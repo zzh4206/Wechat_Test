@@ -1,0 +1,6 @@
+node_modules/
+lib/
+state/
+vendor/
+.DS_Store
+*.log
