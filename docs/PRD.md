@@ -84,5 +84,5 @@ WP0 spike（docs/SPIKE-bus.md）推翻两个前提：未 @ 群消息在 im-conne
 
 - **B（本地补丁）**：以 `pnpm patch` 给 profile 中的 im-connect 打只读事件补丁——在 access 过滤前 emit `im-connect/message { channel, message }`（<10 行，不改既有行为，可回滚）。补丁文件显式、受控，进入本仓库版本管理（patches/ 目录）。
 - **A（上游提案）**：向 MichengAI/dsh-im-connect 提交同一改动的 issue/PR（英文草稿见 SPIKE-bus.md §3），长期回归官方实现后移除补丁。
-- **渠道过渡**：微信群聊需上游支持才有数据；开发与联调期用 QQ/钉钉群先跑通全链路，微信等上游就绪后接入。
+- **渠道战略（2026-10-11 修订）**：**微信优先，QQ/钉钉暂缓至二期**（用户主要对话在微信）。微信群读取的自研可行性报告（docs/REPORT-wechat-group.md）成为项目关键路径；微信通路打通前，WP3/WP4 以模拟消息开发测试，WP5 端到端灰度顺延至微信通路就绪。
 - 影响：WP3 事件源改为补丁事件；WP1 骨架不受影响；新增 WP0.5（补丁制作与安装）。
