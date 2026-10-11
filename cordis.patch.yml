@@ -1,0 +1,3 @@
+- insert:
+    - id: group-lurker
+      name: '@zzh4206/dsh-group-lurker'

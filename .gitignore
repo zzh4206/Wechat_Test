@@ -4,3 +4,4 @@ state/
 vendor/
 .DS_Store
 *.log
+.npm-cache/
