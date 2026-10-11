@@ -19,6 +19,7 @@ import { BufferPool } from './buffer.js'
 import { MessageBus } from './bus.js'
 import { Distiller, DefaultLlmClient } from './distiller.js'
 import type { LlmClient, HostLlmService, Insight } from './distiller.js'
+import { InsightsJournal } from './journal.js'
 
 export interface PluginConfig {
   stateDir: string
@@ -68,6 +69,8 @@ export interface GroupLurker {
   readonly bus: MessageBus
   /** 提炼器（WP3） */
   readonly distiller: Distiller
+  /** insights 落盘 + 每日日报（WP4） */
+  readonly journal: InsightsJournal
   /** 运行可见性（PRD F5）：各群缓冲水位 / 今日条数 / 最近提炼时间 */
   getStatus(): Record<
     string,
@@ -89,8 +92,11 @@ export function apply(ctx: Context, config: PluginConfig): void {
   const bucket = new TokenBucket() // 默认 1 条/秒、突发 5（TECH-DESIGN §3）
   const buffer = new BufferPool({ bufferSize: config.bufferSize })
 
-  // 提炼产出回调：WP3 只回传，落盘（store 调用）留给 WP4。
-  const onInsights = (_chatId: string, _insights: Insight[]): void => {}
+  // WP4 接线：提炼产出 → journal（二次校验 type + 截断引用 + jsonl/日报落盘）。
+  const journal = new InsightsJournal({ store, logger: logger as unknown as StoreLogger })
+  const onInsights = (chatId: string, insights: Insight[]): void => {
+    journal.record(chatId, insights)
+  }
 
   const llmClient: LlmClient = new DefaultLlmClient(
     (ctx as Context & { llm?: HostLlmService }).llm,
@@ -120,16 +126,19 @@ export function apply(ctx: Context, config: PluginConfig): void {
     buffer,
     bus,
     distiller,
+    journal,
     getStatus: () => {
       const out: ReturnType<GroupLurker['getStatus']> = {}
       const chats = new Set<string>(config.groups)
       for (const chatId of chats) {
         const st = distiller.status(chatId)
+        const jst = journal.status(chatId)
         out[chatId] = {
           buffered: buffer.size(chatId),
           dropped: bus.dropped(chatId),
-          todayCount: st.todayCount,
-          lastDistillAt: st.lastDistillAt,
+          // 计数以 journal（本地自然日、已落盘条目）为准，distiller 作回退
+          todayCount: jst.todayCount || st.todayCount,
+          lastDistillAt: jst.lastDistillAt ?? st.lastDistillAt,
         }
       }
       return out
@@ -146,6 +155,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
     return () => {
       stopTimer() // clearInterval：唯一 setInterval 的释放点
       distiller.dispose()
+      journal.dispose() // 无定时器，清计数/日报内存引用
       buffer.clear()
       personas.clear()
       logger.info('group-lurker disposed')

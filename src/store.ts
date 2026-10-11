@@ -4,7 +4,7 @@
  * - ensureDir / appendJsonl / appendText 写入前都必须过 assertInsideState；
  * - 写失败只记 logger，绝不抛出致命错误（不能拖垮宿主）。
  */
-import { mkdirSync, appendFileSync } from 'node:fs'
+import { mkdirSync, appendFileSync, writeFileSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { assertInsideState } from './guard.js'
 
@@ -34,6 +34,28 @@ export class Store {
   /** 追加一行 JSON 到 .jsonl 文件 */
   appendJsonl(rel: string, entry: unknown): boolean {
     return this.appendText(rel, `${JSON.stringify(entry)}\n`)
+  }
+
+  /** 覆写文本文件（WP4 日报整文件重写用）；同样先过 assertInsideState */
+  writeText(rel: string, text: string): boolean {
+    const target = join(this.baseDir, rel)
+    try {
+      assertInsideState(this.baseDir, target)
+      writeFileSync(target, text, 'utf8')
+      return true
+    } catch (error) {
+      this.logger.warn(`store.writeText failed (${rel}): ${String(error)}`)
+      return false
+    }
+  }
+
+  /** 读文本文件；不存在或失败返回 null（只读，不写） */
+  readText(rel: string): string | null {
+    try {
+      return readFileSync(join(this.baseDir, rel), 'utf8')
+    } catch {
+      return null
+    }
   }
 
   /** 追加文本（自管换行） */
