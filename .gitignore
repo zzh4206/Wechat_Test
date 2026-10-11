@@ -5,3 +5,5 @@ vendor/
 .DS_Store
 *.log
 .npm-cache/
+spikes/
+*.tsbuildinfo
