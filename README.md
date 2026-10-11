@@ -16,11 +16,12 @@
   - `vendor/` 不安装依赖、不进构建路径、不出现在插件发布产物中；
   - 若将来必须改动 im-connect 才能拿到群消息，走 GitHub fork / 上游 PR，不在本地 vendor 上改。
 - 本插件自身永远不持有任何消息发送通道（验收见 PRD §5 与 WP1 的 `no-send` 测试）。
+- **（2026-10-11 转向）** 微信消息源改为本地库读取（wx-chatbot 路线），im-connect 解耦、补丁已回滚；新实施计划见 [docs/REPORT-wechat-db-plan.md](docs/REPORT-wechat-db-plan.md)。
 
 ## 运行前提
 
-- DSH ≥ 0.2.0-rc.2，profile（如 `~/.dsh/profiles/web`）中已安装并登录 `@michengai/dsh-im-connect`；
-- im-connect 登录的账号必须在目标群里（微信用独立小号静默挂机，MVP 永不发言；联调建议先用 QQ/钉钉官方机器人渠道）；
+- **（2026-10-11 路线转向后）** 大号登录 macOS 微信客户端 + 完全磁盘访问授权；插件经本地库读取适配器获取白名单群消息（见 docs/REPORT-wechat-db-plan.md）。读取严格受控：白名单默认全拒、用户显式维护、读取行为留审计。
+- DSH ≥ 0.2.0-rc.2；im-connect 仍安装在 profile 但与本项目解耦（原 WP0.5 补丁已回滚，patches/ 已删除）。
 - 用户侧交互纯本地：在 DSH 会话中查看 `state/` 下的关键信息日志（insights.jsonl）与每日 Markdown 日报，群内零操作、群友无感。
 
 ## 仓库结构
