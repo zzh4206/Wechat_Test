@@ -12,6 +12,7 @@ import Schema from '@deepseek-ai/schemastery'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { Store } from './store.js'
+import { PersonaService } from './persona.js'
 
 export interface PluginConfig {
   stateDir: string
@@ -20,6 +21,8 @@ export interface PluginConfig {
   distillEveryMessages: number
   distillIntervalMin: number
   persona: string
+  /** chatId → 人格名（按群覆盖）；未配置的群回退内置 default */
+  groupPersonas: Record<string, string>
 }
 
 export const name = 'dsh-group-lurker'
@@ -34,6 +37,7 @@ export const Config: Schema<PluginConfig> = Schema.object({
   distillEveryMessages: Schema.number().default(25),
   distillIntervalMin: Schema.number().default(15),
   persona: Schema.string().default('default'),
+  groupPersonas: Schema.dict(String).default({}),
 })
 
 /**
@@ -50,7 +54,8 @@ export interface GroupLurker {
   readonly stateDir: string
   /** 项目内唯一 fs 写入点 */
   readonly store: Store
-  // WP2/WP3 在此扩展：bus / buffer / distiller / persona 接口。
+  /** 人格服务（WP2）：resolve(chatId, groupPersonas)，缓存随 dispose 清空 */
+  readonly personas: PersonaService
 }
 
 export function apply(ctx: Context, config: PluginConfig): void {
@@ -61,7 +66,9 @@ export function apply(ctx: Context, config: PluginConfig): void {
   // 初始化即建目录；失败只记日志，不阻断宿主。
   store.ensureDir('.')
 
-  const api: GroupLurker = { stateDir, store }
+  const personas = new PersonaService({ stateDir, logger })
+
+  const api: GroupLurker = { stateDir, store, personas }
 
   // 所有随插件生命周期回收的资源都挂在这里（dispose 无残留定时器/监听的保证点）。
   ctx.effect(() => {
@@ -69,11 +76,12 @@ export function apply(ctx: Context, config: PluginConfig): void {
     // WP2/WP3：事件监听（ctx.on 会随插件回收）、每群环形缓冲、
     // 定时提炼（setInterval 也必须包进 effect 的清理函数）在此注册。
     return () => {
-      // 释放点：关闭任何在用句柄；store 无长驻句柄，无需额外动作。
+      // 释放点：人格缓存清空；store 无长驻句柄，无需额外动作。
+      personas.clear()
       logger.info('group-lurker disposed')
     }
   }, 'group-lurker.serve')
 
-  // 占位导出：供 WP2/WP3 模块挂载（bus/buffer/distiller/persona 后续在此接线）。
+  // 占位导出：供 WP2/WP3 模块挂载（bus/buffer/distiller 后续在此接线）。
   ;(ctx as Context & { groupLurker?: GroupLurker }).groupLurker = api
 }
