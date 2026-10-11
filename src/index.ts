@@ -12,7 +12,13 @@ import Schema from '@deepseek-ai/schemastery'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { Store } from './store.js'
+import type { StoreLogger } from './store.js'
 import { PersonaService } from './persona.js'
+import { TokenBucket } from './guard.js'
+import { BufferPool } from './buffer.js'
+import { MessageBus } from './bus.js'
+import { Distiller, DefaultLlmClient } from './distiller.js'
+import type { LlmClient, HostLlmService, Insight } from './distiller.js'
 
 export interface PluginConfig {
   stateDir: string
@@ -56,6 +62,17 @@ export interface GroupLurker {
   readonly store: Store
   /** 人格服务（WP2）：resolve(chatId, groupPersonas)，缓存随 dispose 清空 */
   readonly personas: PersonaService
+  /** 每群环形缓冲（WP3） */
+  readonly buffer: BufferPool
+  /** 事件总线（WP3）：im-connect/message → 消毒 → 限流 → 缓冲 */
+  readonly bus: MessageBus
+  /** 提炼器（WP3） */
+  readonly distiller: Distiller
+  /** 运行可见性（PRD F5）：各群缓冲水位 / 今日条数 / 最近提炼时间 */
+  getStatus(): Record<
+    string,
+    { buffered: number; dropped: number; todayCount: number; lastDistillAt: number | null }
+  >
 }
 
 export function apply(ctx: Context, config: PluginConfig): void {
@@ -68,20 +85,73 @@ export function apply(ctx: Context, config: PluginConfig): void {
 
   const personas = new PersonaService({ stateDir, logger })
 
-  const api: GroupLurker = { stateDir, store, personas }
+  // —— WP3 接线：限流 → 缓冲 → 提炼 → 事件总线 ——
+  const bucket = new TokenBucket() // 默认 1 条/秒、突发 5（TECH-DESIGN §3）
+  const buffer = new BufferPool({ bufferSize: config.bufferSize })
+
+  // 提炼产出回调：WP3 只回传，落盘（store 调用）留给 WP4。
+  const onInsights = (_chatId: string, _insights: Insight[]): void => {}
+
+  const llmClient: LlmClient = new DefaultLlmClient(
+    (ctx as Context & { llm?: HostLlmService }).llm,
+  )
+  const distiller = new Distiller({
+    buffer,
+    llm: llmClient,
+    personas,
+    groupPersonas: config.groupPersonas ?? {},
+    logger: logger as unknown as StoreLogger,
+    distillEveryMessages: config.distillEveryMessages,
+    distillIntervalMin: config.distillIntervalMin,
+    onInsights,
+  })
+
+  const bus = new MessageBus({
+    groups: config.groups,
+    buffer,
+    bucket,
+    onAccepted: (chatId) => distiller.onNewMessage(chatId),
+  })
+
+  const api: GroupLurker = {
+    stateDir,
+    store,
+    personas,
+    buffer,
+    bus,
+    distiller,
+    getStatus: () => {
+      const out: ReturnType<GroupLurker['getStatus']> = {}
+      const chats = new Set<string>(config.groups)
+      for (const chatId of chats) {
+        const st = distiller.status(chatId)
+        out[chatId] = {
+          buffered: buffer.size(chatId),
+          dropped: bus.dropped(chatId),
+          todayCount: st.todayCount,
+          lastDistillAt: st.lastDistillAt,
+        }
+      }
+      return out
+    },
+  }
 
   // 所有随插件生命周期回收的资源都挂在这里（dispose 无残留定时器/监听的保证点）。
   ctx.effect(() => {
     logger.info(`group-lurker ready, stateDir=${stateDir}, groups=${JSON.stringify(config.groups)}`)
-    // WP2/WP3：事件监听（ctx.on 会随插件回收）、每群环形缓冲、
-    // 定时提炼（setInterval 也必须包进 effect 的清理函数）在此注册。
+    // 事件监听：ctx.on（bus.attach 内部）随插件 dispose 自动回收。
+    bus.attach(ctx)
+    // 定时提炼：start() 返回 clearInterval 清理函数，包进 effect 返回值 → dispose 无定时器残留。
+    const stopTimer = distiller.start()
     return () => {
-      // 释放点：人格缓存清空；store 无长驻句柄，无需额外动作。
+      stopTimer() // clearInterval：唯一 setInterval 的释放点
+      distiller.dispose()
+      buffer.clear()
       personas.clear()
       logger.info('group-lurker disposed')
     }
   }, 'group-lurker.serve')
 
-  // 占位导出：供 WP2/WP3 模块挂载（bus/buffer/distiller 后续在此接线）。
+  // 挂到宿主上下文，供其它模块只读访问。
   ;(ctx as Context & { groupLurker?: GroupLurker }).groupLurker = api
 }
