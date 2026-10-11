@@ -17,6 +17,12 @@
   - 若将来必须改动 im-connect 才能拿到群消息，走 GitHub fork / 上游 PR，不在本地 vendor 上改。
 - 本插件自身永远不持有任何消息发送通道（验收见 PRD §5 与 WP1 的 `no-send` 测试）。
 
+## 运行前提
+
+- DSH ≥ 0.2.0-rc.2，profile（如 `~/.dsh/profiles/web`）中已安装并登录 `@michengai/dsh-im-connect`；
+- im-connect 登录的账号必须在目标群里（微信用独立小号静默挂机，MVP 永不发言；联调建议先用 QQ/钉钉官方机器人渠道）；
+- 用户侧交互纯本地：在 DSH 会话中查看 `state/` 下的关键信息日志（insights.jsonl）与每日 Markdown 日报，群内零操作、群友无感。
+
 ## 仓库结构
 
 ```
@@ -28,4 +34,8 @@ state/           本地运行数据（gitignore，绝不提交真实群数据）
 
 ## 状态
 
-MVP「只观察」规划完成，尚未开始编码。工作包 WP0–WP5 见 WORKBREAKDOWN。
+MVP「只观察」规划完成，即将进入开发。工作包 WP0–WP5 见 WORKBREAKDOWN；当前进度记录于下方。
+
+| 日期 | 进展 |
+|---|---|
+| 2026-10-11 | 立项文档与仓库约定定稿（commit 8308dd4）；补充运行前提（账号/渠道）；WP0 待分派 |
