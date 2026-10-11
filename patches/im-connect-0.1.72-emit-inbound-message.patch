@@ -1,0 +1,11 @@
+--- a/lib/engine/gateway.js
++++ b/lib/engine/gateway.js
+@@ -348,6 +348,8 @@
+                 return;
+             if (msg.messageId)
+                 this.seen.add(`${channelId}:${msg.messageId}`);
++            // [WP0.5 patch] 只读事件：在 access 过滤前广播原始入站消息（不改变任何既有行为）。
++            this.ctx.emit('im-connect/message', { channel, message: msg });
+             const decision = decideAccess({
+                 userAllowed: this.isAuthorized(channelId, channel, msg),
+                 kind: msg.kind === 'group' ? 'group' : 'dm',

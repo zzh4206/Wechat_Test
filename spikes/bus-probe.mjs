@@ -29,6 +29,7 @@
  */
 
 const CANDIDATE_EVENTS = [
+  'im-connect/message', // WP0.5 补丁新增：im-connect 在 access 过滤前广播的只读入站事件
   'agent/inbox/inserted',
   'agent/inbox/claimed',
   'agent/inbox/discarded',
