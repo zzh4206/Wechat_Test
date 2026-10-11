@@ -77,3 +77,12 @@
 - 频控/黑名单/话题回避规则
 - Web 设置页（注入 `dsh.client.inject` 的 settings slot）
 - 全自动水群（需频控与回退机制成熟后评估）
+
+## 8. 方向修订记录（2026-10-11，WP0 后）
+
+WP0 spike（docs/SPIKE-bus.md）推翻两个前提：未 @ 群消息在 im-connect 入口即被丢弃且无事件；当前微信渠道仅支持私聊。经产品负责人确认，采用 **B+A 路线**：
+
+- **B（本地补丁）**：以 `pnpm patch` 给 profile 中的 im-connect 打只读事件补丁——在 access 过滤前 emit `im-connect/message { channel, message }`（<10 行，不改既有行为，可回滚）。补丁文件显式、受控，进入本仓库版本管理（patches/ 目录）。
+- **A（上游提案）**：向 MichengAI/dsh-im-connect 提交同一改动的 issue/PR（英文草稿见 SPIKE-bus.md §3），长期回归官方实现后移除补丁。
+- **渠道过渡**：微信群聊需上游支持才有数据；开发与联调期用 QQ/钉钉群先跑通全链路，微信等上游就绪后接入。
+- 影响：WP3 事件源改为补丁事件；WP1 骨架不受影响；新增 WP0.5（补丁制作与安装）。
