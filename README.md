@@ -42,4 +42,5 @@ MVP「只观察」规划完成，即将进入开发。工作包 WP0–WP5 见 WO
 | 2026-10-11 | WP1 骨架完成并验收（e46be79）：guard/store/三组测试，tsc OK、9 pass 0 fail |
 | 2026-10-11 | WP0 spike 完成并验收（a34a3f2）：**未 @ 群消息不可旁听**，且当前 im-connect 微信渠道仅支持私聊；产品方向修订为 B+A（PRD §8，1cff209） |
 | 2026-10-11 | WP2 人格模块完成并验收（b4dbba9）：15 pass / 0 fail |
-| 2026-10-11 | WP0.5 补丁完成并验收（55f657f），已应用到 web profile（gateway.js SHA1 e17705a9…，回滚见 patches/README.md）；**需重启 DSH 生效**；WP3 待派 |
+| 2026-10-11 | WP0.5 补丁完成并验收（55f657f），已应用到 web profile（回滚见 patches/README.md） |
+| 2026-10-11 | 渠道战略定为微信优先（98b9efc）；可行性研究完成（cb95b94）：**官方 iLink 协议内微信读群现阶段无解**，附 ~1h 探测实验与 G0–G5 冻结预案；WP3 开发中 |
