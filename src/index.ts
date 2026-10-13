@@ -24,6 +24,8 @@ import { Scheduler } from './scheduler.js'
 import type { TickKind } from './scheduler.js'
 import { SystemNotifier } from './notify.js'
 import { GroupStoreService } from './group-store.js'
+import { PersonaTrackService } from './persona-track.js'
+import type { WatchListEntry } from './persona-track.js'
 import { WechatDbSource } from './source/wechat-db.js'
 import { NicknameResolver } from './source/nickname.js'
 import type { WechatDbMessage } from './source/wechat-db.js'
@@ -68,6 +70,11 @@ export interface PluginConfig {
   staggerMinutes: number
   /** M1-T1.4：系统通知 dry_run（默认 true = 只记日志不弹通知） */
   notifyDryRun: boolean
+  /**
+   * M2-T2.1：关注名单（配置文件唯一入口，默认空数组 = 无人被追踪，fail-closed 零活动）。
+   * scope：'global'（全部白名单群）| { groups: [chatId] }（指定群）。
+   */
+  watchList?: WatchListEntry[]
 }
 
 export const name = 'dsh-group-lurker'
@@ -106,6 +113,8 @@ export const Config: Schema<PluginConfig> = Schema.object({
   monthlyReportTime: Schema.string().default('08:00').description('每月触达时点（1 日 HH:MM）'),
   staggerMinutes: Schema.number().default(5).description('按白名单顺序每群错峰分钟数'),
   notifyDryRun: Schema.boolean().default(true).description('系统通知 dry_run：true 只记日志不弹通知中心'),
+  // schemastery 无 const 联合：条目结构运行时校验（persona-track 内 fail-closed 跳过非法项）
+  watchList: Schema.array(Schema.any()).default([]).description('M2 关注名单：[{ wxid, remark?, scope: "global" | { groups: [chatId] } }]。空数组 = 无人被追踪（零活动）'),
 })
 
 /**
@@ -134,6 +143,8 @@ export interface GroupLurker {
   readonly journal: InsightsJournal
   /** 每群 SQLite 数据桶（M1-T1.1）：messages 写入/查询 + schema 迁移；bus 接线在 T1.2 */
   readonly groupStore: GroupStoreService
+  /** 关注名单 + 按人跨群检索（M2-T2.1/T2.4）；空名单 fail-closed 零活动 */
+  readonly personaTrack: PersonaTrackService
   /** 定时触达调度器（M1-T1.3）；schedulerEnabled=false 时为 null */
   readonly scheduler: Scheduler | null
   /** 系统通知通道（M1-T1.4）：notifyDryRun 控制是否真弹通知 */
@@ -235,6 +246,8 @@ export function apply(ctx: Context, config: PluginConfig): void {
     throw new Error(`unknown source "${config.source}" (expected "none" | "wechat-db") — refuse to start (fail-closed)`)
   }
   let source: WechatDbSource | null = null
+  // M2-T2.1：昵称解析器引用（供 persona-track 复用 W3 映射链；source 未启用时为 null）
+  let nicknameResolverRef: NicknameResolver | null = null
   if (config.source === 'wechat-db') {
     try {
       // 规范化（复用性）：机器相关路径无源码默认值——启用读取时必须显式配置，缺失即 fail-closed 拒读。
@@ -264,14 +277,46 @@ export function apply(ctx: Context, config: PluginConfig): void {
         backfillOnStart: config.backfillOnStart,
         nicknameResolver,
         onMessages: (messages: WechatDbMessage[]) => {
-          for (const message of messages) bus.ingest(message)
+          for (const message of messages) {
+            const accepted = bus.ingest(message)
+            // M2-T1.2 落库接线：消毒/限流通过后异步写每群 SQLite 桶；不阻塞提炼主流程，
+            // appendMessages 失败只 warn（服务层已兜底，这里再兜一层）。
+            // senderPid 暂存 wxid 原值（sender→P01 代号化是 M2 后续任务）。
+            if (accepted && message.messageId) {
+              void groupStore
+                .appendMessages(message.chatId, [
+                  {
+                    msgId: message.messageId,
+                    ts: message.ts,
+                    senderPid: message.sender,
+                    senderName: message.senderName,
+                    kind: message.kind ?? 'text',
+                    text: message.text,
+                    quoteOfMsgId: message.quoteOfMsgId,
+                  },
+                ])
+                .catch((error: unknown) =>
+                  logger.warn(`group-store appendMessages failed: ${String(error)}`),
+                )
+            }
+          }
         },
       })
+      // M2-T2.1：把解析器交给 persona-track 复用（wxid → 群昵称映射链）
+      nicknameResolverRef = nicknameResolver
     } catch (error) {
       logger.error(`wechat-db source refused to start (fail-closed): ${String(error)}`)
       source = null
     }
   }
+
+  // —— M2-T2.1/T2.4：关注名单 + 按人跨群检索（配置文件唯一入口；空名单 fail-closed 零活动）——
+  const personaTrack = new PersonaTrackService({ groupStore, logger })
+  personaTrack.setNicknameSource(nicknameResolverRef)
+  // TODO(M2+)：watchList 变更热同步；当前仅 apply 启动时同步一次（写入各群 identities）
+  void personaTrack.syncWatchList(config.watchList ?? [], config.groups).catch((error) => {
+    logger.error(`persona-track syncWatchList failed: ${String(error)}`)
+  })
 
   const api: GroupLurker = {
     stateDir,
@@ -282,6 +327,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
     distiller,
     journal,
     groupStore,
+    personaTrack,
     scheduler,
     notifier,
     source,

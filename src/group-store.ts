@@ -168,6 +168,15 @@ const MIGRATIONS: readonly ((db: DatabaseSync) => void)[] = [
   },
 ]
 
+/** identities 表行（M2-T2.1 追加：关注名单同步写入/查询） */
+export interface IdentityRow {
+  pid: string
+  wxid: string
+  groupNick?: string
+  remark?: string
+  watchLevel?: 'global' | 'group' | 'off'
+}
+
 /** 单群库句柄（不直接对外导出使用，统一经 GroupStoreService） */
 export class GroupStore {
   private readonly db: DatabaseSync
@@ -309,10 +318,147 @@ export class GroupStore {
     }))
   }
 
+  /** 按 msg_id 精确取一条（已关闭返回 null） */
+  getMessage(msgId: string): StoredMessage | null {
+    if (this.closed) return null
+    const r = this.db
+      .prepare(
+        `SELECT msg_id, ts, sender_pid, sender_name, kind, text, quote_of_msg_id, file_id, raw_class
+         FROM messages WHERE msg_id = ? LIMIT 1`,
+      )
+      .get(msgId) as Record<string, unknown> | undefined
+    if (!r) return null
+    return {
+      msgId: String(r.msg_id),
+      ts: Number(r.ts),
+      senderPid: String(r.sender_pid),
+      senderName: String(r.sender_name),
+      kind: r.kind as MessageKind,
+      text: String(r.text),
+      quoteOfMsgId: r.quote_of_msg_id === null ? null : String(r.quote_of_msg_id),
+      fileId: r.file_id === null ? null : String(r.file_id),
+      rawClass: r.raw_class === null ? null : String(r.raw_class),
+    }
+  }
+
+  /**
+   * M2-T2.2：引用回复链多级追溯。从 msgId 出发沿 quote_of_msg_id 向上（被引用方向）
+   * 逐级取消息，返回 [起始消息, 其引用的消息, 再上一级, ...]（按链顺序排列）。
+   * - maxDepth：链上最多返回的消息条数（含起始消息），默认 5（D2 §4-T2.2）；
+   * - 断链（被引用消息不在库，如 qref-* 占位 id）在该级终止，返回已取到的部分链；
+   * - 环引用（数据异常）经 seen 集防死循环；
+   * - TODO(M2+)：软关联（无引用的时序+语义近似，置信度<阈值仅展示）本任务不做。
+   */
+  getQuoteChain(msgId: string, maxDepth = 5): StoredMessage[] {
+    const chain: StoredMessage[] = []
+    if (this.closed || maxDepth <= 0) return chain
+    const seen = new Set<string>()
+    let cur: string | null = msgId
+    while (cur !== null && chain.length < maxDepth && !seen.has(cur)) {
+      seen.add(cur)
+      const row = this.getMessage(cur)
+      if (!row) break // 断链：被引用消息不在库
+      chain.push(row)
+      cur = row.quoteOfMsgId
+    }
+    return chain
+  }
+
   /** 当前消息总条数 */
   countMessages(): number {
     if (this.closed) return 0
     return Number(this.db.prepare('SELECT COUNT(*) AS n FROM messages').get()!.n)
+  }
+
+  // —— 以下为 M2-T2.1/T2.4 追加 API（identities 读写 + 按人检索），不改上方既有行 ——
+
+  /** upsert 一条 identities（按 wxid 幂等：重名换 pid 不产生重复行）。返回是否成功。 */
+  async upsertIdentity(row: IdentityRow): Promise<boolean> {
+    if (!row.pid || !row.wxid) return false
+    const level = row.watchLevel ?? 'off'
+    if (level !== 'global' && level !== 'group' && level !== 'off') return false
+    return this.write((db) => {
+      db.prepare(`
+        INSERT INTO identities (pid, wxid, group_nick, remark, watch_level)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(wxid) DO UPDATE SET
+          pid = excluded.pid,
+          group_nick = excluded.group_nick,
+          remark = excluded.remark,
+          watch_level = excluded.watch_level
+      `).run(row.pid, row.wxid, row.groupNick ?? '', row.remark ?? '', level)
+      return true
+    })
+  }
+
+  /** 读 identities：全部（默认）或按 watch_level 过滤。只读，失败返回 []。 */
+  getIdentities(opts: { watchLevel?: 'global' | 'group' | 'off' } = {}): Array<{
+    pid: string
+    wxid: string
+    groupNick: string
+    remark: string
+    watchLevel: 'global' | 'group' | 'off'
+  }> {
+    if (this.closed) return []
+    try {
+      const rows = opts.watchLevel
+        ? this.db.prepare('SELECT pid, wxid, group_nick, remark, watch_level FROM identities WHERE watch_level = ?').all(opts.watchLevel)
+        : this.db.prepare('SELECT pid, wxid, group_nick, remark, watch_level FROM identities').all()
+      return (rows as Record<string, unknown>[]).map((r) => ({
+        pid: String(r.pid),
+        wxid: String(r.wxid),
+        groupNick: String(r.group_nick),
+        remark: String(r.remark),
+        watchLevel: r.watch_level as 'global' | 'group' | 'off',
+      }))
+    } catch (error) {
+      this.logger.error(`group-store[${this.chatId}] getIdentities failed: ${String(error)}`)
+      return []
+    }
+  }
+
+  /**
+   * 按人检索（M2-T2.4）：sender_pid ∈ senderKeys（wxid 或派生 pid），可选关键词子串
+   * （instr 匹配，无 LIKE 转义问题），按 ts 降序取最近 limit 条。只读。
+   */
+  searchByPerson(
+    senderKeys: readonly string[],
+    keyword: string | undefined,
+    opts: { afterTs?: number; beforeTs?: number; limit?: number } = {},
+  ): StoredMessage[] {
+    if (this.closed || senderKeys.length === 0) return []
+    const conds = [`sender_pid IN (${senderKeys.map(() => '?').join(',')})`]
+    const params: (string | number)[] = [...senderKeys]
+    if (keyword && keyword !== '') {
+      conds.push('instr(text, ?) > 0')
+      params.push(keyword)
+    }
+    if (opts.afterTs !== undefined) {
+      conds.push('ts > ?')
+      params.push(opts.afterTs)
+    }
+    if (opts.beforeTs !== undefined) {
+      conds.push('ts < ?')
+      params.push(opts.beforeTs)
+    }
+    const limit = Math.max(0, Math.floor(opts.limit ?? 100))
+    const rows = this.db
+      .prepare(
+        `SELECT msg_id, ts, sender_pid, sender_name, kind, text, quote_of_msg_id, file_id, raw_class
+         FROM messages WHERE ${conds.join(' AND ')} ORDER BY ts DESC, rowid DESC LIMIT ${limit}`,
+      )
+      .all(...params) as Record<string, unknown>[]
+    return rows.map((r) => ({
+      msgId: String(r.msg_id),
+      ts: Number(r.ts),
+      senderPid: String(r.sender_pid),
+      senderName: String(r.sender_name),
+      kind: r.kind as MessageKind,
+      text: String(r.text),
+      quoteOfMsgId: r.quote_of_msg_id === null ? null : String(r.quote_of_msg_id),
+      fileId: r.file_id === null ? null : String(r.file_id),
+      rawClass: r.raw_class === null ? null : String(r.raw_class),
+    }))
   }
 
   /** 关闭库句柄（幂等） */
@@ -384,6 +530,48 @@ export class GroupStoreService {
       return st.getMessages(opts)
     } catch (error) {
       this.logger.error(`group-store getMessages(${chatId}) failed: ${String(error)}`)
+      return []
+    }
+  }
+
+  /**
+   * M2-T2.2：引用链查询（服务层）。库未开/失败返回 []（读操作不建库、不落盘）。
+   * TODO(M2+)：软关联（时序+语义近似）留给后续任务，这里只走 quote_of_msg_id 硬链。
+   */
+  getQuoteChain(chatId: string, msgId: string, maxDepth = 5): StoredMessage[] {
+    const st = this.stores.get(chatId)
+    if (!st) return []
+    try {
+      return st.getQuoteChain(msgId, maxDepth)
+    } catch (error) {
+      this.logger.error(`group-store getQuoteChain(${chatId}) failed: ${String(error)}`)
+      return []
+    }
+  }
+
+  /** M2-T2.1：向某群 identities upsert 一行（库未开则惰性建库；失败返回 false） */
+  async appendIdentity(chatId: string, row: IdentityRow): Promise<boolean> {
+    try {
+      return await this.open(chatId).upsertIdentity(row)
+    } catch (error) {
+      this.logger.error(`group-store appendIdentity(${chatId}) failed: ${String(error)}`)
+      return false
+    }
+  }
+
+  /** M2-T2.4：某群按人检索；库未打开返回 []（不为此建库——不做全量索引） */
+  searchByPerson(
+    chatId: string,
+    senderKeys: readonly string[],
+    keyword?: string,
+    opts?: { afterTs?: number; beforeTs?: number; limit?: number },
+  ): StoredMessage[] {
+    const st = this.stores.get(chatId)
+    if (!st) return []
+    try {
+      return st.searchByPerson(senderKeys, keyword, opts)
+    } catch (error) {
+      this.logger.error(`group-store searchByPerson(${chatId}) failed: ${String(error)}`)
       return []
     }
   }
