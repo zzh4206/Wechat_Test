@@ -283,18 +283,31 @@ export function apply(ctx: Context, config: PluginConfig): void {
             // appendMessages 失败只 warn（服务层已兜底，这里再兜一层）。
             // senderPid 暂存 wxid 原值（sender→P01 代号化是 M2 后续任务）。
             if (accepted && message.messageId) {
+              const msgs: import('./group-store.js').StorableMessage[] = []
+              // M2-T1.2：被引用原文不在库 → 先落 qref-* 占位行（满足 quote_of_msg_id 外键，
+              // 原文保留在该行 text，链查询可沿链取到），再落回复行。
+              if (message.quoteOfMsgId?.startsWith('qref-')) {
+                msgs.push({
+                  msgId: message.quoteOfMsgId,
+                  ts: message.ts,
+                  senderPid: 'unknown',
+                  senderName: message.quoteRefName ?? '',
+                  kind: 'text',
+                  text: message.quoteRefText ?? '',
+                  rawClass: 'quote-placeholder',
+                })
+              }
+              msgs.push({
+                msgId: message.messageId,
+                ts: message.ts,
+                senderPid: message.sender,
+                senderName: message.senderName,
+                kind: message.kind ?? 'text',
+                text: message.text,
+                quoteOfMsgId: message.quoteOfMsgId,
+              })
               void groupStore
-                .appendMessages(message.chatId, [
-                  {
-                    msgId: message.messageId,
-                    ts: message.ts,
-                    senderPid: message.sender,
-                    senderName: message.senderName,
-                    kind: message.kind ?? 'text',
-                    text: message.text,
-                    quoteOfMsgId: message.quoteOfMsgId,
-                  },
-                ])
+                .appendMessages(message.chatId, msgs)
                 .catch((error: unknown) =>
                   logger.warn(`group-store appendMessages failed: ${String(error)}`),
                 )

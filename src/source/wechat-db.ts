@@ -45,6 +45,132 @@ const SYSTEM_TYPES: ReadonlySet<number> = new Set([10000, 10002])
 /** text 为系统/媒体 XML（以 '<' 开头且含特征标记）→ 按系统消息处理（跳过） */
 const XML_SYSTEM_PATTERN = /<(sysmsg|emoji|emojijson|recordinfo|videomsg|voicemsg|newxmlmsg|newmsg)\b/i
 
+/** M2-T1.2：引用消息特征（appmsg 内嵌 <refermsg> 块，local_type 49） */
+const REFERMSG_PATTERN = /<refermsg[\s>]/i
+
+// ============================== M2-T1.2 引用消息解析 ==============================
+//
+// 解析隔离约定（D2 风险表）：refermsg XML 结构随微信版本可能变化，全部解析收拢在
+// 下面这几个独立纯函数里，mapRows 只消费其结果；任何异常/缺字段一律降级为纯文本
+// （warn，不抛错），绝不阻塞消息管线。零第三方依赖：手写正则 + 实体解码。
+
+/** refermsg 块中提取出的被引用消息信息 */
+export interface ParsedReferMsg {
+  /** 被引用消息的 server id（<svrid>）——引用链关联键 */
+  refMsgId: string
+  /** 被引用者群内显示名（<displayname>） */
+  refDisplayName: string
+  /** 被引用原文（<content>，已解码实体/CDATA） */
+  refContent: string
+  /** 引用者自己的回复文本（外层 appmsg <title>） */
+  selfText: string
+}
+
+/** 解析基础 XML 实体与 CDATA 包裹（refermsg 字段常见形态） */
+function decodeXmlText(raw: string): string {
+  let s = raw.trim()
+  const cdata = s.match(/^<!\[CDATA\[([\s\S]*)\]\]>$/)
+  if (cdata) s = cdata[1]
+  return s
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'")
+    .replace(/&amp;/g, '&')
+}
+
+/** 取第一个 <tag>text</tag>（含可选属性与 CDATA）；无则 null */
+function firstTag(xml: string, tag: string): string | null {
+  const m = xml.match(new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)</${tag}>`, 'i'))
+  return m ? decodeXmlText(m[1]) : null
+}
+
+/** text 是否为引用消息（含 <refermsg> 块）。独立导出便于测试。 */
+export function isQuoteMessage(text: string): boolean {
+  return REFERMSG_PATTERN.test(text)
+}
+
+/**
+ * 拆解 refermsg XML（M2-T1.2 核心解析函数，解析隔离点）。
+ * 返回 null = 无法可靠提取（缺 svrid 等）→ 调用方降级为纯文本。
+ * 内部不抛错：任何意外都折返 null（try/catch 兜底）。
+ */
+export function parseReferMsgXml(xml: string): ParsedReferMsg | null {
+  try {
+    const block = xml.match(/<refermsg[^>]*>([\s\S]*?)<\/refermsg>/i)
+    if (!block) return null
+    const inner = block[1]
+    const refMsgId = firstTag(inner, 'svrid') ?? firstTag(inner, 'msgid')
+    if (!refMsgId || !/^\d{1,24}$/.test(refMsgId)) return null // 无稳定关联键 → 降级
+    return {
+      refMsgId,
+      refDisplayName: firstTag(inner, 'displayname') ?? '',
+      refContent: firstTag(inner, 'content') ?? '',
+      // 引用者的回复在外层 appmsg <title>（refermsg 块之前的那个 title）
+      selfText: firstTag(xml.slice(0, block.index ?? 0), 'title') ?? '',
+    }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * FNV-1a 32bit → 8 位 hex。占位 id 生成用（确定性、可测试、零依赖）。
+ */
+export function fnv1aHex(input: string): string {
+  let h = 0x811c9dc5
+  for (let i = 0; i < input.length; i++) {
+    h ^= input.charCodeAt(i)
+    h = Math.imul(h, 0x01000193) >>> 0
+  }
+  return h.toString(16).padStart(8, '0')
+}
+
+/**
+ * 被引用原文不在已读消息中时的占位 msgId（格式 `qref-<fnv1a8>`，由
+ * 被引用者显示名 + 原文派生，同一条引用重复出现得到同一占位 id，可测试）。
+ */
+export function quotePlaceholderId(refDisplayName: string, refContent: string): string {
+  return `qref-${fnv1aHex(`${refDisplayName}\u0000${refContent}`)}`
+}
+
+/** 占位引用的正文前缀格式：[引用|显示名|原文] （保留原文便于溯源） */
+export function quotePrefix(refDisplayName: string, refContent: string): string {
+  return `[引用|${refDisplayName}|${refContent}]`
+}
+
+/**
+ * 引用行规范化（mapRows 消费）：返回 null = 解析失败/缺 svrid，调用方按纯文本降级。
+ * knownIds：被引用原文可能落在其中的"已读消息" id 集（本轮批次 ∪ 持久化游标）。
+ * 占位情形额外带回 quoteRefName/quoteRefText：落库侧用它们建 qref-* 占位行，
+ * 满足 quote_of_msg_id 外键约束，原文得以沿链溯源。
+ */
+export function normalizeQuoteRow(
+  rawText: string,
+  knownIds: ReadonlySet<string>,
+): {
+  text: string
+  kind: 'quote'
+  quoteOfMsgId: string
+  quoteRefName?: string
+  quoteRefText?: string
+} | null {
+  const parsed = parseReferMsgXml(rawText)
+  if (!parsed) return null
+  if (knownIds.has(parsed.refMsgId)) {
+    // 被引用原文已在库里：quoteOfMsgId 直接指向它，正文只留回复（原文可沿链溯源）
+    return { text: parsed.selfText, kind: 'quote', quoteOfMsgId: parsed.refMsgId }
+  }
+  // 原文不在库（未读历史/已过期清理）：占位 id + 原文保留于 text 前缀
+  return {
+    text: `${quotePrefix(parsed.refDisplayName, parsed.refContent)}${parsed.selfText}`,
+    kind: 'quote',
+    quoteOfMsgId: quotePlaceholderId(parsed.refDisplayName, parsed.refContent),
+    quoteRefName: parsed.refDisplayName,
+    quoteRefText: parsed.refContent,
+  }
+}
+
 /** 发送者剥离：群消息 text 可能带 "wxid_xxx:\n正文" 前缀 */
 const SENDER_PREFIX_PATTERN = /^[A-Za-z0-9_@.-]{4,64}:\n/
 
@@ -88,6 +214,13 @@ export interface WechatDbMessage {
   text: string
   messageId: string
   ts: number
+  /** M2-T1.2：'quote' = 引用回复消息（缺省 'text'） */
+  kind?: 'text' | 'quote'
+  /** M2-T1.2：被引用消息的 msgId（被引用原文在库内为真实 server_id，否则为 qref-* 占位） */
+  quoteOfMsgId?: string
+  /** M2-T1.2：仅占位情形带回（落库侧建 qref-* 占位行用）：被引用者显示名 / 原文 */
+  quoteRefName?: string
+  quoteRefText?: string
 }
 
 /** 子进程运行结果（可注入 mock） */
@@ -454,9 +587,16 @@ export class WechatDbSource {
     return rows
   }
 
-  /** 原始行 → 管线消息（server_id 去重 + 落游标 + W3 normalize） */
+  /** 原始行 → 管线消息（server_id 去重 + 落游标 + W3 normalize + M2-T1.2 引用拆解） */
   private mapRows(chatId: string, rows: RawReadMessage[]): WechatDbMessage[] {
     const fresh: WechatDbMessage[] = []
+    // M2-T1.2："已读消息" id 集 = 本轮批次全部 server_id ∪ 持久化游标（引用关联用）。
+    // 先扫一遍批次 id：同批内 A→B→C 多级引用可互相指到真实 server_id。
+    const knownIds = new Set<string>()
+    for (const row of rows) {
+      const id = this.serverIdOf(row)
+      if (id !== null) knownIds.add(id)
+    }
     for (const row of rows) {
       // server_id 缺失（未上服务器的本地行）无法稳定去重，跳过
       const id = this.serverIdOf(row)
@@ -469,6 +609,31 @@ export class WechatDbSource {
       const rawText = row.text === null || row.text === undefined ? '' : String(row.text)
       const localType =
         typeof row.local_type === 'number' ? row.local_type : Number(row.local_type) || undefined
+      if (SYSTEM_TYPES.has(localType ?? -1)) continue // 系统消息过滤（既有逻辑，勿动）
+      // M2-T1.2：引用消息（<refermsg> XML）先于普通 normalize 拆解；
+      // 解析失败 → 降级为纯文本（原文进 text）继续入管线，只 warn 不阻塞。
+      if (isQuoteMessage(rawText)) {
+        knownIds.add(id) // 自身也可被后续引用行指到
+        const quote = normalizeQuoteRow(rawText, knownIds)
+        if (quote) {
+          fresh.push({
+            chatId,
+            sender,
+            senderName: sender,
+            text: quote.text,
+            messageId: id,
+            ts: typeof row.create_time === 'number' ? row.create_time : 0,
+            kind: quote.kind,
+            quoteOfMsgId: quote.quoteOfMsgId,
+            quoteRefName: quote.quoteRefName,
+            quoteRefText: quote.quoteRefText,
+          })
+          continue
+        }
+        this.logger.warn(
+          `wechat-db quote parse failed for ${chatId} msg ${id} — degraded to plain text`,
+        )
+      }
       const text = normalizeRowText(rawText, localType, sender)
       if (text === null) continue
       fresh.push({
