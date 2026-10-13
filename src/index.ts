@@ -134,6 +134,10 @@ export interface GroupLurker {
   readonly journal: InsightsJournal
   /** 每群 SQLite 数据桶（M1-T1.1）：messages 写入/查询 + schema 迁移；bus 接线在 T1.2 */
   readonly groupStore: GroupStoreService
+  /** 定时触达调度器（M1-T1.3）；schedulerEnabled=false 时为 null */
+  readonly scheduler: Scheduler | null
+  /** 系统通知通道（M1-T1.4）：notifyDryRun 控制是否真弹通知 */
+  readonly notifier: SystemNotifier
   /** 本地库消息源（W2）；source='none' 或 fail-closed 拒启时为 null */
   readonly source: WechatDbSource | null
   /** 运行可见性（PRD F5）：各群缓冲水位 / 今日条数 / 最近提炼时间 */
@@ -168,6 +172,38 @@ export function apply(ctx: Context, config: PluginConfig): void {
 
   // —— M1-T1.1：每群 SQLite 数据桶（惰性建库；bus.ingest 下游接线在 T1.2） ——
   const groupStore = new GroupStoreService(stateDir, logger)
+
+  // —— M1-T1.4：系统通知通道（dry_run 默认开；审计只记元数据） ——
+  const notifier = new SystemNotifier({
+    store,
+    logger,
+    dryRun: config.notifyDryRun,
+  })
+
+  // —— M1-T1.3：调度骨架（onTick → 通知占位；报告生成回调留空，M3 接） ——
+  let scheduler: Scheduler | null = null
+  if (config.schedulerEnabled) {
+    scheduler = new Scheduler({
+      groups: config.groups,
+      logger,
+      store,
+      dailyTime: config.dailyReportTime,
+      weeklyTime: config.weeklyReportTime,
+      monthlyTime: config.monthlyReportTime,
+      staggerMinutes: config.staggerMinutes,
+      onTick: (kind: TickKind, chatId: string, meta) => {
+        // M3 占位：目前只记日志 + dry_run 通知；报告内容由 M3 生成回填。
+        void notifier
+          .notify(
+            kind,
+            `群聊${kind === 'daily' ? '日报' : kind === 'weekly' ? '周报' : '月报'}（${chatId}）`,
+            meta.catchup ? '（补跑）报告生成接入前占位' : '报告生成接入前占位',
+          )
+          .catch(() => {})
+      },
+    })
+  }
+
   const onInsights = (chatId: string, insights: Insight[]): void => {
     journal.record(chatId, insights)
   }
@@ -246,6 +282,8 @@ export function apply(ctx: Context, config: PluginConfig): void {
     distiller,
     journal,
     groupStore,
+    scheduler,
+    notifier,
     source,
     getStatus: () => {
       const out: ReturnType<GroupLurker['getStatus']> = {}
@@ -289,9 +327,20 @@ export function apply(ctx: Context, config: PluginConfig): void {
         logger.error(`wechat-db source start refused: ${String(error)}`)
       }
     }
+    // M1-T1.3 调度器：同样 start() → 清理函数约定；触发点持久化在 stateDir。
+    let stopScheduler: (() => void) | null = null
+    if (scheduler) {
+      try {
+        stopScheduler = scheduler.start()
+        logger.info(`scheduler started (daily=${config.dailyReportTime}, weekly=${config.weeklyReportTime}, monthly=${config.monthlyReportTime}, stagger=${config.staggerMinutes}m)`)
+      } catch (error) {
+        logger.error(`scheduler start refused: ${String(error)}`)
+      }
+    }
     return () => {
       stopTimer() // clearInterval：唯一 setInterval 的释放点
       stopSource?.() // clearInterval + 释放单实例锁
+      stopScheduler?.() // clearInterval：调度器心跳唯一释放点
       distiller.dispose()
       journal.dispose() // 无定时器，清计数/日报内存引用
       groupStore.dispose() // 关闭全部 SQLite 句柄（WAL checkpoint 随 close 完成）
