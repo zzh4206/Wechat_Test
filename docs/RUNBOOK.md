@@ -128,3 +128,18 @@ rm -rf /path/to/macos-wechat-export/.wechat-local
 1. 新环境按 QUICKSTART 重跑 `bootstrap_keys.py`——它会重新生成签名快照与逐库密钥；
 2. **切勿**把旧机器的 `.wechat-local/` 拷过去：旧签名快照会让 `bootstrap_keys.py` 的原版签名对照（第 101 行）误判"原版被改动"而中止；旧 keys.json 对新环境的库也不适用；
 3. 取钥成功后插件侧只需核对 `sourceDbRoot`/`sourceToolDir` 指向无误，游标（stateDir/cursor.json）与新库位点不一致时会自动按新库重新对齐（最坏情况：少量近期消息重复投递，下游幂等消化）。
+
+## 附录：macos-wechat-export 目录盘点（2026-10-13）
+
+> 结论：除 `__pycache__`（92K 编译缓存，随时再生）外**无废弃物**，整目录 ~400KB，不做瘦身。逐类依据如下。
+
+| 类别 | 文件 | 处置 |
+|---|---|---|
+| 现役依赖（缺一不可） | `wechat_db.py`（唯一读取 CLI）、`bootstrap_keys.py`（取钥入口，内部调 `capture_keys.py` 做 LLDB 捕获——勿误删）、`disk_inventory.py`（多账号选库）、`.wechat-local/`（keys.json 0600 + 签名快照）、`.git`（**含 T1.5 补丁 `--before-id`，只存在本地**）、`.gitignore`、`LICENSE`+`NOTICE`（MIT 合规义务）、`test_db.py`（29 项验收） | 保留 |
+| 将来要用（M5-F7） | `media_pipeline.py`、`test_media.py`、`requirements-media.txt`、`media-config.example.json` | 保留 |
+| 二期参考（发送红线暂不用） | `Send.swift`、`WeChatUI.swift`、`Tests.swift`、`wechat-ui`（编译产物）、`UI_GUIDE/OPERATIONS/AGENT_PLAYBOOK`、`check_inbox.py`、`send_verified.py` | 保留（filehelper 通道接入 outbox 时为现成参考） |
+| W1 调研残留 | `sqlcipher_probe.py`、`readonly_port_probe.c`、`probe_readonly_port.sh`、`build.sh`、`test.sh` | 保留（W1 报告可复现性注记依赖） |
+| 文档 | QUICKSTART / README / KEY_GUIDE / TROUBLESHOOTING / REFERENCE / VALIDATION | 保留（本手册素材出处） |
+| 垃圾 | `__pycache__` | 可删（再生） |
+
+仓库状态注记：上游 remote 已移除（原 `DaneelOlivaw1/macos-wechat-export`，无写权限），现为**纯本地私有仓库**（上游 `88ca1be` + 本地补丁 `d5eda50`）。如需异地备份：在 GitHub 新建**自有**私有仓库作 remote，绝不恢复原作者 remote。
