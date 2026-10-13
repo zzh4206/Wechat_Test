@@ -122,6 +122,8 @@ export interface WechatDbSourceOptions {
   pollIntervalMs?: number
   /** 每次 read 的 --limit，默认 50 */
   readLimit?: number
+  /** T1.5：单轮追赶补读上限条数，默认 2000（触顶 warn 并建议人工 backfill） */
+  catchUpLimit?: number
   /** 退避基数 ms（默认取 pollIntervalMs） */
   backoffBaseMs?: number
   /** 退避上限 ms，默认 5 分钟 */
@@ -143,12 +145,18 @@ interface RawReadMessage {
   sender_id?: unknown
   text?: unknown
   local_type?: unknown
+  /** T1.5：分库局部 id（跨库不可比，仅用于同分片内向前翻页锚点） */
+  local_id?: unknown
+  /** T1.5：消息所在分片名（message_*.db），用于判断翻页是否跨分片 */
+  database?: unknown
 }
 
 const DEFAULT_POLL_INTERVAL_MS = 10_000
 const DEFAULT_READ_LIMIT = 50
 const DEFAULT_BACKOFF_MAX_MS = 5 * 60_000
 const DEFAULT_TIMEOUT_MS = 30_000
+/** T1.5：单轮追赶补读上限（条）；触顶即 warn 并建议人工 backfill */
+export const DEFAULT_CATCHUP_LIMIT = 2000
 
 /**
  * 默认子进程运行器：spawn(python, [wechat_db.py, ...args])，超时 SIGKILL。
@@ -208,6 +216,7 @@ export class WechatDbSource {
   private readonly runner: CliRunner
   private readonly pollIntervalMs: number
   private readonly readLimit: number
+  private readonly catchUpLimit: number
   private readonly backoffBaseMs: number
   private readonly backoffMaxMs: number
   private readonly now: () => number
@@ -247,6 +256,7 @@ export class WechatDbSource {
       })
     this.pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS
     this.readLimit = options.readLimit ?? DEFAULT_READ_LIMIT
+    this.catchUpLimit = options.catchUpLimit ?? DEFAULT_CATCHUP_LIMIT
     this.backoffBaseMs = options.backoffBaseMs ?? this.pollIntervalMs
     this.backoffMaxMs = options.backoffMaxMs ?? DEFAULT_BACKOFF_MAX_MS
     this.now = options.now ?? (() => Date.now())
@@ -273,10 +283,19 @@ export class WechatDbSource {
   /**
    * 单次读取（只导出给测试/显式调用；白名单外抛错、零子进程调用）。
    * 返回本次新见（去重后）的消息；失败抛错。无论成败都写审计行。
+   *
+   * T1.5 追赶补读：首轮不带 --before-id（不传时行为与旧版完全一致）；当该群游标已有
+   * 历史且本轮读出的消息全部是新消息（cursor 未见过）时，用本轮最旧消息的 local_id
+   * 作为 --before-id 向前翻页，直到：翻页读空 / 撞到已见消息 / 达到单轮追赶上限
+   * （触顶 warn 并建议人工 backfill）。local_id 是分库局部 id、跨库不可比：一页横跨
+   * 多个 message_*.db 分片或分片名未知时停止翻页并 warn（宁少读不可错读）。
    */
   async readOnce(chatId: string, limit = this.readLimit): Promise<WechatDbMessage[]> {
     this.gate(chatId) // 读取路径第一行：先过闸门再谈子进程
-    const result = await this.runner([
+    const collected: RawReadMessage[] = []
+    let ok = true
+    // —— 首轮：参数与旧版完全一致（不带 --before-id） ——
+    const first = await this.runner([
       '--db-root',
       this.dbRoot,
       'read',
@@ -285,22 +304,88 @@ export class WechatDbSource {
       '--limit',
       String(limit),
     ])
-    let fresh: WechatDbMessage[] = []
-    let ok = result.code === 0
+    let page: RawReadMessage[] = []
+    ok = first.code === 0
     if (ok) {
       try {
-        fresh = this.parse(chatId, result.stdout)
+        page = this.parseRows(first.stdout)
       } catch (error) {
         ok = false
         this.logger.warn(`wechat-db parse failed for ${chatId}: ${String(error)}`)
       }
     } else {
       this.logger.warn(
-        `wechat_db read failed for ${chatId} (code=${result.code}): ${result.stderr.slice(0, 200)}`,
+        `wechat_db read failed for ${chatId} (code=${first.code}): ${first.stderr.slice(0, 200)}`,
       )
     }
+    if (ok) collected.push(...page)
+    // 本轮内已见的 server_id 集：游标只在 readOnce 结束时统一落账，
+    // 追赶循环的"撞到已见"判定必须同时看本轮早前各页的 id。
+    const roundIds = new Set<string>()
+    for (const row of collected) {
+      const id = this.serverIdOf(row)
+      if (id !== null) roundIds.add(id)
+    }
+    // —— 追赶循环：仅当游标已有该群历史（掉线重登后的积压场景）。首次接触该群
+    // （游标为空）不追赶：旧历史按基线处理（old_messages_are_not_new，不回灌）。 ——
+    if (ok && page.length > 0 && this.cursor.recentCount(chatId) > 0 && this.pageFullyNew(chatId, page)) {
+      /** "已读"判定：持久化游标 ∪ 本轮早前页面 */
+      const isSeen = (row: RawReadMessage): boolean => {
+        const id = this.serverIdOf(row)
+        return id !== null && (this.cursor.has(chatId, id) || roundIds.has(id))
+      }
+      while (collected.length < this.catchUpLimit) {
+        if (page.length === 0) break // 读空：翻到头了
+        // 翻出的页含无法判重的行（server_id 缺失）→ 无法确认边界：保守停止（宁少读）
+        if (page.some((row) => this.serverIdOf(row) === null)) break
+        const anchor = this.paginationAnchor(chatId, page)
+        if (anchor === null) break // 锚点不可用 / 跨分片：宁少读（内部已 warn）
+        const res = await this.runner([
+          '--db-root',
+          this.dbRoot,
+          'read',
+          '--chat-id',
+          chatId,
+          '--limit',
+          String(limit),
+          '--before-id',
+          String(anchor),
+        ])
+        if (res.code !== 0) {
+          ok = false
+          this.logger.warn(
+            `wechat_db catch-up read failed for ${chatId} (code=${res.code}): ${res.stderr.slice(0, 200)}`,
+          )
+          break
+        }
+        try {
+          page = this.parseRows(res.stdout)
+        } catch (error) {
+          ok = false
+          this.logger.warn(`wechat-db catch-up parse failed for ${chatId}: ${String(error)}`)
+          break
+        }
+        const touchedSeen = page.some(isSeen)
+        // 本页全部新见：记入本轮已见集，继续向前翻页
+        for (const row of page) {
+          const id = this.serverIdOf(row)
+          if (id !== null) roundIds.add(id)
+        }
+        // 本页混有已见消息：收下其中的新消息后停止（追上游标窗口）
+        collected.push(...page)
+        if (touchedSeen) break
+      }
+      if (collected.length >= this.catchUpLimit) {
+        this.logger.warn(
+          `wechat-db catch-up hit the per-round limit (${this.catchUpLimit}) for ${chatId} — ` +
+            '停止本轮追赶，剩余积压建议人工 backfill',
+        )
+      }
+    }
+    // —— 汇总去重并落游标（全部页成功后才 add：中途失败不误标已读、不静默丢消息） ——
+    const fresh = ok ? this.mapRows(chatId, collected) : []
     this.audit(chatId, fresh.length, ok)
-    if (!ok) throw new Error(`wechat_db read failed for ${chatId} (code ${result.code})`)
+    if (!ok) throw new Error(`wechat_db read failed for ${chatId} (code ${first.code})`)
     // W3：senderName 填昵称（resolver 内部自带降级——失败回原 id 并 warn，不中断主流程）
     if (this.nicknameResolver && fresh.length > 0) {
       const map = await this.nicknameResolver.resolveGroup(chatId)
@@ -311,16 +396,71 @@ export class WechatDbSource {
     return fresh
   }
 
-  /** 解析 wechat_db.py read 的 JSON 输出并映射为管线消息（去重） */
-  private parse(chatId: string, stdout: string): WechatDbMessage[] {
+  /** server_id → 去重键；缺失（未上服务器的本地行）返回 null（无法稳定判重） */
+  private serverIdOf(row: RawReadMessage): string | null {
+    return row.server_id === null || row.server_id === undefined ? null : String(row.server_id)
+  }
+
+  /** 一页是否全部为新消息（含无法判重的行 → 保守视为不全新，宁少读） */
+  private pageFullyNew(chatId: string, page: RawReadMessage[]): boolean {
+    for (const row of page) {
+      const id = this.serverIdOf(row)
+      if (id === null) return false
+      if (this.cursor.has(chatId, id)) return false
+    }
+    return true
+  }
+
+  /**
+   * 翻页锚点：本轮最旧消息的 local_id（作为 --before-id）。
+   * local_id 跨分片不可比：一页横跨多个 message_*.db、分片名未知或 local_id 非法时
+   * 返回 null 并 warn（宁少读不可错读）。
+   */
+  private paginationAnchor(chatId: string, page: RawReadMessage[]): number | null {
+    const shards = new Set<string>()
+    let oldest: number | null = null
+    for (const row of page) {
+      if (typeof row.database !== 'string' || row.database === '') {
+        this.logger.warn(
+          `wechat-db catch-up: read row without database shard for ${chatId} — pagination stopped (宁少读)`,
+        )
+        return null
+      }
+      const localId = Number(row.local_id)
+      if (!Number.isInteger(localId) || localId <= 0) {
+        this.logger.warn(
+          `wechat-db catch-up: read row without valid local_id for ${chatId} — pagination stopped (宁少读)`,
+        )
+        return null
+      }
+      shards.add(row.database)
+      if (oldest === null || localId < oldest) oldest = localId
+    }
+    if (shards.size > 1) {
+      this.logger.warn(
+        `wechat-db catch-up: page spans ${shards.size} message shards for ${chatId} — ` +
+          'local_id 跨分片不可比，停止翻页（宁少读不可错读）',
+      )
+      return null
+    }
+    return oldest
+  }
+
+  /** 解析 wechat_db.py read 的 JSON 输出为原始行（结构异常抛错） */
+  private parseRows(stdout: string): RawReadMessage[] {
     const parsed = JSON.parse(stdout) as { messages?: RawReadMessage[] }
-    const rows = Array.isArray(parsed.messages) ? parsed.messages : []
+    const rows = parsed.messages
+    if (!Array.isArray(rows)) throw new Error('read output missing messages array')
+    return rows
+  }
+
+  /** 原始行 → 管线消息（server_id 去重 + 落游标 + W3 normalize） */
+  private mapRows(chatId: string, rows: RawReadMessage[]): WechatDbMessage[] {
     const fresh: WechatDbMessage[] = []
     for (const row of rows) {
       // server_id 缺失（未上服务器的本地行）无法稳定去重，跳过
-      const messageId = row.server_id
-      if (messageId === null || messageId === undefined) continue
-      const id = String(messageId)
+      const id = this.serverIdOf(row)
+      if (id === null) continue
       // W4：持久化游标去重（重启后同 id 不再入管线）；未命中 → 记为已读并投递
       if (this.cursor.has(chatId, id)) continue
       this.cursor.add(chatId, id)

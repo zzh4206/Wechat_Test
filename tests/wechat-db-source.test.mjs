@@ -156,3 +156,120 @@ test('pollOnce 在退避窗口内整轮跳过（不产生子进程调用）', as
   assert.equal(calls.length, 2)
   rmSync(base, { recursive: true, force: true })
 })
+
+// ===== T1.5 掉线积压追赶补读（--before-id 向前翻页）=====
+
+function mkRows(prefix, start, count, startLocal) {
+  const out = []
+  for (let i = 0; i < count; i++) {
+    out.push({
+      server_id: `${prefix}${start + i}`,
+      local_id: startLocal + i,
+      database: 'message_0.db',
+      create_time: 1791860000 + startLocal + i,
+      sender_id: 'wxid_x',
+      text: `msg${start + i}`,
+    })
+  }
+  return out
+}
+
+function resp(rows) {
+  return { code: 0, stdout: JSON.stringify({ messages: rows }), stderr: '' }
+}
+
+function argsOf(call) {
+  const i = call.indexOf('--before-id')
+  return { beforeId: i === -1 ? null : call[i + 1], raw: call }
+}
+
+test('T1.5: 50+ 条积压一次性补齐（持续向前翻页直到读空）', async () => {
+  const calls = []
+  const pages = [
+    resp(mkRows('s', 91, 10, 91)), // poll#1 首轮：基线 10 条（游标为空，不追赶）
+    resp(mkRows('s', 31, 60, 31)), // poll#2 首页：60 条积压（全部新）
+    resp(mkRows('s', 1, 30, 1)), //   翻页1：再 30 条（全部新，锚点=31）
+    resp([]), //                       翻页2（锚点=1）：读空 → 停止
+  ]
+  let n = 0
+  const { source, collected } = setup({ output: () => pages[n++] })
+  // 用自定义 runner 记录调用
+  source['runner'] = async (args) => { calls.push([...args]); return pages[calls.length - 1] }
+  await source.pollOnce()
+  assert.equal(collected.length, 10, '首轮基线：游标为空不追赶')
+  collected.push(...(await source.readOnce('10000@chatroom')))
+  assert.equal(calls.length, 4, '首页 + 两次翻页 + 读空即停')
+  assert.equal(argsOf(calls[1]).beforeId, null, '本轮首页照旧不带 --before-id')
+  assert.equal(argsOf(calls[2]).beforeId, '31', '翻页锚点 = 本轮最旧 local_id')
+  assert.equal(argsOf(calls[3]).beforeId, '1', '读空前锚点逐页前移且严格递减')
+  assert.equal(collected.length, 100, '10 基线 + 60 + 30 全部补齐、不重不漏')
+})
+
+test('T1.5: 翻页撞到已见消息即停（收下本页新消息后不再翻页）', async () => {
+  const calls = []
+  const pages = [
+    resp(mkRows('s', 91, 10, 91)), // poll#1 基线
+    resp(mkRows('s', 36, 55, 36)), // poll#2 首页 55 条（全部新）
+    resp(mkRows('s', 10, 27, 10)), // 翻页：s10..s36，其中 s36 已见（上一页最旧）→ 撞到即停
+  ]
+  const { source, collected } = setup({ output: () => pages[0] })
+  source['runner'] = async (args) => { calls.push([...args]); return pages[calls.length - 1] }
+  await source.pollOnce()
+  collected.push(...(await source.readOnce('10000@chatroom')))
+  assert.equal(calls.length, 3, '撞到已见消息后不再发起下一次翻页')
+  assert.equal(argsOf(calls[2]).beforeId, '36')
+  assert.equal(collected.length, 10 + 55 + 26, '本页未见过的新消息（s10..s35）仍入管线，s36 不重投')
+})
+
+test('T1.5: 达到单轮追赶上限 → warn 并停止（建议人工 backfill）', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'w2cap-'))
+  const logger = makeLogger()
+  const store = new Store(base, logger)
+  store.ensureDir('.')
+  const calls = []
+  const pages = [
+    resp(mkRows('s', 1, 10, 1)), // poll#1 基线 10 条
+    resp(mkRows('s', 11, 10, 11)), // poll#2 首页 10 条
+    resp(mkRows('s', 21, 10, 21)), // 翻页 10 条 → 累计 20 ≥ 上限 15
+  ]
+  const source = new WechatDbSource({
+    groups: ['10000@chatroom'],
+    dbRoot: '/tmp/fake-db-root',
+    store,
+    stateDir: base,
+    logger,
+    runner: async (args) => { calls.push([...args]); return pages[calls.length - 1] },
+    pollIntervalMs: 1000,
+    catchUpLimit: 15,
+    onMessages: () => {},
+  })
+  await source.pollOnce()
+  await source.readOnce('10000@chatroom')
+  assert.equal(calls.length, 3, '触顶后不再继续翻页')
+  assert.equal(argsOf(calls[2]).beforeId, '11')
+  assert.ok(
+    logger.lines.warn.some((m) => m.includes('catch-up hit the per-round limit (15)') && m.includes('backfill')),
+    '触顶须 warn 并建议人工 backfill',
+  )
+  rmSync(base, { recursive: true, force: true })
+})
+
+test('T1.5: --before-id 不传时行为与旧版完全一致（参数不变、不触发追赶）', async () => {
+  const { source, calls, collected } = setup({
+    output: JSON.stringify({ messages: mkRows('s', 1, 3, 1) }),
+  })
+  const expected = ['--db-root', '/tmp/fake-db-root', 'read', '--chat-id', '10000@chatroom', '--limit', '50']
+  await source.pollOnce() // 游标为空：即使全部新消息也不追赶（旧历史按基线处理）
+  await source.readOnce('10000@chatroom') // 全部已见：pageFullyNew=false，同样只有一次调用
+  await source.readOnce('10000@chatroom', 20)
+  assert.equal(calls.length, 3)
+  assert.deepEqual(
+    calls[2],
+    ['--db-root', '/tmp/fake-db-root', 'read', '--chat-id', '10000@chatroom', '--limit', '20'],
+    '显式 limit 时参数与旧版逐项一致',
+  )
+  for (const call of calls) {
+    assert.ok(!call.includes('--before-id'), '不传 before-id 时任何调用都不带该参数')
+  }
+  assert.equal(collected.length, 3, '重复输出去重后只投递一次')
+})
