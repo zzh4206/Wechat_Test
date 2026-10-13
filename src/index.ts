@@ -20,6 +20,10 @@ import { MessageBus } from './bus.js'
 import { Distiller, DefaultLlmClient } from './distiller.js'
 import type { LlmClient, HostLlmService, Insight } from './distiller.js'
 import { InsightsJournal } from './journal.js'
+import { Scheduler } from './scheduler.js'
+import type { TickKind } from './scheduler.js'
+import { SystemNotifier } from './notify.js'
+import { GroupStoreService } from './group-store.js'
 import { WechatDbSource } from './source/wechat-db.js'
 import { NicknameResolver } from './source/nickname.js'
 import type { WechatDbMessage } from './source/wechat-db.js'
@@ -54,6 +58,16 @@ export interface PluginConfig {
   readLimit: number
   /** W4：启动回灌条数（默认 0 不回灌；>0 首轮可回灌最多该条数最近历史，受 readLimit 约束） */
   backfillOnStart: number
+  /** M1-T1.3：调度器开关（默认 false；M3 报告生成接入后再开启） */
+  schedulerEnabled: boolean
+  /** 调度时点（本地时区 "HH:MM"）：日 / 周日 / 每月 1 日 */
+  dailyReportTime: string
+  weeklyReportTime: string
+  monthlyReportTime: string
+  /** 按白名单顺序每群错峰分钟数（默认 5） */
+  staggerMinutes: number
+  /** M1-T1.4：系统通知 dry_run（默认 true = 只记日志不弹通知） */
+  notifyDryRun: boolean
 }
 
 export const name = 'dsh-group-lurker'
@@ -86,6 +100,12 @@ export const Config: Schema<PluginConfig> = Schema.object({
   pollIntervalSec: Schema.number().default(10).description('轮询间隔（秒）'),
   readLimit: Schema.number().default(50).description('每次读取的 --limit'),
   backfillOnStart: Schema.number().default(0).description('启动回灌条数（默认 0 不回灌；受监管原则）'),
+  schedulerEnabled: Schema.boolean().default(false).description('定时触达调度器（日报 20:30/周报周日 20:40/月报 1 日 08:00，按群错峰）；M3 接报告生成后再开'),
+  dailyReportTime: Schema.string().default('20:30').description('每日触达时点（HH:MM 本地时区）'),
+  weeklyReportTime: Schema.string().default('20:40').description('每周触达时点（周日 HH:MM）'),
+  monthlyReportTime: Schema.string().default('08:00').description('每月触达时点（1 日 HH:MM）'),
+  staggerMinutes: Schema.number().default(5).description('按白名单顺序每群错峰分钟数'),
+  notifyDryRun: Schema.boolean().default(true).description('系统通知 dry_run：true 只记日志不弹通知中心'),
 })
 
 /**
@@ -112,6 +132,8 @@ export interface GroupLurker {
   readonly distiller: Distiller
   /** insights 落盘 + 每日日报（WP4） */
   readonly journal: InsightsJournal
+  /** 每群 SQLite 数据桶（M1-T1.1）：messages 写入/查询 + schema 迁移；bus 接线在 T1.2 */
+  readonly groupStore: GroupStoreService
   /** 本地库消息源（W2）；source='none' 或 fail-closed 拒启时为 null */
   readonly source: WechatDbSource | null
   /** 运行可见性（PRD F5）：各群缓冲水位 / 今日条数 / 最近提炼时间 */
@@ -143,6 +165,9 @@ export function apply(ctx: Context, config: PluginConfig): void {
 
   // WP4 接线：提炼产出 → journal（二次校验 type + 截断引用 + jsonl/日报落盘）。
   const journal = new InsightsJournal({ store, logger: logger as unknown as StoreLogger })
+
+  // —— M1-T1.1：每群 SQLite 数据桶（惰性建库；bus.ingest 下游接线在 T1.2） ——
+  const groupStore = new GroupStoreService(stateDir, logger)
   const onInsights = (chatId: string, insights: Insight[]): void => {
     journal.record(chatId, insights)
   }
@@ -220,6 +245,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
     bus,
     distiller,
     journal,
+    groupStore,
     source,
     getStatus: () => {
       const out: ReturnType<GroupLurker['getStatus']> = {}
@@ -268,6 +294,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
       stopSource?.() // clearInterval + 释放单实例锁
       distiller.dispose()
       journal.dispose() // 无定时器，清计数/日报内存引用
+      groupStore.dispose() // 关闭全部 SQLite 句柄（WAL checkpoint 随 close 完成）
       buffer.clear()
       personas.clear()
       logger.info('group-lurker disposed')
