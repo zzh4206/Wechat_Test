@@ -20,6 +20,8 @@ import { MessageBus } from './bus.js'
 import { Distiller, DefaultLlmClient } from './distiller.js'
 import type { LlmClient, HostLlmService, Insight } from './distiller.js'
 import { InsightsJournal } from './journal.js'
+import { WechatDbSource } from './source/wechat-db.js'
+import type { WechatDbMessage } from './source/wechat-db.js'
 
 export interface PluginConfig {
   stateDir: string
@@ -30,12 +32,36 @@ export interface PluginConfig {
   persona: string
   /** chatId → 人格名（按群覆盖）；未配置的群回退内置 default */
   groupPersonas: Record<string, string>
+  /**
+   * 消息源：'none'（默认，保守不读取）| 'wechat-db'（本地库白名单读取，W2）。
+   * schema 声明为 string（schemastery 无 const 联合），apply 启动时运行时校验，
+   * 未知值 fail-closed。
+   */
+  source: string
+  /** 外部工具目录（macos-wechat-export，含 wechat_db.py；只读复用，不修改） */
+  sourceToolDir: string
+  /** 外部工具 python 解释器 */
+  sourcePython: string
+  /** 外部工具 --db-root（微信 db_storage 绝对路径） */
+  sourceDbRoot: string
+  /** 轮询间隔（秒），默认 10 */
+  pollIntervalSec: number
+  /** 每次 read 的 --limit，默认 50 */
+  readLimit: number
 }
 
 export const name = 'dsh-group-lurker'
 
 // 越少越安全：只声明真正需要的宿主服务。
 export const inject = ['llm'] as const
+
+const DEFAULT_SOURCE_TOOL_DIR = '$HOME/WeChat/macos-wechat-export'
+const DEFAULT_SOURCE_PYTHON = 'python3.14'
+const DEFAULT_SOURCE_DB_ROOT = join(
+  homedir(),
+  'Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files',
+  'wxid_yyy/db_storage',
+)
 
 export const Config: Schema<PluginConfig> = Schema.object({
   stateDir: Schema.string().default(''),
@@ -45,6 +71,13 @@ export const Config: Schema<PluginConfig> = Schema.object({
   distillIntervalMin: Schema.number().default(15),
   persona: Schema.string().default('default'),
   groupPersonas: Schema.dict(String).default({}),
+  // W2：保守默认 'none'——显式选择 wechat-db 才启动本地库读取（白名单硬闸门在适配器第一行）。
+  source: Schema.string().default('none'),
+  sourceToolDir: Schema.string().default(DEFAULT_SOURCE_TOOL_DIR),
+  sourcePython: Schema.string().default(DEFAULT_SOURCE_PYTHON),
+  sourceDbRoot: Schema.string().default(DEFAULT_SOURCE_DB_ROOT),
+  pollIntervalSec: Schema.number().default(10),
+  readLimit: Schema.number().default(50),
 })
 
 /**
@@ -71,10 +104,18 @@ export interface GroupLurker {
   readonly distiller: Distiller
   /** insights 落盘 + 每日日报（WP4） */
   readonly journal: InsightsJournal
+  /** 本地库消息源（W2）；source='none' 或 fail-closed 拒启时为 null */
+  readonly source: WechatDbSource | null
   /** 运行可见性（PRD F5）：各群缓冲水位 / 今日条数 / 最近提炼时间 */
   getStatus(): Record<
     string,
-    { buffered: number; dropped: number; todayCount: number; lastDistillAt: number | null }
+    {
+      buffered: number
+      dropped: number
+      todayCount: number
+      lastDistillAt: number | null
+      source: { running: boolean; lastPollAt: number | null; consecutiveFailures: number }
+    }
   >
 }
 
@@ -119,6 +160,34 @@ export function apply(ctx: Context, config: PluginConfig): void {
     onAccepted: (chatId) => distiller.onNewMessage(chatId),
   })
 
+  // —— W2 接线：可选本地库消息源（source='wechat-db' 时启用）——
+  // 白名单为空 → WechatDbSource 构造即抛错（fail-closed），这里降级为“无源运行”并大声记日志。
+  if (config.source !== 'none' && config.source !== 'wechat-db') {
+    throw new Error(`unknown source "${config.source}" (expected "none" | "wechat-db") — refuse to start (fail-closed)`)
+  }
+  let source: WechatDbSource | null = null
+  if (config.source === 'wechat-db') {
+    try {
+      source = new WechatDbSource({
+        groups: config.groups,
+        dbRoot: config.sourceDbRoot,
+        toolDir: config.sourceToolDir,
+        pythonPath: config.sourcePython,
+        store,
+        stateDir,
+        logger: logger as unknown as import('./source/wechat-db.js').WechatDbSourceLogger,
+        pollIntervalMs: config.pollIntervalSec * 1000,
+        readLimit: config.readLimit,
+        onMessages: (messages: WechatDbMessage[]) => {
+          for (const message of messages) bus.ingest(message)
+        },
+      })
+    } catch (error) {
+      logger.error(`wechat-db source refused to start (fail-closed): ${String(error)}`)
+      source = null
+    }
+  }
+
   const api: GroupLurker = {
     stateDir,
     store,
@@ -127,6 +196,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
     bus,
     distiller,
     journal,
+    source,
     getStatus: () => {
       const out: ReturnType<GroupLurker['getStatus']> = {}
       const chats = new Set<string>(config.groups)
@@ -139,6 +209,13 @@ export function apply(ctx: Context, config: PluginConfig): void {
           // 计数以 journal（本地自然日、已落盘条目）为准，distiller 作回退
           todayCount: jst.todayCount || st.todayCount,
           lastDistillAt: jst.lastDistillAt ?? st.lastDistillAt,
+          source: source
+            ? {
+                running: source.status().running,
+                lastPollAt: source.status().lastPollAt,
+                consecutiveFailures: source.status().consecutiveFailures,
+              }
+            : { running: false, lastPollAt: null, consecutiveFailures: 0 },
         }
       }
       return out
@@ -152,8 +229,19 @@ export function apply(ctx: Context, config: PluginConfig): void {
     bus.attach(ctx)
     // 定时提炼：start() 返回 clearInterval 清理函数，包进 effect 返回值 → dispose 无定时器残留。
     const stopTimer = distiller.start()
+    // W2 消息源轮询：同样 start() → clearInterval 约定；锁被占（单实例冲突）时拒启并记日志。
+    let stopSource: (() => void) | null = null
+    if (source) {
+      try {
+        stopSource = source.start()
+        logger.info(`wechat-db source started, poll=${config.pollIntervalSec}s`)
+      } catch (error) {
+        logger.error(`wechat-db source start refused: ${String(error)}`)
+      }
+    }
     return () => {
       stopTimer() // clearInterval：唯一 setInterval 的释放点
+      stopSource?.() // clearInterval + 释放单实例锁
       distiller.dispose()
       journal.dispose() // 无定时器，清计数/日报内存引用
       buffer.clear()

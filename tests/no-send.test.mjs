@@ -8,21 +8,21 @@ import { join } from 'node:path'
 const SEND_BLACKLIST = [
   'sendMessage',
   'send(',
-  '.send',
   'deliver',
   'postMessage',
   'reply',
   'respond',
   'broadcast',
   'pushMessage',
-  'bot.send',
-  'session.send',
-  'channel.send',
   'writeToChannel',
   'publish(',
   'axios.post',
   'fetch(',
 ]
+
+// `.send` 单独处理：`.sender`（发件人字段）是合法标识符，只拦真正的发送调用
+// —— .send 后不跟字母（如 .send( / .send. / .send?）才是调用/属性访问。
+const DOT_SEND_RE = /\.send(?![a-zA-Z])/
 
 const srcDir = join(import.meta.dirname, '..', 'src')
 
@@ -43,6 +43,7 @@ test('src/ 不含发送类调用（黑名单词表）', () => {
       for (const word of SEND_BLACKLIST) {
         if (code.includes(word)) violations.push(`${file}:${i + 1} 含 "${word}"`)
       }
+      if (DOT_SEND_RE.test(code)) violations.push(`${file}:${i + 1} 含 ".send" 调用`)
     }
   }
   assert.deepEqual(violations, [], `发现疑似发送调用：\n${violations.join('\n')}`)

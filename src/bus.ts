@@ -29,6 +29,17 @@ export interface ImConnectMessageEvent {
   message: ImConnectMessage
 }
 
+/** 本地库适配器（W2 wechat-db.ts）产出的消息：经 ingest 进同一消毒/限流/缓冲下游 */
+export interface IngestibleMessage {
+  chatId: string
+  sender: string
+  senderName?: string
+  text: string
+  messageId?: string
+  /** 消息自身时间戳（适配器传 create_time；事件路径传 Date.now()） */
+  ts: number
+}
+
 export interface BusOptions {
   /** 允许旁听的 chatId 白名单（空 = 不监听任何人） */
   groups: readonly string[]
@@ -80,19 +91,47 @@ export class MessageBus {
     if (typeof channelId !== 'string' || !this.groups.has(channelId)) return false
 
     this._handled++
-    // 先消毒：原文 → JSON 数据字段（指令区永不出现原文）。
-    const sanitized = sanitize(String(message.text ?? ''))
-    // 再限流：超限丢弃并计数。
-    if (!this.bucket.take(message.chatId)) return false
-
-    this.buffer.push(message.chatId, {
+    return this.accept(message.chatId, {
       ts: Date.now(),
       sender: message.username ?? message.userId ?? 'unknown',
+      text: String(message.text ?? ''),
+      messageId: message.messageId,
+    })
+  }
+
+  /**
+   * 适配器消息入口（W2）：白名单 → 消毒 → 限流 → 缓冲 → onAccepted，
+   * 与事件路径 handle() 完全同款下游；ts 保留消息自身时间戳。
+   */
+  ingest(message: IngestibleMessage): boolean {
+    if (!this.groups.has(message.chatId)) return false
+    this._handled++
+    return this.accept(message.chatId, {
+      ts: message.ts,
+      sender: message.sender,
+      text: String(message.text ?? ''),
+      messageId: message.messageId,
+    })
+  }
+
+  /** 共用下游：消毒 → 限流 → 缓冲（调用方已过白名单并累计 _handled） */
+  private accept(
+    chatId: string,
+    message: { ts: number; sender: string; text: string; messageId?: string },
+  ): boolean {
+    // 先消毒：原文 → JSON 数据字段（指令区永不出现原文）。
+    const sanitized = sanitize(message.text)
+    // 再限流：超限丢弃并计数。
+    if (!this.bucket.take(chatId)) return false
+
+    this.buffer.push(chatId, {
+      ts: message.ts,
+      sender: message.sender,
       text: sanitized.data,
       messageId: message.messageId,
     })
-    this.stats.accepted.set(message.chatId, (this.stats.accepted.get(message.chatId) ?? 0) + 1)
-    this.onAccepted(message.chatId)
+    this.stats.accepted.set(chatId, (this.stats.accepted.get(chatId) ?? 0) + 1)
+    this.onAccepted(chatId)
     return true
   }
 
