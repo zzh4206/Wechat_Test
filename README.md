@@ -1,54 +1,95 @@
-# dsh-group-lurker（群聊水友引擎）
+# @zzh4206/dsh-group-lurker
 
-一个独立的 DeepSeek Harness（DSH）Cordis 插件：**只读旁听群聊，按群维护独立上下文与人格，提炼关键信息并生成日志。MVP 不发送任何消息。**
+一个独立可复用的 [DeepSeek Harness（DSH）](https://github.com/deepseek-ai) Cordis 插件：**只读旁听微信群聊，按群维护独立上下文与人格，提炼关键信息并生成日志。不发送任何消息。**
 
-- 产品需求：[docs/PRD.md](docs/PRD.md)
-- 技术设计：[docs/TECH-DESIGN.md](docs/TECH-DESIGN.md)
-- 工作拆分（供分派编码 agent）：[docs/WORKBREAKDOWN.md](docs/WORKBREAKDOWN.md)
+> 仅支持 macOS 微信 4.x（本地 SQLCipher 库读取路线）。MVP 阶段只观察、零发送。
 
-## 与 im-connect 的关系（重要约定）
+## 特性
 
-本插件**叠加**在社区插件 [`@michengai/dsh-im-connect`](https://github.com/MichengAI/dsh-im-connect) 之上，把它当作只读消息源，**不 fork、不修改、不参与构建**：
+- **只读**：经只读子进程读取微信本地库，永不写微信数据、永不动微信进程；静态 `no-send` 测试哨兵钉死"零发送通道"
+- **受监管读取（管控三原则）**：
+  1. 默认全拒——`groups` 白名单为空即拒绝启动读取（fail-closed）
+  2. 白名单外的群在适配器层零子进程调用（测试断言）
+  3. 读取行为全程审计（`audit.log` 仅记元数据：时间、群、条数、成败，绝无消息内容）
+- **每群独立**：独立消息缓冲、独立人格（`personas/<name>.md`，可按群覆盖）
+- **昵称解析**：群消息自动映射 wxid → 群内显示名（备注名优先）
+- **增量游标**：持久化去重窗口，重启不重投、不漏新；默认不回灌历史
+- **日志产出**：`insights.jsonl`（话题摘要/人物/金句）+ 每日 Markdown 日报
 
-- im-connect 的运行实例是 DSH profile（`~/.dsh/profiles/web`）里安装的那份，由它自己升级维护；
-- 本仓库如需放置其源码，只允许放在 `vendor/dsh-im-connect/`，用途**仅限只读参考**（供编码 agent 阅读事件接口）：
-  - 原项目采用 Apache-2.0，保留其 LICENSE 与版权声明，注明"只读参考副本，有改动一律不接受"；
-  - `vendor/` 不安装依赖、不进构建路径、不出现在插件发布产物中；
-  - 若将来必须改动 im-connect 才能拿到群消息，走 GitHub fork / 上游 PR，不在本地 vendor 上改。
-- 本插件自身永远不持有任何消息发送通道（验收见 PRD §5 与 WP1 的 `no-send` 测试）。
-- **（2026-10-11 转向）** 微信消息源改为本地库读取（wx-chatbot 路线），im-connect 解耦、补丁已回滚；新实施计划见 [docs/REPORT-wechat-db-plan.md](docs/REPORT-wechat-db-plan.md)。
+## 前提条件
 
-## 运行前提
-
-- **（2026-10-11 路线转向后）** 大号登录 macOS 微信客户端 + 完全磁盘访问授权；插件经本地库读取适配器获取白名单群消息（见 docs/REPORT-wechat-db-plan.md）。读取严格受控：白名单默认全拒、用户显式维护、读取行为留审计。
-- DSH ≥ 0.2.0-rc.2；im-connect 仍安装在 profile 但与本项目解耦（原 WP0.5 补丁已回滚，patches/ 已删除）。
-- 用户侧交互纯本地：在 DSH 会话中查看 `state/` 下的关键信息日志（insights.jsonl）与每日 Markdown 日报，群内零操作、群友无感。
-
-## 仓库结构
-
-```
-docs/            PRD、技术设计、工作拆分、spike 报告
-vendor/          只读参考副本（见上，暂未放置）
-src/ …           插件源码（WP1 起逐步落地）
-state/           本地运行数据（gitignore，绝不提交真实群数据）
-```
-
-## 状态
-
-MVP「只观察」规划完成，即将进入开发。工作包 WP0–WP5 见 WORKBREAKDOWN；当前进度记录于下方。
-
-| 日期 | 进展 |
+| 依赖 | 说明 |
 |---|---|
-| 2026-10-11 | 立项文档与仓库约定定稿（commit 8308dd4）；补充运行前提（账号/渠道）；vendor 副本就位 |
-| 2026-10-11 | WP1 骨架完成并验收（e46be79）：guard/store/三组测试，tsc OK、9 pass 0 fail |
-| 2026-10-11 | WP0 spike 完成并验收（a34a3f2）：**未 @ 群消息不可旁听**，且当前 im-connect 微信渠道仅支持私聊；产品方向修订为 B+A（PRD §8，1cff209） |
-| 2026-10-11 | WP2 人格模块完成并验收（b4dbba9）：15 pass / 0 fail |
-| 2026-10-11 | WP0.5 补丁完成并验收（55f657f），已应用到 web profile（回滚见 patches/README.md） |
-| 2026-10-11 | 渠道战略定为微信优先（98b9efc）；可行性研究完成（cb95b94）：**官方 iLink 协议内微信读群现阶段无解**，附 ~1h 探测实验与 G0–G5 冻结预案 |
-| 2026-10-11 | WP3 提炼管线完成并验收（f8257f6）：bus/buffer/distiller，38 pass / 0 fail，注入防护用例通过 |
-| 2026-10-11 | WP4 日志落盘完成并验收（a602107）：insights.jsonl + 每日日报，43 pass / 0 fail。**MVP 代码全部就绪** |
-| 2026-10-11 | 技术路线转向本地库读取（4d41134），实施计划定稿（22b99c9），补丁回滚/patches 删除；W1 生死步通过（727707c）：**结论 b，key 途径可行**（复用 macos-wechat-export 取钥） |
-| 2026-10-12 | **小号彩排全链路打通**：sqlcipher 装机 → 二轮取钥 19/19 库验证（首轮因新账号时序失败，--db-root 限定小号后成功；keys.json 0600 本地保存）→ resolve/read 实测读出 Test 群消息（chatroom 1234567890）。大号全程零接触 |
-| 2026-10-12 | W2 读取适配器完成并验收（362ee5b）：白名单硬闸门/审计/退避/单实例，50 pass / 0 fail |
-| 2026-10-12 | W3 规范化+昵称解析完成并验收（df648b5）：映射链经 name2id 中转破解，Test 群冒烟昵称解析成功，58 pass / 0 fail |
-| 2026-10-12 | W4 持久化游标完成并验收（2dcc988）：重启不重投不漏新，64 pass / 0 fail。**只剩 W5 端到端** |
+| DSH ≥ 0.2.0-rc.2 | 宿主 |
+| macOS 微信 4.x | 桌面客户端保持目标账号登录（读取其本地库） |
+| sqlcipher | `brew install sqlcipher` |
+| [macos-wechat-export](https://github.com/DaneelOlivaw1/macos-wechat-export) | 只读复用其取钥与读取 CLI；克隆后先跑 `bootstrap_keys.py` 完成取钥（产物 `.wechat-local/keys.json`，0600） |
+
+## 安装
+
+在 DSH profile 目录（如 `~/.dsh/profiles/web`）：
+
+```bash
+pnpm add --config.auto-install-peers=false file:/path/to/dsh-group-lurker
+# 或从 git：
+pnpm add --config.auto-install-peers=false git+https://github.com/zzh4206/Wechat_Test.git
+```
+
+然后在 profile 的 `cordis.patch.yml` 追加：
+
+```yaml
+- id: group-lurker
+  name: "@zzh4206/dsh-group-lurker"
+  config:
+    groups:
+      - "12345678@chatroom"   # 白名单：群 chatId（用工具的 resolve <群名> 查）
+    source: wechat-db
+    sourceToolDir: /path/to/macos-wechat-export   # 必填，无默认值
+    sourceDbRoot: ~/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/<wxid_hash>/db_storage  # 必填，无默认值
+    sourcePython: /opt/homebrew/bin/python3.14    # 建议绝对路径
+```
+
+重启 DSH（或等 patch 热加载）即生效。插件状态目录默认 `DSH_HOME/dsh-group-lurker/`。
+
+## 配置参考
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `groups` | `[]` | **白名单**。空 = 拒绝读取（fail-closed） |
+| `source` | `none` | `none`（不读取）\| `wechat-db`（本地库读取）。选后者必须显式配置下列三项 |
+| `sourceToolDir` | —（必填） | macos-wechat-export 工具目录 |
+| `sourceDbRoot` | —（必填） | 微信 `db_storage` 绝对路径 |
+| `sourcePython` | `python3` | python 解释器 |
+| `pollIntervalSec` | `10` | 轮询间隔（秒） |
+| `readLimit` | `50` | 每次读取条数 |
+| `backfillOnStart` | `0` | 启动回灌条数（受监管原则：默认不回灌） |
+| `bufferSize` | `60` | 每群环形缓冲 |
+| `distillEveryMessages` | `25` | 每攒 N 条触发一次 LLM 提炼 |
+| `distillIntervalMin` | `15` | 定时提炼间隔（分钟） |
+| `persona` | `default` | 默认人格名 |
+| `groupPersonas` | `{}` | 按群人格覆盖：chatId → 人格名 |
+| `stateDir` | `DSH_HOME/dsh-group-lurker` | 状态目录 |
+
+状态目录内容：`insights.jsonl`（提炼结果）、`report-YYYY-MM-DD.md`（日报）、`audit.log`（读取审计）、`cursor.json`（增量游标）、`personas/`（人格）。
+
+## 安全模型（红线）
+
+- 插件不持有任何消息发送通道（发送类调用黑名单静态测试）
+- 取钥产物 `keys.json` 只存在于工具目录（0600），本插件不复制、不打印、不提交；解密经 stdin 传钥（不进命令行参数）
+- 不逆向微信协议；不修改微信客户端；UI 自动化发送属二期，另行评估
+- 白名单外群：适配器第一行闸门拒绝，零子进程调用
+
+## 开发
+
+```bash
+npm install
+npm run build   # tsc → lib/
+npm test        # node --test（64 例，全离线 mock，不碰真实库）
+```
+
+- 项目文档（PRD/技术设计/工作拆分/spike 报告）：[docs/](docs/)
+- 开发进度日志：[docs/PROGRESS.md](docs/PROGRESS.md)
+
+## License
+
+[MIT](LICENSE)

@@ -39,12 +39,15 @@ export interface PluginConfig {
    * 未知值 fail-closed。
    */
   source: string
-  /** 外部工具目录（macos-wechat-export，含 wechat_db.py；只读复用，不修改） */
-  sourceToolDir: string
-  /** 外部工具 python 解释器 */
-  sourcePython: string
-  /** 外部工具 --db-root（微信 db_storage 绝对路径） */
-  sourceDbRoot: string
+  /**
+   * 外部工具目录（macos-wechat-export，含 wechat_db.py；只读复用，不修改）。
+   * 无默认值（机器相关路径不进源码）；source='wechat-db' 时必须显式配置，apply 校验。
+   */
+  sourceToolDir?: string
+  /** 外部工具 python 解释器（默认 'python3'；建议绝对路径） */
+  sourcePython?: string
+  /** 外部工具 --db-root（微信 db_storage 绝对路径）。无默认值；source='wechat-db' 时必须显式配置 */
+  sourceDbRoot?: string
   /** 轮询间隔（秒），默认 10 */
   pollIntervalSec: number
   /** 每次 read 的 --limit，默认 50 */
@@ -58,31 +61,31 @@ export const name = 'dsh-group-lurker'
 // 越少越安全：只声明真正需要的宿主服务。
 export const inject = ['llm'] as const
 
-const DEFAULT_SOURCE_TOOL_DIR = '$HOME/WeChat/macos-wechat-export'
-const DEFAULT_SOURCE_PYTHON = 'python3.14'
-const DEFAULT_SOURCE_DB_ROOT = join(
-  homedir(),
-  'Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files',
-  'wxid_yyy/db_storage',
-)
+/** 配置面板说明（DSH UI 渲染） */
+export const usage = `微信本地库只读旁听插件（MVP 只读不发送）。
+
+必读前提（source=wechat-db 时）：
+1. 本机已安装 sqlcipher（brew install sqlcipher）
+2. 已克隆 macos-wechat-export 并完成取钥（bootstrap_keys.py，产物 .wechat-local/keys.json）
+3. 显式配置 sourceToolDir / sourceDbRoot / sourcePython——本插件不内置任何机器路径默认值
+
+管控原则：groups 白名单为空即拒绝读取（fail-closed）；读取只经只读子进程；审计日志仅记元数据。`
 
 export const Config: Schema<PluginConfig> = Schema.object({
-  stateDir: Schema.string().default(''),
-  groups: Schema.array(String).default([]),
-  bufferSize: Schema.number().default(60),
-  distillEveryMessages: Schema.number().default(25),
-  distillIntervalMin: Schema.number().default(15),
-  persona: Schema.string().default('default'),
-  groupPersonas: Schema.dict(String).default({}),
-  // W2：保守默认 'none'——显式选择 wechat-db 才启动本地库读取（白名单硬闸门在适配器第一行）。
-  source: Schema.string().default('none'),
-  sourceToolDir: Schema.string().default(DEFAULT_SOURCE_TOOL_DIR),
-  sourcePython: Schema.string().default(DEFAULT_SOURCE_PYTHON),
-  sourceDbRoot: Schema.string().default(DEFAULT_SOURCE_DB_ROOT),
-  pollIntervalSec: Schema.number().default(10),
-  readLimit: Schema.number().default(50),
-  // W4：受监管原则——默认不回灌历史消息。
-  backfillOnStart: Schema.number().default(0),
+  stateDir: Schema.string().default('').description('状态目录（绝对路径）。留空 = DSH_HOME/dsh-group-lurker'),
+  groups: Schema.array(String).default([]).description('白名单：chatId 数组（xxx@chatroom）。空 = 拒绝读取（fail-closed）。用工具的 resolve 命令查群 chatId'),
+  bufferSize: Schema.number().default(60).description('每群消息环形缓冲条数'),
+  distillEveryMessages: Schema.number().default(25).description('每攒 N 条消息触发一次 LLM 提炼'),
+  distillIntervalMin: Schema.number().default(15).description('定时提炼间隔（分钟）'),
+  persona: Schema.string().default('default').description('默认人格（<stateDir>/personas/<name>.md）'),
+  groupPersonas: Schema.dict(String).default({}).description('按群人格覆盖：chatId → 人格名'),
+  source: Schema.string().default('none').description('消息源：none（默认，不读取）| wechat-db（本地库白名单读取）。选 wechat-db 必须显式配置 sourceToolDir/sourceDbRoot'),
+  sourceToolDir: Schema.string().description('macos-wechat-export 工具目录（含 wechat_db.py 与 .wechat-local/keys.json）。无默认值——必须显式配置'),
+  sourcePython: Schema.string().default('python3').description('运行工具的 python 解释器（绝对路径更稳，如 /opt/homebrew/bin/python3.14）'),
+  sourceDbRoot: Schema.string().description('微信 db_storage 绝对路径（~/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/<wxid_hash>/db_storage）。无默认值——必须显式配置'),
+  pollIntervalSec: Schema.number().default(10).description('轮询间隔（秒）'),
+  readLimit: Schema.number().default(50).description('每次读取的 --limit'),
+  backfillOnStart: Schema.number().default(0).description('启动回灌条数（默认 0 不回灌；受监管原则）'),
 })
 
 /**
@@ -173,6 +176,14 @@ export function apply(ctx: Context, config: PluginConfig): void {
   let source: WechatDbSource | null = null
   if (config.source === 'wechat-db') {
     try {
+      // 规范化（复用性）：机器相关路径无源码默认值——启用读取时必须显式配置，缺失即 fail-closed 拒读。
+      if (!config.sourceToolDir || !config.sourceDbRoot) {
+        throw new Error(
+          'wechat-db source: sourceToolDir and sourceDbRoot are required when source="wechat-db" ' +
+            '(no machine-specific defaults in plugin; set them explicitly in profile config)',
+        )
+      }
+      const sourcePython = config.sourcePython && config.sourcePython !== '' ? config.sourcePython : 'python3'
       // W3：昵称解析器（密钥纪律见 nickname.ts 头注——经 stdin 传 PRAGMA，绝不进日志/argv/git）
       const nicknameResolver = new NicknameResolver({
         contactDbPath: join(config.sourceDbRoot, 'contact/contact.db'),
@@ -183,7 +194,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
         groups: config.groups,
         dbRoot: config.sourceDbRoot,
         toolDir: config.sourceToolDir,
-        pythonPath: config.sourcePython,
+        pythonPath: sourcePython,
         store,
         stateDir,
         logger: logger as unknown as import('./source/wechat-db.js').WechatDbSourceLogger,

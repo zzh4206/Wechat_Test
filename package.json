@@ -2,6 +2,22 @@
   "name": "@zzh4206/dsh-group-lurker",
   "version": "0.1.0",
   "description": "DSH Cordis 插件：只读旁听群聊，提炼关键信息并生成日志。MVP 不发送任何消息。",
+  "keywords": [
+    "dsh",
+    "cordis",
+    "plugin",
+    "wechat",
+    "readonly",
+    "lurker"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zzh4206/Wechat_Test.git"
+  },
+  "homepage": "https://github.com/zzh4206/Wechat_Test#readme",
+  "bugs": {
+    "url": "https://github.com/zzh4206/Wechat_Test/issues"
+  },
   "type": "module",
   "main": "lib/index.js",
   "exports": {
