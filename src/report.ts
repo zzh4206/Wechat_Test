@@ -188,11 +188,16 @@ export interface RenderInput {
   quotes: Array<{ msgId: string; ts: number; senderName: string; text: string }>
   /** 重点人槽（person-digest 摘要；空 = 省略该槽） */
   persons: Array<{ name: string; line: string }>
+  /**
+   * L1「今日行动」槽（M4-T4.2 接真数据源）：待确认任务 + 当日到期/逾期任务行。
+   * 缺省（undefined）时保留 M3 占位行——旧调用方/旧测试行为不变。
+   */
+  actions?: readonly string[]
 }
 
 /** 三层金字塔 Markdown 渲染（纯函数） */
 export function renderReport(input: RenderInput): string {
-  const { kind, chatId, window: win, draft, status, messageCount, quotes, persons } = input
+  const { kind, chatId, window: win, draft, status, messageCount, quotes, persons, actions } = input
   const kindName = kind === 'daily' ? '日报' : kind === 'weekly' ? '周报' : '月报'
   const lines: string[] = []
   lines.push(`# ${kindName} · ${chatId} · ${win.dateKey}`, '')
@@ -215,7 +220,16 @@ export function renderReport(input: RenderInput): string {
     lines.push('（degraded：关键判断不可用）')
   }
   lines.push('', '### 今日行动', '')
-  lines.push('-（今日要我做的 / 今日应到期承诺：M4 任务与承诺识别接入后回填）', '')
+  // M4-T4.2：待确认清单 + 当日到期/逾期任务（真数据源 = tasks 表）；缺省保留占位
+  if (actions !== undefined) {
+    if (actions.length > 0) {
+      for (const a of actions) lines.push(`- ${a}`)
+    } else {
+      lines.push('-（今日无待确认任务，也无当日到期/逾期任务）')
+    }
+  } else {
+    lines.push('-（今日要我做的 / 今日应到期承诺：M4 任务与承诺识别接入后回填）')
+  }
   // —— L2 五分钟层 ——
   lines.push('## L2 五分钟层', '')
   if (draft && draft.topics.length > 0) {
@@ -368,7 +382,7 @@ export class ReportService {
     const messages = this.options.groupStore.getMessages(chatId, { afterTs: win.start - 1, beforeTs: win.end, limit: 2000 })
     const messageCount = messages.length
     if (messageCount === 0) {
-      const md = renderReport({ kind, chatId, window: win, draft: null, status: 'empty', messageCount: 0, quotes: [], persons: [] })
+      const md = renderReport({ kind, chatId, window: win, draft: null, status: 'empty', messageCount: 0, quotes: [], persons: [], actions: this.collectActions(chatId, win) })
       this.options.store.writeText(rel, md)
       await this.recordMeta(chatId, kind, win, 'empty', rel, 0, 0, 0)
       return { status: 'empty', path: rel, judgmentCount: 0, topicCount: 0, messageCount: 0 }
@@ -402,7 +416,7 @@ export class ReportService {
     }
 
     const quotes = this.pickQuotes(draft, messages)
-    const md = renderReport({ kind, chatId, window: win, draft, status, messageCount, quotes, persons })
+    const md = renderReport({ kind, chatId, window: win, draft, status, messageCount, quotes, persons, actions: this.collectActions(chatId, win) })
     const written = this.options.store.writeText(rel, md)
     const path = written ? rel : null
     const judgmentCount = draft?.judgments.length ?? 0
@@ -505,6 +519,31 @@ export class ReportService {
     }
     const ok = await this.options.groupStore.appendReportMeta(chatId, row)
     if (!ok) this.options.logger.warn(`report[${chatId}]: appendReportMeta failed for ${win.dateKey}`)
+  }
+
+  /**
+   * L1「今日行动」数据源（M4-T4.2，最小接入）：tasks 表——
+   * ① pending_confirm 清单（待确认，提请审批具体时间/真伪）；
+   * ② active 且 deadline 落在本报告窗口内或已逾期（当日到期/逾期未完成）。
+   * 查询失败/无任务 → 空数组（渲染为"无"行）。只读。
+   */
+  private collectActions(chatId: string, win: ReportWindow): string[] {
+    const out: string[] = []
+    try {
+      for (const t of this.options.groupStore.getTasks(chatId, { status: 'pending_confirm', limit: 50 })) {
+        out.push(`（待确认）${t.statement}${t.deadline === null ? '（无明确 deadline，请审批具体时间）' : ''}`)
+      }
+      const now = this.now()
+      for (const t of this.options.groupStore.getTasks(chatId, { status: 'active', limit: 200 })) {
+        if (t.deadline === null) continue
+        if (t.deadline < win.end && t.deadline >= win.start - 7 * 86_400_000) {
+          out.push(`${t.deadline < now ? '【逾期】' : ''}${t.statement}（截止 ${new Date(t.deadline).toLocaleString('zh-CN', { hour12: false })}）`)
+        }
+      }
+    } catch (error) {
+      this.options.logger.warn(`report[${chatId}] collectActions failed: ${String(error)}`)
+    }
+    return out
   }
 
   /** 重点人槽：watch 名单（watch_level != off）当日生效摘要（person-digest 数据源） */

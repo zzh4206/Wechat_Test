@@ -181,6 +181,70 @@ const MIGRATIONS: readonly ((db: DatabaseSync) => void)[] = [
       CREATE INDEX IF NOT EXISTS idx_clusters_person ON topic_clusters(person_pid, digest_date);
     `)
   },
+  // v2 → v3（M4-T4.1 + M3 遗留收口）：
+  // 1. report_meta 惰性表收编进正式迁移：迁移前先探测 sqlite_master，表已存在
+  //    （v2 时代的惰性建表产物）则不重复建、仅登记版本；不存在才 CREATE。
+  //    schema 与惰性版逐字一致，两来源的行互通。
+  // 2. tasks 增列（提醒计划器用）：overdue_marked_at（逾期自动标记时刻）、
+  //    created_at（识别时刻，无 deadline 时 +3 天软提醒的锚点）。ADD COLUMN 前
+  //    先 PRAGMA table_info 探测，列已存在则跳过（对只建了部分表的库也稳健）。
+  // 3. reminder_log：提醒计划器的"每任务每时点只触发一次"持久化去重表。
+  (db) => {
+    const hasReportMeta = db
+      .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'report_meta'`)
+      .get()
+    if (!hasReportMeta) {
+      db.exec(`
+        CREATE TABLE report_meta (
+          id            INTEGER PRIMARY KEY AUTOINCREMENT,
+          kind          TEXT NOT NULL,
+          date          TEXT NOT NULL,
+          window_start  INTEGER NOT NULL,
+          window_end    INTEGER NOT NULL,
+          status        TEXT NOT NULL,
+          path          TEXT NOT NULL DEFAULT '',
+          judgment_count INTEGER NOT NULL DEFAULT 0,
+          topic_count   INTEGER NOT NULL DEFAULT 0,
+          message_count INTEGER NOT NULL DEFAULT 0,
+          generated_at  INTEGER NOT NULL
+        );
+      `)
+    }
+    // tasks 可能不存在（早期部分建表的库）：先补全表骨架（已存在则 no-op）。
+    // 兜底骨架不带外键子句——部分建表的库可能缺 identities/messages，
+    // foreign_keys=ON 下带外键的建表骨架会在插入时报 no such table。
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS tasks (
+        task_id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        statement         TEXT NOT NULL,
+        assigner_pid      TEXT,
+        evidence_msg_id   TEXT,
+        deadline          INTEGER,
+        deadline_confidence REAL NOT NULL DEFAULT 0,
+        status            TEXT NOT NULL DEFAULT 'pending_confirm'
+                          CHECK (status IN ('pending_confirm','active','done','cancelled')),
+        learned_pattern   TEXT,
+        overdue_marked_at INTEGER NOT NULL DEFAULT 0,
+        created_at        INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+    `)
+    const taskCols = (db.prepare('PRAGMA table_info(tasks)').all() as Record<string, unknown>[]).map((c) => String(c.name))
+    if (!taskCols.includes('overdue_marked_at')) {
+      db.exec(`ALTER TABLE tasks ADD COLUMN overdue_marked_at INTEGER NOT NULL DEFAULT 0;`)
+    }
+    if (!taskCols.includes('created_at')) {
+      db.exec(`ALTER TABLE tasks ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0;`)
+    }
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS reminder_log (
+        task_id   INTEGER NOT NULL,
+        point     TEXT NOT NULL,
+        fired_at  INTEGER NOT NULL,
+        PRIMARY KEY (task_id, point)
+      );
+    `)
+  },
 ]
 
 /** identities 表行（M2-T2.1 追加：关注名单同步写入/查询） */
@@ -209,6 +273,63 @@ export interface ReportMetaRow {
   topicCount: number
   messageCount: number
   generatedAt: number
+}
+
+/** tasks 表单行（M4-T4.1 追加：任务识别写入/查询） */
+export interface TaskRow {
+  taskId: number
+  statement: string
+  assignerPid: string | null
+  evidenceMsgId: string | null
+  /** 毫秒时间戳；null = 无明确 deadline */
+  deadline: number | null
+  deadlineConfidence: number
+  status: 'pending_confirm' | 'active' | 'done' | 'cancelled'
+  /** 模式学习指纹（`${assigner_pid}:${hash}`）；null = 未登记 */
+  learnedPattern: string | null
+  /** 逾期自动标记时刻（0 = 未标记；不删条目） */
+  overdueMarkedAt: number
+  /** 识别/入库时刻（无 deadline 时 +3 天软提醒锚点） */
+  createdAt: number
+}
+
+/** 新任务入库入参（taskId/overdueMarkedAt/createdAt 由本层补全） */
+export interface NewTaskInput {
+  statement: string
+  assignerPid?: string | null
+  evidenceMsgId?: string | null
+  deadline?: number | null
+  deadlineConfidence?: number
+  status?: TaskRow['status']
+  learnedPattern?: string | null
+}
+
+/** events 表单行（M4-T4.1 追加：事件识别写入/查询） */
+export interface EventRow {
+  eventId: number
+  category: string
+  statement: string
+  evidenceMsgId: string | null
+  confidence: number
+  /** 'pending_confirm' | 'active' | 'superseded' */
+  status: string
+  /**
+   * 演变链指针：新行指向被其推翻的旧行（provenance）；
+   * 旧行被推翻时也回指新行（successor），旧行 status='superseded'。
+   */
+  supersedesEventId: number | null
+  source: 'auto' | 'manual'
+}
+
+/** 新事件入库入参 */
+export interface NewEventInput {
+  category: string
+  statement: string
+  evidenceMsgId?: string | null
+  confidence?: number
+  status?: string
+  supersedesEventId?: number | null
+  source?: 'auto' | 'manual'
 }
 
 /** topic_clusters 单行（person 维度，M2-T2.3 追加：人物增量摘要写入/查询） */
@@ -721,6 +842,211 @@ export class GroupStore {
     return [...keep].sort((a, b) => a - b).map((i) => day[i])
   }
 
+  // —— 以下为 M4-T4.1/T4.2 追加 API（tasks / events / reminder_log 读写），不改上方既有行 ——
+
+  /** 写一条任务（初始 status 由调用方定：'pending_confirm' 或模式学习 'active'）。返回新 taskId；失败返回 null。 */
+  async appendTask(input: NewTaskInput, createdAt?: number): Promise<number | null> {
+    const status = input.status ?? 'pending_confirm'
+    if (!TASK_STATUSES.includes(status)) return null
+    let newId: number | null = null
+    const ok = await this.write((db) => {
+      const r = db.prepare(`
+        INSERT INTO tasks
+          (statement, assigner_pid, evidence_msg_id, deadline, deadline_confidence,
+           status, learned_pattern, overdue_marked_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
+      `).run(
+        input.statement,
+        input.assignerPid ?? null,
+        input.evidenceMsgId ?? null,
+        input.deadline === null || input.deadline === undefined ? null : Math.floor(input.deadline),
+        input.deadlineConfidence ?? 0,
+        status,
+        input.learnedPattern ?? null,
+        createdAt === undefined ? Date.now() : Math.floor(createdAt),
+      )
+      newId = Number(r.lastInsertRowid)
+      return true
+    })
+    return ok ? newId : null
+  }
+
+  /** 按 id 取任务；不存在/失败返回 null。 */
+  getTask(taskId: number): TaskRow | null {
+    if (this.closed) return null
+    try {
+      const r = this.db.prepare('SELECT * FROM tasks WHERE task_id = ? LIMIT 1').get(taskId) as Record<string, unknown> | undefined
+      return r ? mapTaskRow(r) : null
+    } catch (error) {
+      this.logger.error(`group-store[${this.chatId}] getTask failed: ${String(error)}`)
+      return null
+    }
+  }
+
+  /** 查任务：可选 status 过滤、deadline 时间窗（deadline IS NOT NULL 时生效）、上限。只读。 */
+  getTasks(opts: { status?: TaskRow['status']; deadlineFrom?: number; deadlineTo?: number; limit?: number } = {}): TaskRow[] {
+    if (this.closed) return []
+    try {
+      const conds: string[] = []
+      const params: (string | number)[] = []
+      if (opts.status) {
+        conds.push('status = ?')
+        params.push(opts.status)
+      }
+      if (opts.deadlineFrom !== undefined) {
+        conds.push('deadline IS NOT NULL AND deadline >= ?')
+        params.push(opts.deadlineFrom)
+      }
+      if (opts.deadlineTo !== undefined) {
+        conds.push('deadline IS NOT NULL AND deadline < ?')
+        params.push(opts.deadlineTo)
+      }
+      const where = conds.length ? `WHERE ${conds.join(' AND ')}` : ''
+      const limit = Math.max(0, Math.floor(opts.limit ?? 200))
+      const rows = this.db
+        .prepare(`SELECT * FROM tasks ${where} ORDER BY task_id ASC LIMIT ${limit}`)
+        .all(...params) as Record<string, unknown>[]
+      return rows.map(mapTaskRow)
+    } catch (error) {
+      this.logger.error(`group-store[${this.chatId}] getTasks failed: ${String(error)}`)
+      return []
+    }
+  }
+
+  /** 更新任务状态（confirm/cancel/done 闭环）。返回是否成功。 */
+  async updateTaskStatus(taskId: number, status: TaskRow['status']): Promise<boolean> {
+    if (!TASK_STATUSES.includes(status)) return false
+    return this.write((db) => {
+      const r = db.prepare('UPDATE tasks SET status = ? WHERE task_id = ?').run(status, taskId)
+      return Number(r.changes) > 0
+    })
+  }
+
+  /** 登记模式学习指纹（确认时调用）。返回是否成功。 */
+  async setTaskLearnedPattern(taskId: number, pattern: string): Promise<boolean> {
+    return this.write((db) => {
+      const r = db.prepare('UPDATE tasks SET learned_pattern = ? WHERE task_id = ?').run(pattern, taskId)
+      return Number(r.changes) > 0
+    })
+  }
+
+  /**
+   * deadline 变更（冲突演变链·任务侧）：更新原行（不新建），返回是否成功。
+   */
+  async updateTaskDeadline(taskId: number, deadline: number | null, confidence: number): Promise<boolean> {
+    return this.write((db) => {
+      const r = db.prepare('UPDATE tasks SET deadline = ?, deadline_confidence = ? WHERE task_id = ?')
+        .run(deadline === null ? null : Math.floor(deadline), confidence, taskId)
+      return Number(r.changes) > 0
+    })
+  }
+
+  /** 逾期自动标记（只记时刻，不改状态不删条目；重复标记幂等）。返回是否发生了新标记。 */
+  async markTaskOverdue(taskId: number, at: number): Promise<boolean> {
+    return this.write((db) => {
+      const r = db
+        .prepare('UPDATE tasks SET overdue_marked_at = ? WHERE task_id = ? AND overdue_marked_at = 0')
+        .run(Math.floor(at), taskId)
+      return Number(r.changes) > 0
+    })
+  }
+
+  /** 写一条事件。返回新 eventId；失败返回 null。 */
+  async appendEvent(input: NewEventInput): Promise<number | null> {
+    let newId: number | null = null
+    const ok = await this.write((db) => {
+      const r = db.prepare(`
+        INSERT INTO events (category, statement, evidence_msg_id, confidence, status, supersedes_event_id, source)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        input.category,
+        input.statement,
+        input.evidenceMsgId ?? null,
+        input.confidence ?? 0,
+        input.status ?? 'active',
+        input.supersedesEventId === undefined ? null : input.supersedesEventId,
+        input.source ?? 'auto',
+      )
+      newId = Number(r.lastInsertRowid)
+      return true
+    })
+    return ok ? newId : null
+  }
+
+  /** 按 id 取事件；不存在/失败返回 null。 */
+  getEvent(eventId: number): EventRow | null {
+    if (this.closed) return null
+    try {
+      const r = this.db.prepare('SELECT * FROM events WHERE event_id = ? LIMIT 1').get(eventId) as Record<string, unknown> | undefined
+      return r ? mapEventRow(r) : null
+    } catch (error) {
+      this.logger.error(`group-store[${this.chatId}] getEvent failed: ${String(error)}`)
+      return null
+    }
+  }
+
+  /** 查事件：可选 status/source/category 过滤，event_id 升序。只读。 */
+  getEvents(opts: { status?: string; source?: 'auto' | 'manual'; category?: string; limit?: number } = {}): EventRow[] {
+    if (this.closed) return []
+    try {
+      const conds: string[] = []
+      const params: (string | number)[] = []
+      if (opts.status) {
+        conds.push('status = ?')
+        params.push(opts.status)
+      }
+      if (opts.source) {
+        conds.push('source = ?')
+        params.push(opts.source)
+      }
+      if (opts.category) {
+        conds.push('category = ?')
+        params.push(opts.category)
+      }
+      const where = conds.length ? `WHERE ${conds.join(' AND ')}` : ''
+      const limit = Math.max(0, Math.floor(opts.limit ?? 200))
+      const rows = this.db
+        .prepare(`SELECT * FROM events ${where} ORDER BY event_id ASC LIMIT ${limit}`)
+        .all(...params) as Record<string, unknown>[]
+      return rows.map(mapEventRow)
+    } catch (error) {
+      this.logger.error(`group-store[${this.chatId}] getEvents failed: ${String(error)}`)
+      return []
+    }
+  }
+
+  /**
+   * 冲突演变链（事件侧，M4-T4.2）：旧行标记 superseded 并把 supersedes_event_id
+   * 回指新行（successor 指针；新行的 supersedes_event_id 由调用方建行时指向旧行）。
+   * 不物理删除。返回是否成功。
+   */
+  async supersedeEvent(oldEventId: number, successorEventId: number): Promise<boolean> {
+    return this.write((db) => {
+      const r = db
+        .prepare(`UPDATE events SET status = 'superseded', supersedes_event_id = ? WHERE event_id = ?`)
+        .run(successorEventId, oldEventId)
+      return Number(r.changes) > 0
+    })
+  }
+
+  /** 更新事件状态（待确认闭环 / 演变链标记）。返回是否成功。 */
+  async updateEventStatus(eventId: number, status: string): Promise<boolean> {
+    return this.write((db) => {
+      const r = db.prepare('UPDATE events SET status = ? WHERE event_id = ?').run(status, eventId)
+      return Number(r.changes) > 0
+    })
+  }
+
+  /** 提醒去重登记：INSERT OR IGNORE，返回 true = 首次登记（应触发提醒）。 */
+  async appendReminderLog(taskId: number, point: string, firedAt: number): Promise<boolean> {
+    return this.write((db) => {
+      const r = db
+        .prepare('INSERT OR IGNORE INTO reminder_log (task_id, point, fired_at) VALUES (?, ?, ?)')
+        .run(taskId, point, Math.floor(firedAt))
+      return Number(r.changes) > 0
+    })
+  }
+
   /** 关闭库句柄（幂等） */
   close(): void {
     if (this.closed) return
@@ -792,6 +1118,13 @@ export class GroupStoreService {
       this.logger.error(`group-store getMessages(${chatId}) failed: ${String(error)}`)
       return []
     }
+  }
+
+  /** 按群取单条消息（服务层只读包装；库未开返回 null，不为此建库） */
+  getMessage(chatId: string, msgId: string): StoredMessage | null {
+    const st = this.stores.get(chatId)
+    if (!st) return null
+    return st.getMessage(msgId)
   }
 
   /**
@@ -959,10 +1292,140 @@ getReportMetas(chatId: string, opts: { kind?: ReportMetaRow['kind']; limit?: num
   return st.getReportMetas(opts)
 }
 
+  // —— 以下为 M4-T4.1/T4.2 追加（tasks/events/reminder_log 服务层包装），不改上方既有行 ——
+
+  /** 写一条任务（库未开则惰性建库；失败返回 null） */
+  async appendTask(chatId: string, input: NewTaskInput, createdAt?: number): Promise<number | null> {
+    try {
+      return await this.open(chatId).appendTask(input, createdAt)
+    } catch (error) {
+      this.logger.error(`group-store appendTask(${chatId}) failed: ${String(error)}`)
+      return null
+    }
+  }
+
+  /** 按 id 取任务；库未打开返回 null（读操作不建库） */
+  getTask(chatId: string, taskId: number): TaskRow | null {
+    const st = this.stores.get(chatId)
+    if (!st) return null
+    return st.getTask(taskId)
+  }
+
+  /** 查任务；库未打开返回 [] */
+  getTasks(chatId: string, opts?: { status?: TaskRow['status']; deadlineFrom?: number; deadlineTo?: number; limit?: number }): TaskRow[] {
+    const st = this.stores.get(chatId)
+    if (!st) return []
+    return st.getTasks(opts)
+  }
+
+  /** 更新任务状态；失败返回 false */
+  async updateTaskStatus(chatId: string, taskId: number, status: TaskRow['status']): Promise<boolean> {
+    const st = this.stores.get(chatId)
+    if (!st) return false
+    return st.updateTaskStatus(taskId, status)
+  }
+
+  /** 登记模式学习指纹；失败返回 false */
+  async setTaskLearnedPattern(chatId: string, taskId: number, pattern: string): Promise<boolean> {
+    const st = this.stores.get(chatId)
+    if (!st) return false
+    return st.setTaskLearnedPattern(taskId, pattern)
+  }
+
+  /** deadline 变更（更新原行不新建）；失败返回 false */
+  async updateTaskDeadline(chatId: string, taskId: number, deadline: number | null, confidence: number): Promise<boolean> {
+    const st = this.stores.get(chatId)
+    if (!st) return false
+    return st.updateTaskDeadline(taskId, deadline, confidence)
+  }
+
+  /** 逾期自动标记；失败返回 false */
+  async markTaskOverdue(chatId: string, taskId: number, at: number): Promise<boolean> {
+    const st = this.stores.get(chatId)
+    if (!st) return false
+    return st.markTaskOverdue(taskId, at)
+  }
+
+  /** 写一条事件；失败返回 null */
+  async appendEvent(chatId: string, input: NewEventInput): Promise<number | null> {
+    try {
+      return await this.open(chatId).appendEvent(input)
+    } catch (error) {
+      this.logger.error(`group-store appendEvent(${chatId}) failed: ${String(error)}`)
+      return null
+    }
+  }
+
+  /** 按 id 取事件；库未打开返回 null */
+  getEvent(chatId: string, eventId: number): EventRow | null {
+    const st = this.stores.get(chatId)
+    if (!st) return null
+    return st.getEvent(eventId)
+  }
+
+  /** 查事件；库未打开返回 [] */
+  getEvents(chatId: string, opts?: { status?: string; source?: 'auto' | 'manual'; category?: string; limit?: number }): EventRow[] {
+    const st = this.stores.get(chatId)
+    if (!st) return []
+    return st.getEvents(opts)
+  }
+
+  /** 冲突演变链：旧行 superseded + 回指新行；失败返回 false */
+  async supersedeEvent(chatId: string, oldEventId: number, successorEventId: number): Promise<boolean> {
+    const st = this.stores.get(chatId)
+    if (!st) return false
+    return st.supersedeEvent(oldEventId, successorEventId)
+  }
+
+  /** 更新事件状态；库未打开返回 false */
+  async updateEventStatus(chatId: string, eventId: number, status: string): Promise<boolean> {
+    const st = this.stores.get(chatId)
+    if (!st) return false
+    return st.updateEventStatus(eventId, status)
+  }
+
+  /** 提醒去重登记；失败返回 false */
+  async appendReminderLog(chatId: string, taskId: number, point: string, firedAt: number): Promise<boolean> {
+    const st = this.stores.get(chatId)
+    if (!st) return false
+    return st.appendReminderLog(taskId, point, firedAt)
+  }
+
   /** 关闭全部库句柄（dispose 时调用，幂等） */
   dispose(): void {
     for (const st of this.stores.values()) st.close()
     this.stores.clear()
+  }
+}
+
+/** tasks.status 允许值（schema CHECK 同口径） */
+export const TASK_STATUSES: readonly TaskRow['status'][] = ['pending_confirm', 'active', 'done', 'cancelled']
+
+function mapTaskRow(r: Record<string, unknown>): TaskRow {
+  return {
+    taskId: Number(r.task_id),
+    statement: String(r.statement),
+    assignerPid: r.assigner_pid === null ? null : String(r.assigner_pid),
+    evidenceMsgId: r.evidence_msg_id === null ? null : String(r.evidence_msg_id),
+    deadline: r.deadline === null ? null : Number(r.deadline),
+    deadlineConfidence: Number(r.deadline_confidence),
+    status: String(r.status) as TaskRow['status'],
+    learnedPattern: r.learned_pattern === null ? null : String(r.learned_pattern),
+    overdueMarkedAt: Number(r.overdue_marked_at ?? 0),
+    createdAt: Number(r.created_at ?? 0),
+  }
+}
+
+function mapEventRow(r: Record<string, unknown>): EventRow {
+  return {
+    eventId: Number(r.event_id),
+    category: String(r.category),
+    statement: String(r.statement),
+    evidenceMsgId: r.evidence_msg_id === null ? null : String(r.evidence_msg_id),
+    confidence: Number(r.confidence),
+    status: String(r.status),
+    supersedesEventId: r.supersedes_event_id === null ? null : Number(r.supersedes_event_id),
+    source: String(r.source) as EventRow['source'],
   }
 }
 

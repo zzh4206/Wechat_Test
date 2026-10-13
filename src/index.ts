@@ -31,7 +31,13 @@ import { PersonDigestService } from './person-digest.js'
 // M3：三层金字塔报告引擎 + 发件箱日志替身（新增行，不动他人行）
 import { ReportService } from './report.js'
 import type { ReportKind } from './report.js'
+import { localDayKey } from './person-digest.js'
 import { Outbox } from './outbox.js'
+// M4：任务/事件识别 + 待确认闭环（新增行，不动他人行）
+import { TaskRecognitionService } from './task-recognition.js'
+import type { RecognitionEvent } from './task-recognition.js'
+// M4：提醒计划器（时点表 + 每日速览）
+import { ReminderService } from './reminder.js'
 import { WechatDbSource } from './source/wechat-db.js'
 import { NicknameResolver } from './source/nickname.js'
 import type { WechatDbMessage } from './source/wechat-db.js'
@@ -87,6 +93,16 @@ export interface PluginConfig {
   reportEnabled: boolean
   /** M3：跨群聚合群数上限（默认 8；超出按相关度+活跃度取前 N，其余一行带过） */
   aggregationMaxGroups: number
+  /** M4-T4.1：任务/事件识别开关（默认 false = 零 LLM 调用、零落库） */
+  taskRecognitionEnabled: boolean
+  /** M4-T4.3：提醒计划器开关（默认 false = 零通知、零心跳） */
+  reminderEnabled: boolean
+  /** M4：本人 wxid（@我精确匹配）。空（默认）= 关闭精确匹配，降级 '@' 代理信号 */
+  selfWxid: string
+  /** M4-T4.2：模式学习（确认过的「派发人+句式」免确认，默认 true） */
+  patternLearning: boolean
+  /** M4-T4.3：截止前 1 小时提醒时点（功能文档 §6.3 默认关） */
+  deadline1hRemind: boolean
 }
 
 export const name = 'dsh-group-lurker'
@@ -130,6 +146,11 @@ export const Config: Schema<PluginConfig> = Schema.object({
   personDigestEnabled: Schema.boolean().default(false).description('M2-T2.3 人物按天增量摘要（默认关；generateDaily 手动可调，M3 接调度时再开）'),
   reportEnabled: Schema.boolean().default(false).description('M3 三层金字塔报告引擎（默认关；调度到点生成日/周/月报 + 跨群汇总，正文只落盘）'),
   aggregationMaxGroups: Schema.number().default(8).description('M3 跨群聚合群数上限（默认 8；超出按「与我相关度+活跃度」取前 N，其余一行带过）'),
+  taskRecognitionEnabled: Schema.boolean().default(false).description('M4 任务/事件识别（默认关）：@我指派 → 待确认 → 确认入清单，识别结果只落库不发送'),
+  reminderEnabled: Schema.boolean().default(false).description('M4 提醒计划器（默认关）：截止前 1 天/逾期时点 + 每日 7:50 待办速览（notify + outbox，零发送）'),
+  selfWxid: Schema.string().default('').description('本人 wxid（@我精确匹配 + 确认语义归属）。留空 = 关闭精确匹配，降级为 "@" 代理信号'),
+  patternLearning: Schema.boolean().default(true).description('M4 模式学习：确认过的「派发人+句式指纹」同类消息免确认直接入清单'),
+  deadline1hRemind: Schema.boolean().default(false).description('M4 截止前 1 小时提醒（功能文档 §6.3 默认关）'),
 })
 
 /**
@@ -166,6 +187,10 @@ export interface GroupLurker {
   readonly report: ReportService | null
   /** 发件箱日志替身（M3 落地 M4-T4.4 最小版）：只落盘不发送 */
   readonly outbox: Outbox
+  /** 任务/事件识别 + 待确认闭环（M4-T4.1/T4.2）；taskRecognitionEnabled=false 时为 null（零活动） */
+  readonly taskRecognition: TaskRecognitionService | null
+  /** 提醒计划器（M4-T4.3）；reminderEnabled=false 时为 null（零活动） */
+  readonly reminder: ReminderService | null
   /** 定时触达调度器（M1-T1.3）；schedulerEnabled=false 时为 null */
   readonly scheduler: Scheduler | null
   /** 系统通知通道（M1-T1.4）：notifyDryRun 控制是否真弹通知 */
@@ -250,11 +275,42 @@ export function apply(ctx: Context, config: PluginConfig): void {
               : 'LLM 归纳不可用，已降级输出骨架（degraded）'
           await notifier.notify(kind, title, body)
           outbox.appendOutbox({ kind, title, body, evidence_ref: res.path ?? '' })
+          // —— M3 遗留收口①：daily 全群出报告后，先对当日无报告的群补 generateReport，
+          //    再生成跨群汇总（调度端行为，不改 report.ts 引擎；生成前逐群探测 report_meta）。
+          if (kind === 'daily') await maybeSummarize(chatId, meta.scheduledAt)
         })().catch((error: unknown) => {
           logger.error(`scheduler[${kind}] report generation failed for ${chatId}: ${String(error)}`)
         })
       },
     })
+  }
+
+  /** M3 遗留收口①：daily occurrence 全群触发完 → 补缺报告群 → generateSummary */
+  const dailyDone = new Map<string, Set<string>>() // dateKey → 已完成日报的群
+  async function maybeSummarize(chatId: string, scheduledAt: number): Promise<void> {
+    if (!report) return
+    const dateKey = localDayKey(scheduledAt)
+    const done = dailyDone.get(dateKey) ?? new Set<string>()
+    dailyDone.set(dateKey, done)
+    done.add(chatId)
+    if (done.size < config.groups.length) return
+    for (const chatId of config.groups) {
+      // 逐群探测：当日无 daily 报告元数据 → 补生成（聚合不再缺报告）
+      const metas = groupStore.getReportMetas(chatId, { kind: 'daily', limit: 10 })
+      if (!metas.some((m) => m.date === dateKey && m.status !== 'empty')) {
+        try {
+          await report.generateReport(chatId, 'daily', scheduledAt)
+        } catch (error) {
+          logger.error(`summary-fill generateReport(${chatId}) failed: ${String(error)}`)
+        }
+      }
+    }
+    try {
+      const s = await report.generateSummary(scheduledAt)
+      logger.info(`summary generated: ${s.path ?? 'failed'} (groups=${s.groupsIncluded})`)
+    } catch (error) {
+      logger.error(`generateSummary failed: ${String(error)}`)
+    }
   }
 
   const onInsights = (chatId: string, insights: Insight[]): void => {
@@ -278,6 +334,47 @@ export function apply(ctx: Context, config: PluginConfig): void {
       groups: config.groups,
     })
   }
+
+  // —— M4-T4.1/T4.2：任务/事件识别 + 待确认闭环（默认关 = 零 LLM 调用、零落库） ——
+  // 待确认卡片：notify 只弹短句（不含正文），详情落 outbox（零发送）。
+  let taskRecognition: TaskRecognitionService | null = null
+  if (config.taskRecognitionEnabled) {
+    taskRecognition = new TaskRecognitionService({
+      groupStore,
+      llm: llmClient,
+      logger: logger as unknown as StoreLogger,
+      enabled: true,
+      selfWxid: config.selfWxid,
+      patternLearning: config.patternLearning,
+      onRecognitionEvent: (ev: RecognitionEvent) => {
+        const isTask = ev.kind === 'task'
+        const title = ev.type.endsWith('pending_confirm')
+          ? (isTask ? '识别到疑似任务，待确认' : '识别到疑似关键事件，待确认')
+          : (isTask ? '任务已入清单' : '关键事件已入库')
+        void notifier.notify('task-recognition', title, `群 ${ev.chatId} · 1 项${ev.degraded ? '（降级）' : ''}`).catch(() => {})
+        outbox.appendOutbox({
+          kind: ev.type,
+          title,
+          body: `${isTask ? '任务' : '事件'}：${ev.statement}\n群：${ev.chatId}\n编号：${ev.id}${ev.degraded ? '\n（降级产出）' : ''}`,
+          evidence_ref: `${ev.kind}:${ev.id}`,
+        })
+      },
+    })
+  }
+
+  // —— M4-T4.3：提醒计划器（默认关 = 零心跳、零通知；时点表见 reminder.ts 头注） ——
+  const reminder = config.reminderEnabled
+    ? new ReminderService({
+        groupStore,
+        notifier,
+        outbox,
+        store,
+        logger,
+        enabled: true,
+        deadline1hRemind: config.deadline1hRemind,
+        groups: config.groups,
+      })
+    : null
 
   const distiller = new Distiller({
     buffer,
@@ -365,6 +462,15 @@ export function apply(ctx: Context, config: PluginConfig): void {
               })
               void groupStore
                 .appendMessages(message.chatId, msgs)
+                .then(() => {
+                  // M4-T4.1 识别接线：落库成功后触发一次该群识别扫描（并发自动合并；
+                  // taskRecognitionEnabled=false 时为 null，零开销）。
+                  if (taskRecognition) {
+                    void taskRecognition.scanChat(message.chatId).catch((error: unknown) =>
+                      logger.warn(`task-recognition scan failed: ${String(error)}`),
+                    )
+                  }
+                })
                 .catch((error: unknown) =>
                   logger.warn(`group-store appendMessages failed: ${String(error)}`),
                 )
@@ -413,6 +519,8 @@ export function apply(ctx: Context, config: PluginConfig): void {
     personDigest,
     report,
     outbox,
+    taskRecognition,
+    reminder,
     scheduler,
     notifier,
     source,
@@ -468,14 +576,27 @@ export function apply(ctx: Context, config: PluginConfig): void {
         logger.error(`scheduler start refused: ${String(error)}`)
       }
     }
+    // M4-T4.3 提醒计划器：同样 start() → 清理函数约定；disabled 时 start 返回 noop。
+    let stopReminder: (() => void) | null = null
+    if (reminder) {
+      try {
+        stopReminder = reminder.start()
+        logger.info(`reminder started (1h=${config.deadline1hRemind}, digest=07:50)`)
+      } catch (error) {
+        logger.error(`reminder start refused: ${String(error)}`)
+      }
+    }
     return () => {
       stopTimer() // clearInterval：唯一 setInterval 的释放点
       stopSource?.() // clearInterval + 释放单实例锁
       stopScheduler?.() // clearInterval：调度器心跳唯一释放点
+      stopReminder?.() // clearInterval：提醒心跳唯一释放点
       distiller.dispose()
       journal.dispose() // 无定时器，清计数/日报内存引用
       personDigest?.dispose() // M2-T2.3：无定时器，清并发去重表
       report?.dispose() // M3：无定时器，清并发去重表
+      taskRecognition?.dispose() // M4：无定时器，清并发去重表
+      reminder?.stop() // M4：clearInterval（双保险）+ 清速览内存态
       groupStore.dispose() // 关闭全部 SQLite 句柄（WAL checkpoint 随 close 完成）
       buffer.clear()
       personas.clear()
