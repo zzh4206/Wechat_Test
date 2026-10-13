@@ -120,3 +120,11 @@ rm -rf /path/to/macos-wechat-export/.wechat-local
 ```
 
 宿主 dispose 保证无定时器/监听残留；卸载后自动回到"不读取"状态。
+
+## 9. 换机 / 重装微信（不迁移，重取钥）
+
+`.wechat-local/` 整个目录（`keys.json`、`original-signature.txt` 等）是**绑定本机与本次取钥过程的临时产物**，换机、重装微信、微信大版本升级后一律**不迁移、重新取钥**：
+
+1. 新环境按 QUICKSTART 重跑 `bootstrap_keys.py`——它会重新生成签名快照与逐库密钥；
+2. **切勿**把旧机器的 `.wechat-local/` 拷过去：旧签名快照会让 `bootstrap_keys.py` 的原版签名对照（第 101 行）误判"原版被改动"而中止；旧 keys.json 对新环境的库也不适用；
+3. 取钥成功后插件侧只需核对 `sourceDbRoot`/`sourceToolDir` 指向无误，游标（stateDir/cursor.json）与新库位点不一致时会自动按新库重新对齐（最坏情况：少量近期消息重复投递，下游幂等消化）。
