@@ -21,6 +21,57 @@ import { spawn } from 'node:child_process'
 import { closeSync, openSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import type { Store } from '../store.js'
+import type { NicknameResolver } from './nickname.js'
+
+/**
+ * W3 normalize：local_type → 占位标签（不做穷举，未知类型 '[type:N]'）。
+ * 1=文本保留原文；10000 附近的系统通知类型在 SYSTEM_TYPES，直接跳过不入管线。
+ */
+const TYPE_LABELS: Readonly<Record<number, string>> = Object.freeze({
+  3: '[图片]',
+  34: '[语音]',
+  43: '[视频]',
+  47: '[表情]',
+  48: '[位置]',
+  49: '[链接/文件]',
+  42: '[名片]',
+  62: '[视频号]',
+})
+
+/** 系统通知类（撤回/拍一拍/入群退群等提示行）：不入管线 */
+const SYSTEM_TYPES: ReadonlySet<number> = new Set([10000, 10002])
+
+/** text 为系统/媒体 XML（以 '<' 开头且含特征标记）→ 按系统消息处理（跳过） */
+const XML_SYSTEM_PATTERN = /<(sysmsg|emoji|emojijson|recordinfo|videomsg|voicemsg|newxmlmsg|newmsg)\b/i
+
+/** 发送者剥离：群消息 text 可能带 "wxid_xxx:\n正文" 前缀 */
+const SENDER_PREFIX_PATTERN = /^[A-Za-z0-9_@.-]{4,64}:\n/
+
+/**
+ * 单行规范化。返回 null = 跳过（系统消息/XML）；否则返回应入管线的 text。
+ * 导出供测试直接构造假 db 行做快照断言。
+ */
+export function normalizeRowText(
+  text: string,
+  localType: number | undefined,
+  sender: string,
+): string | null {
+  const trimmed = text.trim()
+  // XML 系统消息（sysmsg/emoji 等特征）→ 跳过
+  if (trimmed.startsWith('<') && XML_SYSTEM_PATTERN.test(trimmed)) return null
+  const type = localType ?? 1 // 无 local_type 的行按文本处理（兼容旧 CLI 输出）
+  if (SYSTEM_TYPES.has(type)) return null
+  if (type === 1) {
+    // 发送者剥离："wxid_xxx:\n正文"（前缀须匹配 sender 或形如 wxid）
+    if (sender !== 'unknown' && text.startsWith(`${sender}:\n`)) return text.slice(sender.length + 2)
+    if (SENDER_PREFIX_PATTERN.test(text) && text.split(':\n', 1)[0].startsWith('wxid')) {
+      const idx = text.indexOf(':\n')
+      return text.slice(idx + 2)
+    }
+    return text
+  }
+  return TYPE_LABELS[type] ?? `[type:${type}]`
+}
 
 export interface WechatDbSourceLogger {
   info(message: string): unknown
@@ -76,6 +127,8 @@ export interface WechatDbSourceOptions {
   backoffMaxMs?: number
   /** 可注入时钟（测试） */
   now?: () => number
+  /** W3：wxid→昵称解析器（可选；缺省 senderName 回退 sender 原值） */
+  nicknameResolver?: NicknameResolver
   /** 产出消息的下游回调（index.ts 里接 bus.ingest） */
   onMessages: (messages: WechatDbMessage[]) => void
 }
@@ -86,6 +139,7 @@ interface RawReadMessage {
   create_time?: unknown
   sender_id?: unknown
   text?: unknown
+  local_type?: unknown
 }
 
 const DEFAULT_POLL_INTERVAL_MS = 10_000
@@ -154,6 +208,7 @@ export class WechatDbSource {
   private readonly backoffMaxMs: number
   private readonly now: () => number
   private readonly onMessages: (messages: WechatDbMessage[]) => void
+  private readonly nicknameResolver: NicknameResolver | null
 
   /** 每群已见 messageId（防轮询重复投递；W4 换持久化游标） */
   private readonly seen = new Map<string, Set<string>>()
@@ -192,6 +247,7 @@ export class WechatDbSource {
     this.backoffMaxMs = options.backoffMaxMs ?? DEFAULT_BACKOFF_MAX_MS
     this.now = options.now ?? (() => Date.now())
     this.onMessages = options.onMessages
+    this.nicknameResolver = options.nicknameResolver ?? null
   }
 
   /** 闸门：白名单外的 chatId 一律抛错，且不产生任何子进程调用 */
@@ -234,6 +290,13 @@ export class WechatDbSource {
     }
     this.audit(chatId, fresh.length, ok)
     if (!ok) throw new Error(`wechat_db read failed for ${chatId} (code ${result.code})`)
+    // W3：senderName 填昵称（resolver 内部自带降级——失败回原 id 并 warn，不中断主流程）
+    if (this.nicknameResolver && fresh.length > 0) {
+      const map = await this.nicknameResolver.resolveGroup(chatId)
+      for (const message of fresh) {
+        message.senderName = map.get(message.sender) ?? message.sender
+      }
+    }
     return fresh
   }
 
@@ -255,11 +318,17 @@ export class WechatDbSource {
       if (known.has(id)) continue
       known.add(id)
       const sender = row.sender_id === undefined ? 'unknown' : String(row.sender_id)
+      // W3 normalize：local_type 过滤/占位；系统消息与 XML → 跳过不入管线
+      const rawText = row.text === null || row.text === undefined ? '' : String(row.text)
+      const localType =
+        typeof row.local_type === 'number' ? row.local_type : Number(row.local_type) || undefined
+      const text = normalizeRowText(rawText, localType, sender)
+      if (text === null) continue
       fresh.push({
         chatId,
-        sender, // W3 再映射昵称
-        senderName: sender,
-        text: row.text === null || row.text === undefined ? '' : String(row.text),
+        sender, // wxid（原值保留；senderName 才是显示名）
+        senderName: sender, // readOnce 尾部若有 resolver 会覆写为昵称
+        text,
         messageId: id,
         ts: typeof row.create_time === 'number' ? row.create_time : 0,
       })

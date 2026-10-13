@@ -21,6 +21,7 @@ import { Distiller, DefaultLlmClient } from './distiller.js'
 import type { LlmClient, HostLlmService, Insight } from './distiller.js'
 import { InsightsJournal } from './journal.js'
 import { WechatDbSource } from './source/wechat-db.js'
+import { NicknameResolver } from './source/nickname.js'
 import type { WechatDbMessage } from './source/wechat-db.js'
 
 export interface PluginConfig {
@@ -168,6 +169,12 @@ export function apply(ctx: Context, config: PluginConfig): void {
   let source: WechatDbSource | null = null
   if (config.source === 'wechat-db') {
     try {
+      // W3：昵称解析器（密钥纪律见 nickname.ts 头注——经 stdin 传 PRAGMA，绝不进日志/argv/git）
+      const nicknameResolver = new NicknameResolver({
+        contactDbPath: join(config.sourceDbRoot, 'contact/contact.db'),
+        keysJsonPath: join(config.sourceToolDir, '.wechat-local/keys.json'),
+        logger: logger as unknown as import('./source/nickname.js').NicknameLogger,
+      })
       source = new WechatDbSource({
         groups: config.groups,
         dbRoot: config.sourceDbRoot,
@@ -178,6 +185,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
         logger: logger as unknown as import('./source/wechat-db.js').WechatDbSourceLogger,
         pollIntervalMs: config.pollIntervalSec * 1000,
         readLimit: config.readLimit,
+        nicknameResolver,
         onMessages: (messages: WechatDbMessage[]) => {
           for (const message of messages) bus.ingest(message)
         },
