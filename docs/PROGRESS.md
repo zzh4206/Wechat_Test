@@ -11,7 +11,7 @@
 本插件**叠加**在社区插件 [`@michengai/dsh-im-connect`](https://github.com/MichengAI/dsh-im-connect) 之上，把它当作只读消息源，**不 fork、不修改、不参与构建**：
 
 - im-connect 的运行实例是 DSH profile（`~/.dsh/profiles/web`）里安装的那份，由它自己升级维护；
-- 本仓库如需放置其源码，只允许放在 `vendor/dsh-im-connect/`，用途**仅限只读参考**（供编码 agent 阅读事件接口）：
+- 【已废弃 2026-10-13】vendor 约定随 im-connect 路线淘汰而失效，vendor/ 已删除。原约定（仅历史存档）：~~本仓库如需放置其源码，只允许放在 `vendor/dsh-im-connect/`，用途仅限只读参考~~：
   - 原项目采用 Apache-2.0，保留其 LICENSE 与版权声明，注明"只读参考副本，有改动一律不接受"；
   - `vendor/` 不安装依赖、不进构建路径、不出现在插件发布产物中；
   - 若将来必须改动 im-connect 才能拿到群消息，走 GitHub fork / 上游 PR，不在本地 vendor 上改。
@@ -28,7 +28,7 @@
 
 ```
 docs/            PRD、技术设计、工作拆分、spike 报告
-vendor/          只读参考副本（见上，暂未放置）
+vendor/          【已删除 2026-10-13】第一代 im-connect 路线遗物，随路线淘汰清理
 src/ …           插件源码（WP1 起逐步落地）
 state/           本地运行数据（gitignore，绝不提交真实群数据）
 ```

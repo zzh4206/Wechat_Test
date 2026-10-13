@@ -88,6 +88,7 @@ npm test        # node --test（64 例，全离线 mock，不碰真实库）
 ```
 
 - 项目文档（PRD/技术设计/工作拆分/spike 报告）：[docs/](docs/)
+- 历史：第一代 im-connect 路线的 vendor 参考副本已于 2026-10-13 删除（路线淘汰）
 - 开发进度日志：[docs/PROGRESS.md](docs/PROGRESS.md)
 
 ## License
