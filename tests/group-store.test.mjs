@@ -123,7 +123,8 @@ test('dispose：关闭全部句柄，写入/查询失败安全返回', async () 
 test('内存库迁移冒烟：:memory: 亦可完整建表（同 MIGRATIONS 路径）', async () => {
   const { GroupStore } = await import('../lib/group-store.js')
   const mem = new GroupStore(':memory:', ':memory:', logger)
-  assert.equal(mem.schemaVersion, 1)
+  // M2-T2.3：topic_clusters 增加 person 维度列 → MIGRATIONS 追加 v2，版本随之推进（只前不退）
+  assert.equal(mem.schemaVersion, 2)
   assert.equal(await mem.appendMessages([{ msgId: 'a', ts: 1, senderPid: 'P01', text: 'x' }]), 1)
   assert.equal(mem.countMessages(), 1)
   mem.close()

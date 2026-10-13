@@ -26,6 +26,8 @@ import { SystemNotifier } from './notify.js'
 import { GroupStoreService } from './group-store.js'
 import { PersonaTrackService } from './persona-track.js'
 import type { WatchListEntry } from './persona-track.js'
+// M2-T2.3：人物增量摘要（新增行，不动他人行）
+import { PersonDigestService } from './person-digest.js'
 import { WechatDbSource } from './source/wechat-db.js'
 import { NicknameResolver } from './source/nickname.js'
 import type { WechatDbMessage } from './source/wechat-db.js'
@@ -75,6 +77,8 @@ export interface PluginConfig {
    * scope：'global'（全部白名单群）| { groups: [chatId] }（指定群）。
    */
   watchList?: WatchListEntry[]
+  /** M2-T2.3：人物增量摘要开关（默认 false；M3 报告引擎接调度时再开） */
+  personDigestEnabled: boolean
 }
 
 export const name = 'dsh-group-lurker'
@@ -115,6 +119,7 @@ export const Config: Schema<PluginConfig> = Schema.object({
   notifyDryRun: Schema.boolean().default(true).description('系统通知 dry_run：true 只记日志不弹通知中心'),
   // schemastery 无 const 联合：条目结构运行时校验（persona-track 内 fail-closed 跳过非法项）
   watchList: Schema.array(Schema.any()).default([]).description('M2 关注名单：[{ wxid, remark?, scope: "global" | { groups: [chatId] } }]。空数组 = 无人被追踪（零活动）'),
+  personDigestEnabled: Schema.boolean().default(false).description('M2-T2.3 人物按天增量摘要（默认关；generateDaily 手动可调，M3 接调度时再开）'),
 })
 
 /**
@@ -145,6 +150,8 @@ export interface GroupLurker {
   readonly groupStore: GroupStoreService
   /** 关注名单 + 按人跨群检索（M2-T2.1/T2.4）；空名单 fail-closed 零活动 */
   readonly personaTrack: PersonaTrackService
+  /** 人物按天增量摘要（M2-T2.3）；personDigestEnabled=false 时为 null（零活动） */
+  readonly personDigest: PersonDigestService | null
   /** 定时触达调度器（M1-T1.3）；schedulerEnabled=false 时为 null */
   readonly scheduler: Scheduler | null
   /** 系统通知通道（M1-T1.4）：notifyDryRun 控制是否真弹通知 */
@@ -331,6 +338,18 @@ export function apply(ctx: Context, config: PluginConfig): void {
     logger.error(`persona-track syncWatchList failed: ${String(error)}`)
   })
 
+  // —— M2-T2.3：人物按天增量摘要（默认关；generateDaily 手动 API，M3 报告引擎统一接调度）——
+  const personDigest = config.personDigestEnabled
+    ? new PersonDigestService({
+        groupStore,
+        store,
+        stateDir,
+        llm: llmClient,
+        logger: logger as unknown as StoreLogger,
+        enabled: true,
+      })
+    : null
+
   const api: GroupLurker = {
     stateDir,
     store,
@@ -341,6 +360,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
     journal,
     groupStore,
     personaTrack,
+    personDigest,
     scheduler,
     notifier,
     source,
@@ -402,6 +422,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
       stopScheduler?.() // clearInterval：调度器心跳唯一释放点
       distiller.dispose()
       journal.dispose() // 无定时器，清计数/日报内存引用
+      personDigest?.dispose() // M2-T2.3：无定时器，清并发去重表
       groupStore.dispose() // 关闭全部 SQLite 句柄（WAL checkpoint 随 close 完成）
       buffer.clear()
       personas.clear()

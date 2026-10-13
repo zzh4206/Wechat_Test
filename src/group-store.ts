@@ -166,6 +166,21 @@ const MIGRATIONS: readonly ((db: DatabaseSync) => void)[] = [
       );
     `)
   },
+  // v0/v1 → v2：topic_clusters 增加 person 维度列（M2-T2.3 人物增量摘要）。
+  // 只加列不退：历史行新列取默认值，旧查询不受影响（迁移不可重放倒退）。
+  (db) => {
+    db.exec(`
+      ALTER TABLE topic_clusters ADD COLUMN person_pid        TEXT NOT NULL DEFAULT '';
+      ALTER TABLE topic_clusters ADD COLUMN digest_date       TEXT NOT NULL DEFAULT '';
+      ALTER TABLE topic_clusters ADD COLUMN digest_status     TEXT NOT NULL DEFAULT '';
+      ALTER TABLE topic_clusters ADD COLUMN evidence_msg_ids  TEXT NOT NULL DEFAULT '[]';
+      ALTER TABLE topic_clusters ADD COLUMN mood_or_stance    TEXT NOT NULL DEFAULT '';
+      ALTER TABLE topic_clusters ADD COLUMN open_questions    TEXT NOT NULL DEFAULT '[]';
+      ALTER TABLE topic_clusters ADD COLUMN message_count     INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE topic_clusters ADD COLUMN digest_path       TEXT NOT NULL DEFAULT '';
+      CREATE INDEX IF NOT EXISTS idx_clusters_person ON topic_clusters(person_pid, digest_date);
+    `)
+  },
 ]
 
 /** identities 表行（M2-T2.1 追加：关注名单同步写入/查询） */
@@ -175,6 +190,23 @@ export interface IdentityRow {
   groupNick?: string
   remark?: string
   watchLevel?: 'global' | 'group' | 'off'
+}
+
+/** topic_clusters 单行（person 维度，M2-T2.3 追加：人物增量摘要写入/查询） */
+export interface PersonDigestRow {
+  personPid: string
+  date: string
+  status: string
+  title: string
+  summary: string
+  evidenceMsgIds: readonly string[]
+  moodOrStance: string
+  openQuestions: readonly string[]
+  messageCount: number
+  digestPath: string
+  /** 摘要时间窗（毫秒；读取接口同样返回） */
+  windowStart: number
+  windowEnd: number
 }
 
 /** 单群库句柄（不直接对外导出使用，统一经 GroupStoreService） */
@@ -461,6 +493,118 @@ export class GroupStore {
     }))
   }
 
+  // —— 以下为 M2-T2.3 追加 API（人物增量摘要落盘 + 计数/兜底上下文查询），不改上方既有行 ——
+
+  /** 写一条 person 维度 topic_clusters 行（evidence/open_questions 存 JSON 文本）。返回是否成功。 */
+  async appendPersonDigest(row: PersonDigestRow): Promise<boolean> {
+    if (!row.personPid || !row.date) return false
+    return this.write((db) => {
+      db.prepare(`
+        INSERT INTO topic_clusters
+          (window_start, window_end, summary, title,
+           person_pid, digest_date, digest_status, evidence_msg_ids,
+           mood_or_stance, open_questions, message_count, digest_path)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        Math.floor(row.windowStart),
+        Math.floor(row.windowEnd),
+        row.summary ?? '',
+        row.title ?? '',
+        row.personPid,
+        row.date,
+        row.status ?? '',
+        JSON.stringify(row.evidenceMsgIds ?? []),
+        row.moodOrStance ?? '',
+        JSON.stringify(row.openQuestions ?? []),
+        Math.floor(row.messageCount ?? 0),
+        row.digestPath ?? '',
+      )
+      return true
+    })
+  }
+
+  /** 读某人物某日的 topic_clusters 行（含降级占位行）。只读，失败返回 []。 */
+  getPersonDigests(personPid: string, date: string): Array<PersonDigestRow & { windowStart: number; windowEnd: number }> {
+    if (this.closed) return []
+    try {
+      const rows = this.db
+        .prepare(`
+          SELECT window_start, window_end, summary, title, person_pid, digest_date,
+                 digest_status, evidence_msg_ids, mood_or_stance, open_questions,
+                 message_count, digest_path
+          FROM topic_clusters WHERE person_pid = ? AND digest_date = ? ORDER BY rowid ASC
+        `)
+        .all(personPid, date) as Record<string, unknown>[]
+      return rows.map((r) => ({
+        personPid: String(r.person_pid),
+        date: String(r.digest_date),
+        status: String(r.digest_status),
+        title: String(r.title),
+        summary: String(r.summary),
+        evidenceMsgIds: safeJsonArray(r.evidence_msg_ids),
+        moodOrStance: String(r.mood_or_stance),
+        openQuestions: safeJsonArray(r.open_questions),
+        messageCount: Number(r.message_count),
+        digestPath: String(r.digest_path),
+        windowStart: Number(r.window_start),
+        windowEnd: Number(r.window_end),
+      }))
+    } catch (error) {
+      this.logger.error(`group-store[${this.chatId}] getPersonDigests failed: ${String(error)}`)
+      return []
+    }
+  }
+
+  /** 按 sender/时间窗计数（与既有 countMessages() 并存；发言量仅内部信号用）。只读。 */
+  countMessagesBy(
+    senderKeys: readonly string[] | undefined,
+    opts: { afterTs?: number; beforeTs?: number } = {},
+  ): number {
+    if (this.closed) return 0
+    try {
+      const conds: string[] = []
+      const params: (string | number)[] = []
+      if (senderKeys && senderKeys.length > 0) {
+        conds.push(`sender_pid IN (${senderKeys.map(() => '?').join(',')})`)
+        params.push(...senderKeys)
+      }
+      if (opts.afterTs !== undefined) {
+        conds.push('ts > ?')
+        params.push(opts.afterTs)
+      }
+      if (opts.beforeTs !== undefined) {
+        conds.push('ts < ?')
+        params.push(opts.beforeTs)
+      }
+      const where = conds.length ? `WHERE ${conds.join(' AND ')}` : ''
+      return Number(this.db.prepare(`SELECT COUNT(*) AS n FROM messages ${where}`).get(...params)!.n)
+    } catch (error) {
+      this.logger.error(`group-store[${this.chatId}] countMessages failed: ${String(error)}`)
+      return 0
+    }
+  }
+
+  /**
+   * 某人物某时间窗的消息 + 兜底上下文（功能文档 §3.2"上下文保留"）：
+   * 返回目标人物每条消息前后各 pad 条（去重、按 ts 升序）的并集切片；
+   * 调用方以 senderKeys 过滤即得本人消息。只读。
+   */
+  getPersonDayContext(
+    senderKeys: readonly string[],
+    startTs: number,
+    endTs: number,
+    pad = 2,
+  ): StoredMessage[] {
+    if (this.closed || senderKeys.length === 0) return []
+    const day = this.getMessages({ afterTs: startTs, beforeTs: endTs, limit: 2000 })
+    const keep = new Set<number>()
+    day.forEach((m, i) => {
+      if (!senderKeys.includes(m.senderPid)) return
+      for (let j = Math.max(0, i - pad); j <= Math.min(day.length - 1, i + pad); j++) keep.add(j)
+    })
+    return [...keep].sort((a, b) => a - b).map((i) => day[i])
+  }
+
   /** 关闭库句柄（幂等） */
   close(): void {
     if (this.closed) return
@@ -591,9 +735,81 @@ export class GroupStoreService {
     return [...this.stores.keys()]
   }
 
+  // —— M2-T2.3 追加（服务层包装；库未开时惰性建库写 / 只读返回空） ——
+
+  /** 写一条 person 维度摘要行（失败返回 false） */
+  async appendPersonDigest(chatId: string, row: PersonDigestRow): Promise<boolean> {
+    try {
+      return await this.open(chatId).appendPersonDigest(row)
+    } catch (error) {
+      this.logger.error(`group-store appendPersonDigest(${chatId}) failed: ${String(error)}`)
+      return false
+    }
+  }
+
+  /** 读某人物某日摘要行；库未打开返回 []（不为此建库） */
+  getPersonDigests(
+    chatId: string,
+    personPid: string,
+    date: string,
+  ): Array<PersonDigestRow & { windowStart: number; windowEnd: number }> {
+    const st = this.stores.get(chatId)
+    if (!st) return []
+    try {
+      return st.getPersonDigests(personPid, date)
+    } catch (error) {
+      this.logger.error(`group-store getPersonDigests(${chatId}) failed: ${String(error)}`)
+      return []
+    }
+  }
+
+  /** 计数包装（库未开返回 0；发言量仅内部信号用） */
+  countMessages(
+    chatId: string,
+    senderKeys: readonly string[] | undefined,
+    opts?: { afterTs?: number; beforeTs?: number },
+  ): number {
+    const st = this.stores.get(chatId)
+    if (!st) return 0
+    try {
+      return st.countMessagesBy(senderKeys, opts)
+    } catch (error) {
+      this.logger.error(`group-store countMessages(${chatId}) failed: ${String(error)}`)
+      return 0
+    }
+  }
+
+  /** 兜底上下文查询包装（库未开返回 []） */
+  getPersonDayContext(
+    chatId: string,
+    senderKeys: readonly string[],
+    startTs: number,
+    endTs: number,
+    pad = 2,
+  ): StoredMessage[] {
+    const st = this.stores.get(chatId)
+    if (!st) return []
+    try {
+      return st.getPersonDayContext(senderKeys, startTs, endTs, pad)
+    } catch (error) {
+      this.logger.error(`group-store getPersonDayContext(${chatId}) failed: ${String(error)}`)
+      return []
+    }
+  }
+
   /** 关闭全部库句柄（dispose 时调用，幂等） */
   dispose(): void {
     for (const st of this.stores.values()) st.close()
     this.stores.clear()
+  }
+}
+
+/** 安全解析 JSON 数组文本（损坏/非法返回 []，不抛出） */
+function safeJsonArray(text: unknown): string[] {
+  try {
+    const v = JSON.parse(String(text ?? '[]'))
+    return Array.isArray(v) ? v.map(String) : []
+  } catch {
+    return []
   }
 }
