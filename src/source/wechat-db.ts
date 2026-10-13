@@ -169,6 +169,9 @@ export function createCliRunner(options: {
       let settled = false
       const child = spawn(pythonPath, [script, ...args], {
         stdio: ['ignore', 'pipe', 'pipe'],
+        // wechat_db.py 的 --key-file 默认是相对路径 .wechat-local/keys.json，按 cwd 解析；
+        // 不设 cwd 会继承宿主进程 cwd，导致密钥找不到。这里固定到工具目录（仍不接触密钥内容）。
+        cwd: toolDir,
       })
       const finish = (code: number): void => {
         if (settled) return

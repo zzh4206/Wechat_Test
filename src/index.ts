@@ -275,5 +275,8 @@ export function apply(ctx: Context, config: PluginConfig): void {
   }, 'group-lurker.serve')
 
   // 挂到宿主上下文，供其它模块只读访问。
-  ;(ctx as Context & { groupLurker?: GroupLurker }).groupLurker = api
+  // cordis 的 Context 是 Proxy：必须先 provide 声明，才能在 ctx 上暴露属性（直接赋值会抛
+  // "cannot set property without provide"）。provide 注册为服务，其它模块经 ctx.groupLurker
+  // 或 ctx.get('groupLurker') 只读访问，随本插件 dispose 自动注销。
+  ctx.provide('groupLurker', api)
 }

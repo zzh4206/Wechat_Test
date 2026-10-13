@@ -52,3 +52,4 @@ MVP「只观察」规划完成，即将进入开发。工作包 WP0–WP5 见 WO
 | 2026-10-12 | W2 读取适配器完成并验收（362ee5b）：白名单硬闸门/审计/退避/单实例，50 pass / 0 fail |
 | 2026-10-12 | W3 规范化+昵称解析完成并验收（df648b5）：映射链经 name2id 中转破解，Test 群冒烟昵称解析成功，58 pass / 0 fail |
 | 2026-10-12 | W4 持久化游标完成并验收（2dcc988）：重启不重投不漏新，64 pass / 0 fail。**只剩 W5 端到端** |
+| 2026-10-13 | W5 管线合流完成并验收：source→`bus.ingest`→buffer→distiller→journal 端到端接通；修复 cordis 服务暴露（`ctx.provide`，Proxy 直赋抛错）与 CLI 子进程 cwd（keys.json 相对路径）；64 pass / 0 fail。本地 profile 观察模式运行（patch.yml 含机器路径不入库）。RUNBOOK 待补 |
