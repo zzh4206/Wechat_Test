@@ -49,6 +49,8 @@ export interface PluginConfig {
   pollIntervalSec: number
   /** 每次 read 的 --limit，默认 50 */
   readLimit: number
+  /** W4：启动回灌条数（默认 0 不回灌；>0 首轮可回灌最多该条数最近历史，受 readLimit 约束） */
+  backfillOnStart: number
 }
 
 export const name = 'dsh-group-lurker'
@@ -79,6 +81,8 @@ export const Config: Schema<PluginConfig> = Schema.object({
   sourceDbRoot: Schema.string().default(DEFAULT_SOURCE_DB_ROOT),
   pollIntervalSec: Schema.number().default(10),
   readLimit: Schema.number().default(50),
+  // W4：受监管原则——默认不回灌历史消息。
+  backfillOnStart: Schema.number().default(0),
 })
 
 /**
@@ -185,6 +189,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
         logger: logger as unknown as import('./source/wechat-db.js').WechatDbSourceLogger,
         pollIntervalMs: config.pollIntervalSec * 1000,
         readLimit: config.readLimit,
+        backfillOnStart: config.backfillOnStart,
         nicknameResolver,
         onMessages: (messages: WechatDbMessage[]) => {
           for (const message of messages) bus.ingest(message)

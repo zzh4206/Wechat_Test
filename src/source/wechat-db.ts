@@ -22,6 +22,7 @@ import { closeSync, openSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import type { Store } from '../store.js'
 import type { NicknameResolver } from './nickname.js'
+import { GroupCursor } from './cursor.js'
 
 /**
  * W3 normalize：local_type → 占位标签（不做穷举，未知类型 '[type:N]'）。
@@ -127,6 +128,8 @@ export interface WechatDbSourceOptions {
   backoffMaxMs?: number
   /** 可注入时钟（测试） */
   now?: () => number
+  /** W4：启动回灌条数（默认 0 不回灌；>0 首轮可回灌最多该条数最近历史，受 readLimit 约束） */
+  backfillOnStart?: number
   /** W3：wxid→昵称解析器（可选；缺省 senderName 回退 sender 原值） */
   nicknameResolver?: NicknameResolver
   /** 产出消息的下游回调（index.ts 里接 bus.ingest） */
@@ -146,8 +149,6 @@ const DEFAULT_POLL_INTERVAL_MS = 10_000
 const DEFAULT_READ_LIMIT = 50
 const DEFAULT_BACKOFF_MAX_MS = 5 * 60_000
 const DEFAULT_TIMEOUT_MS = 30_000
-/** 每群 in-memory 去重上限（W4 会换成持久化游标，这里只防轮询重复投递） */
-const DEDUPE_CAP = 2000
 
 /**
  * 默认子进程运行器：spawn(python, [wechat_db.py, ...args])，超时 SIGKILL。
@@ -210,8 +211,8 @@ export class WechatDbSource {
   private readonly onMessages: (messages: WechatDbMessage[]) => void
   private readonly nicknameResolver: NicknameResolver | null
 
-  /** 每群已见 messageId（防轮询重复投递；W4 换持久化游标） */
-  private readonly seen = new Map<string, Set<string>>()
+  /** W4：持久化增量游标（每群已读 id 尾部窗口，防重启重投递；见 cursor.ts） */
+  private readonly cursor: GroupCursor
   /** 单实例锁文件 fd（start 时获取，stop 释放） */
   private lockFd: number | null = null
   private _running = false
@@ -248,6 +249,13 @@ export class WechatDbSource {
     this.now = options.now ?? (() => Date.now())
     this.onMessages = options.onMessages
     this.nicknameResolver = options.nicknameResolver ?? null
+    // W4：持久化游标——构造时恢复；损坏降级空游标 + warn（cursor.ts 内处理）
+    this.cursor = new GroupCursor({
+      store: this.store,
+      logger: this.logger,
+      backfillOnStart: options.backfillOnStart ?? 0,
+    })
+    this.cursor.load()
   }
 
   /** 闸门：白名单外的 chatId 一律抛错，且不产生任何子进程调用 */
@@ -304,19 +312,15 @@ export class WechatDbSource {
   private parse(chatId: string, stdout: string): WechatDbMessage[] {
     const parsed = JSON.parse(stdout) as { messages?: RawReadMessage[] }
     const rows = Array.isArray(parsed.messages) ? parsed.messages : []
-    let known = this.seen.get(chatId)
-    if (!known) {
-      known = new Set()
-      this.seen.set(chatId, known)
-    }
     const fresh: WechatDbMessage[] = []
     for (const row of rows) {
       // server_id 缺失（未上服务器的本地行）无法稳定去重，跳过
       const messageId = row.server_id
       if (messageId === null || messageId === undefined) continue
       const id = String(messageId)
-      if (known.has(id)) continue
-      known.add(id)
+      // W4：持久化游标去重（重启后同 id 不再入管线）；未命中 → 记为已读并投递
+      if (this.cursor.has(chatId, id)) continue
+      this.cursor.add(chatId, id)
       const sender = row.sender_id === undefined ? 'unknown' : String(row.sender_id)
       // W3 normalize：local_type 过滤/占位；系统消息与 XML → 跳过不入管线
       const rawText = row.text === null || row.text === undefined ? '' : String(row.text)
@@ -332,10 +336,6 @@ export class WechatDbSource {
         messageId: id,
         ts: typeof row.create_time === 'number' ? row.create_time : 0,
       })
-    }
-    if (known.size > DEDUPE_CAP) {
-      // 粗暴上限：防止长跑内存增长；W4 持久化游标上线后移除
-      this.seen.set(chatId, new Set())
     }
     return fresh
   }
@@ -362,6 +362,8 @@ export class WechatDbSource {
       }
     }
     this.lastPollAt = now
+    // W4：每轮轮询结束持久化一次游标（不是每条消息写盘）；失败在 cursor 内 warn，不中断
+    this.cursor.persist()
     if (allOk) {
       this.consecutiveFailures = 0
       this.nextAttemptAt = now + this.pollIntervalMs
