@@ -192,6 +192,25 @@ export interface IdentityRow {
   watchLevel?: 'global' | 'group' | 'off'
 }
 
+/** supersede 标记前缀（写进 digest_status；读方以此识别旧行，不改 schema 版本） */
+export const DIGEST_SUPERSEDED_MARK = 'superseded__'
+
+/** 报告元数据单行（M3-T3.1：报告落盘后入库一行，供检索/盘点） */
+export interface ReportMetaRow {
+  kind: 'daily' | 'weekly' | 'monthly'
+  /** 报告周期结束日的本地日期键 YYYY-MM-DD（= 文件名 <date>.md） */
+  date: string
+  windowStart: number
+  windowEnd: number
+  status: 'ok' | 'degraded' | 'empty'
+  /** 相对 stateDir 的 md 路径 */
+  path: string
+  judgmentCount: number
+  topicCount: number
+  messageCount: number
+  generatedAt: number
+}
+
 /** topic_clusters 单行（person 维度，M2-T2.3 追加：人物增量摘要写入/查询） */
 export interface PersonDigestRow {
   personPid: string
@@ -523,8 +542,16 @@ export class GroupStore {
     })
   }
 
-  /** 读某人物某日的 topic_clusters 行（含降级占位行）。只读，失败返回 []。 */
-  getPersonDigests(personPid: string, date: string): Array<PersonDigestRow & { windowStart: number; windowEnd: number }> {
+  /**
+   * 读某人物某日的 topic_clusters 行（M3 定夺点②：同日重跑覆盖——默认只返回生效行，
+   * 被 supersede 的旧行需显式 includeSuperseded 才返回；不物理删除）。
+   * 只读，失败返回 []。
+   */
+  getPersonDigests(
+    personPid: string,
+    date: string,
+    opts: { includeSuperseded?: boolean } = {},
+  ): Array<PersonDigestRow & { windowStart: number; windowEnd: number }> {
     if (this.closed) return []
     try {
       const rows = this.db
@@ -535,7 +562,7 @@ export class GroupStore {
           FROM topic_clusters WHERE person_pid = ? AND digest_date = ? ORDER BY rowid ASC
         `)
         .all(personPid, date) as Record<string, unknown>[]
-      return rows.map((r) => ({
+      const mapped = rows.map((r) => ({
         personPid: String(r.person_pid),
         date: String(r.digest_date),
         status: String(r.digest_status),
@@ -549,8 +576,97 @@ export class GroupStore {
         windowStart: Number(r.window_start),
         windowEnd: Number(r.window_end),
       }))
+      // 默认过滤被 supersede 的旧行（读方默认取最新生效行）
+      return opts.includeSuperseded
+        ? mapped
+        : mapped.filter((row) => !row.status.startsWith(DIGEST_SUPERSEDED_MARK))
     } catch (error) {
       this.logger.error(`group-store[${this.chatId}] getPersonDigests failed: ${String(error)}`)
+      return []
+    }
+  }
+
+  /**
+   * 同日重跑覆盖（M3 定夺点②）：把该 pid+date 的既有行 digest_status 打上
+   * superseded 前缀（不改 schema、不物理删除）。返回是否成功。
+   */
+  async supersedePersonDigests(personPid: string, date: string): Promise<boolean> {
+    return this.write((db) => {
+      db.prepare(
+        `UPDATE topic_clusters SET digest_status = '${DIGEST_SUPERSEDED_MARK}' || digest_status
+         WHERE person_pid = ? AND digest_date = ? AND digest_status NOT LIKE '${DIGEST_SUPERSEDED_MARK}%'`,
+      ).run(personPid, date)
+      return true
+    })
+  }
+
+  /** 报告元数据行写入（表惰性建，不动 user_version；见服务层同名方法）。 */
+  async appendReportMeta(row: ReportMetaRow): Promise<boolean> {
+    return this.write((db) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS report_meta (
+          id            INTEGER PRIMARY KEY AUTOINCREMENT,
+          kind          TEXT NOT NULL,
+          date          TEXT NOT NULL,
+          window_start  INTEGER NOT NULL,
+          window_end    INTEGER NOT NULL,
+          status        TEXT NOT NULL,
+          path          TEXT NOT NULL DEFAULT '',
+          judgment_count INTEGER NOT NULL DEFAULT 0,
+          topic_count   INTEGER NOT NULL DEFAULT 0,
+          message_count INTEGER NOT NULL DEFAULT 0,
+          generated_at  INTEGER NOT NULL
+        );
+      `)
+      db.prepare(`
+        INSERT INTO report_meta
+          (kind, date, window_start, window_end, status, path, judgment_count, topic_count, message_count, generated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        row.kind,
+        row.date,
+        Math.floor(row.windowStart),
+        Math.floor(row.windowEnd),
+        row.status,
+        row.path ?? '',
+        Math.floor(row.judgmentCount ?? 0),
+        Math.floor(row.topicCount ?? 0),
+        Math.floor(row.messageCount ?? 0),
+        Math.floor(row.generatedAt),
+      )
+      return true
+    })
+  }
+
+  /** 读报告元数据（generated_at 降序；可选按 kind 过滤）。只读，失败返回 []。 */
+  getReportMetas(opts: { kind?: ReportMetaRow['kind']; limit?: number } = {}): ReportMetaRow[] {
+    if (this.closed) return []
+    try {
+      const conds: string[] = []
+      const params: (string | number)[] = []
+      if (opts.kind) {
+        conds.push('kind = ?')
+        params.push(opts.kind)
+      }
+      const where = conds.length ? `WHERE ${conds.join(' AND ')}` : ''
+      const limit = Math.max(0, Math.floor(opts.limit ?? 100))
+      const rows = this.db
+        .prepare(`SELECT * FROM report_meta ${where} ORDER BY generated_at DESC LIMIT ${limit}`)
+        .all(...params) as Record<string, unknown>[]
+      return rows.map((r) => ({
+        kind: String(r.kind) as ReportMetaRow['kind'],
+        date: String(r.date),
+        windowStart: Number(r.window_start),
+        windowEnd: Number(r.window_end),
+        status: String(r.status) as ReportMetaRow['status'],
+        path: String(r.path),
+        judgmentCount: Number(r.judgment_count),
+        topicCount: Number(r.topic_count),
+        messageCount: Number(r.message_count),
+        generatedAt: Number(r.generated_at),
+      }))
+    } catch (error) {
+      this.logger.error(`group-store[${this.chatId}] getReportMetas failed: ${String(error)}`)
       return []
     }
   }
@@ -747,16 +863,17 @@ export class GroupStoreService {
     }
   }
 
-  /** 读某人物某日摘要行；库未打开返回 []（不为此建库） */
+  /** 读某人物某日摘要行（M3 定夺点②：默认只返回生效行，supersede 旧行需 includeSuperseded）；库未打开返回 [] */
   getPersonDigests(
     chatId: string,
     personPid: string,
     date: string,
+    opts: { includeSuperseded?: boolean } = {},
   ): Array<PersonDigestRow & { windowStart: number; windowEnd: number }> {
     const st = this.stores.get(chatId)
     if (!st) return []
     try {
-      return st.getPersonDigests(personPid, date)
+      return st.getPersonDigests(personPid, date, opts)
     } catch (error) {
       this.logger.error(`group-store getPersonDigests(${chatId}) failed: ${String(error)}`)
       return []
@@ -796,6 +913,51 @@ export class GroupStoreService {
       return []
     }
   }
+
+  // —— 以下为 M3 追加 API（identities 服务层只读包装 / 摘要同日重跑 supersede /
+//     报告元数据行），不改上方既有行 ——
+
+/** 读某群 identities（服务层只读包装；库未开返回 []，不为此建库） */
+getIdentities(
+  chatId: string,
+  opts: { watchLevel?: 'global' | 'group' | 'off' } = {},
+): Array<{ pid: string; wxid: string; groupNick: string; remark: string; watchLevel: 'global' | 'group' | 'off' }> {
+  const st = this.stores.get(chatId)
+  if (!st) return []
+  return st.getIdentities(opts)
+}
+
+/**
+ * 同日重跑覆盖语义（M3 定夺点②）：同 pid+date 的旧行标记 superseded（digest_status
+ * 前缀标记，不改 schema/不物理删除），新行由调用方随后 append；读方
+ * getPersonDigests 默认过滤旧行、默认取最新生效行。返回是否成功。
+ */
+async supersedePersonDigests(chatId: string, personPid: string, date: string): Promise<boolean> {
+  try {
+    return await this.open(chatId).supersedePersonDigests(personPid, date)
+  } catch (error) {
+    this.logger.error(`group-store supersedePersonDigests(${chatId}) failed: ${String(error)}`)
+    return false
+  }
+}
+
+/** 报告元数据单行（M3-T3.1：报告落盘后入库一行，供检索/盘点）——形状见模块级 ReportMetaRow */
+/** 写一行报告元数据（表不存在则惰性建；不动 user_version，历史库无需迁移）。失败返回 false。 */
+async appendReportMeta(chatId: string, row: ReportMetaRow): Promise<boolean> {
+  try {
+    return await this.open(chatId).appendReportMeta(row)
+  } catch (error) {
+    this.logger.error(`group-store appendReportMeta(${chatId}) failed: ${String(error)}`)
+    return false
+  }
+}
+
+/** 读某群报告元数据（按 generated_at 降序；库未开返回 []）。 */
+getReportMetas(chatId: string, opts: { kind?: ReportMetaRow['kind']; limit?: number } = {}): ReportMetaRow[] {
+  const st = this.stores.get(chatId)
+  if (!st) return []
+  return st.getReportMetas(opts)
+}
 
   /** 关闭全部库句柄（dispose 时调用，幂等） */
   dispose(): void {

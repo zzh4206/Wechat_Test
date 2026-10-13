@@ -80,6 +80,25 @@ const ID_RE = /^[A-Za-z0-9_@=-]{1,128}$/
 /** 降级占位标题（topic_clusters.title 中的标记，读取方可识别） */
 export const DEGRADED_TITLE = '__degraded__'
 
+/**
+ * M3 定夺点①：派生 pid 反查。
+ * generateDaily 内部先经 identities 表把派生 pid（wx_xxxx）反查为 wxid，再用
+ * [wxid, derivePid(wxid)] 两条键匹配消息；查不到 identities 行（调用方直接传 wxid
+ * 或未代号化数据）回退为 [pid, derivePid(pid)] 原口径。
+ * 实现层选择：放在 person-digest 而非 personaTrack——identities 按群维护，摘要服务
+ * 已持有该群 groupStore 上下文；personaTrack 层是 wxid 视角且 fail-closed 于
+ * watchList（非关注人物的摘要会被拒），反查作为"调用方 pid → 消息键"的存储细节
+ * 与其职责正交，放这里避免跨模块耦合。
+ */
+export function resolveSenderKeys(
+  pid: string,
+  identities: ReadonlyArray<{ pid: string; wxid: string }>,
+): string[] {
+  const hit = identities.find((r) => r.pid === pid && typeof r.wxid === 'string' && r.wxid !== '')
+  if (hit) return [hit.wxid, derivePid(hit.wxid)]
+  return [pid, derivePid(pid)]
+}
+
 export class PersonDigestService {
   private readonly now: () => number
   private readonly pad: number
@@ -118,7 +137,8 @@ export class PersonDigestService {
     if (!this.options.store.ensureDir(['digests', chatId, pid].join('/'))) {
       throw new Error(`person-digest: ensureDir failed for ${rel}`)
     }
-    const keys = [pid, derivePid(pid)]
+    // M3 定夺点①：派生 pid 反查（identities: wx_xxxx → wxid），两条键匹配消息
+    const keys = resolveSenderKeys(pid, this.options.groupStore.getIdentities(chatId))
     const { start, end } = dayRange(day)
 
     const dayMsgs = this.options.groupStore.getPersonDayContext(chatId, keys, start, end, this.pad)
@@ -135,7 +155,7 @@ export class PersonDigestService {
     }
 
     const anomaly = weekAvg > 0 && count > weekAvg * 3
-    const { prompt, wire, ctx } = this.buildPrompt(pid, day, displayName, dayMsgs, personMsgs)
+    const { prompt, wire, ctx } = this.buildPrompt(pid, day, displayName, dayMsgs, personMsgs, keys)
 
     let digest: PersonDigest | null = null
     for (let attempt = 0; attempt < 2 && digest === null; attempt++) {
@@ -176,6 +196,8 @@ export class PersonDigestService {
     const path = this.options.store.writeText(rel, renderMarkdown(day, displayName || pid, day, digest, digest.status, count, anomaly, weekAvg))
       ? rel
       : null
+    // M3 定夺点②：同日重跑 = 覆盖——旧行标记 superseded（不物理删除），随后新行生效
+    await this.options.groupStore.supersedePersonDigests(chatId, pid, day)
     const rows = digestToRows(digest, count, rel, start, end)
     for (const row of rows) {
       const ok = await this.options.groupStore.appendPersonDigest(chatId, row)
@@ -210,11 +232,12 @@ export class PersonDigestService {
     displayName: string,
     dayMsgs: readonly StoredMessage[],
     personMsgs: readonly StoredMessage[],
+    keys?: readonly string[],
   ): { prompt: string; wire: Array<{ n: number; who: string; text: string; mine?: boolean }>; ctx: StoredMessage[] } {
-    const keys = [pid, derivePid(pid)]
-    const included = contextSlice(dayMsgs, personMsgs, keys, this.pad)
+    const personKeys = keys ?? [pid, derivePid(pid)]
+    const included = contextSlice(dayMsgs, personMsgs, personKeys, this.pad)
     const wire = included.map((m, i) => {
-      const mine = keys.includes(m.senderPid)
+      const mine = personKeys.includes(m.senderPid)
       const e: { n: number; who: string; text: string; mine?: boolean } = {
         n: i + 1,
         who: m.senderName || '（未知成员）',

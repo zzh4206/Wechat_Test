@@ -28,6 +28,10 @@ import { PersonaTrackService } from './persona-track.js'
 import type { WatchListEntry } from './persona-track.js'
 // M2-T2.3：人物增量摘要（新增行，不动他人行）
 import { PersonDigestService } from './person-digest.js'
+// M3：三层金字塔报告引擎 + 发件箱日志替身（新增行，不动他人行）
+import { ReportService } from './report.js'
+import type { ReportKind } from './report.js'
+import { Outbox } from './outbox.js'
 import { WechatDbSource } from './source/wechat-db.js'
 import { NicknameResolver } from './source/nickname.js'
 import type { WechatDbMessage } from './source/wechat-db.js'
@@ -79,6 +83,10 @@ export interface PluginConfig {
   watchList?: WatchListEntry[]
   /** M2-T2.3：人物增量摘要开关（默认 false；M3 报告引擎接调度时再开） */
   personDigestEnabled: boolean
+  /** M3：报告引擎开关（默认 false；M4 端到端联调时再开） */
+  reportEnabled: boolean
+  /** M3：跨群聚合群数上限（默认 8；超出按相关度+活跃度取前 N，其余一行带过） */
+  aggregationMaxGroups: number
 }
 
 export const name = 'dsh-group-lurker'
@@ -120,6 +128,8 @@ export const Config: Schema<PluginConfig> = Schema.object({
   // schemastery 无 const 联合：条目结构运行时校验（persona-track 内 fail-closed 跳过非法项）
   watchList: Schema.array(Schema.any()).default([]).description('M2 关注名单：[{ wxid, remark?, scope: "global" | { groups: [chatId] } }]。空数组 = 无人被追踪（零活动）'),
   personDigestEnabled: Schema.boolean().default(false).description('M2-T2.3 人物按天增量摘要（默认关；generateDaily 手动可调，M3 接调度时再开）'),
+  reportEnabled: Schema.boolean().default(false).description('M3 三层金字塔报告引擎（默认关；调度到点生成日/周/月报 + 跨群汇总，正文只落盘）'),
+  aggregationMaxGroups: Schema.number().default(8).description('M3 跨群聚合群数上限（默认 8；超出按「与我相关度+活跃度」取前 N，其余一行带过）'),
 })
 
 /**
@@ -152,6 +162,10 @@ export interface GroupLurker {
   readonly personaTrack: PersonaTrackService
   /** 人物按天增量摘要（M2-T2.3）；personDigestEnabled=false 时为 null（零活动） */
   readonly personDigest: PersonDigestService | null
+  /** 三层金字塔报告引擎（M3）；reportEnabled=false 时为 null（零活动） */
+  readonly report: ReportService | null
+  /** 发件箱日志替身（M3 落地 M4-T4.4 最小版）：只落盘不发送 */
+  readonly outbox: Outbox
   /** 定时触达调度器（M1-T1.3）；schedulerEnabled=false 时为 null */
   readonly scheduler: Scheduler | null
   /** 系统通知通道（M1-T1.4）：notifyDryRun 控制是否真弹通知 */
@@ -198,7 +212,12 @@ export function apply(ctx: Context, config: PluginConfig): void {
     dryRun: config.notifyDryRun,
   })
 
-  // —— M1-T1.3：调度骨架（onTick → 通知占位；报告生成回调留空，M3 接） ——
+  // —— M1-T1.3：调度骨架（onTick → M3 报告生成 → 短通知 + outbox 落盘） ——
+  // —— M3：发件箱日志替身（只落盘零发送；报告正文不进通知，全文指针进 outbox） ——
+  const outbox = new Outbox({ store })
+  // report 依赖 llmClient（其下才定义），先占位、llmClient 就绪后赋值
+  let report: ReportService | null = null
+
   let scheduler: Scheduler | null = null
   if (config.schedulerEnabled) {
     scheduler = new Scheduler({
@@ -210,14 +229,30 @@ export function apply(ctx: Context, config: PluginConfig): void {
       monthlyTime: config.monthlyReportTime,
       staggerMinutes: config.staggerMinutes,
       onTick: (kind: TickKind, chatId: string, meta) => {
-        // M3 占位：目前只记日志 + dry_run 通知；报告内容由 M3 生成回填。
-        void notifier
-          .notify(
-            kind,
-            `群聊${kind === 'daily' ? '日报' : kind === 'weekly' ? '周报' : '月报'}（${chatId}）`,
-            meta.catchup ? '（补跑）报告生成接入前占位' : '报告生成接入前占位',
-          )
-          .catch(() => {})
+        // M3 接线：tick → 报告生成（按 scheduledAt 所在自然周期切窗，补跑不错窗）
+        // → 成功后短通知（正文不进通知）+ 正文/指针落 outbox（不发消息）。
+        const kindName = kind === 'daily' ? '日报' : kind === 'weekly' ? '周报' : '月报'
+        if (!report) {
+          // reportEnabled=false：保持 M1 占位行为（只记日志 + dry_run 通知）
+          void notifier
+            .notify(kind, `群聊${kindName}（${chatId}）`, meta.catchup ? '（补跑）报告引擎未开启占位' : '报告引擎未开启占位')
+            .catch(() => {})
+          return
+        }
+        void (async () => {
+          const res = await report.generateReport(chatId, kind as ReportKind, meta.scheduledAt)
+          if (res.status === 'disabled') return
+          const title = `${kindName}已生成（${chatId}${meta.catchup ? '，补跑' : ''}）`
+          const body = res.status === 'empty'
+            ? '本期窗口内无消息'
+            : res.status === 'ok'
+              ? `关键判断 ${res.judgmentCount} 条、话题 ${res.topicCount} 个，全文见 outbox 存档`
+              : 'LLM 归纳不可用，已降级输出骨架（degraded）'
+          await notifier.notify(kind, title, body)
+          outbox.appendOutbox({ kind, title, body, evidence_ref: res.path ?? '' })
+        })().catch((error: unknown) => {
+          logger.error(`scheduler[${kind}] report generation failed for ${chatId}: ${String(error)}`)
+        })
       },
     })
   }
@@ -229,6 +264,21 @@ export function apply(ctx: Context, config: PluginConfig): void {
   const llmClient: LlmClient = new DefaultLlmClient(
     (ctx as Context & { llm?: HostLlmService }).llm,
   )
+
+  // —— M3：报告引擎（reportEnabled 默认 false = 零活动；手动 generateReport 可调） ——
+  if (config.reportEnabled) {
+    report = new ReportService({
+      groupStore,
+      store,
+      stateDir,
+      llm: llmClient,
+      logger: logger as unknown as StoreLogger,
+      enabled: true,
+      aggregationMaxGroups: config.aggregationMaxGroups,
+      groups: config.groups,
+    })
+  }
+
   const distiller = new Distiller({
     buffer,
     llm: llmClient,
@@ -361,6 +411,8 @@ export function apply(ctx: Context, config: PluginConfig): void {
     groupStore,
     personaTrack,
     personDigest,
+    report,
+    outbox,
     scheduler,
     notifier,
     source,
@@ -423,6 +475,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
       distiller.dispose()
       journal.dispose() // 无定时器，清计数/日报内存引用
       personDigest?.dispose() // M2-T2.3：无定时器，清并发去重表
+      report?.dispose() // M3：无定时器，清并发去重表
       groupStore.dispose() // 关闭全部 SQLite 句柄（WAL checkpoint 随 close 完成）
       buffer.clear()
       personas.clear()
