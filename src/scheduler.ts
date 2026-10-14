@@ -63,6 +63,10 @@ export interface SchedulerOptions {
   clearInterval?: typeof clearInterval
   /** 心跳毫秒（默认 30s；测试可调小） */
   tickMs?: number
+  /** 快速测试模式：true 且 testKindIntervalMin>0 时，按间隔依次强制触发 weekly/monthly（默认 false = 关，行为与原版完全一致） */
+  testMode?: boolean
+  /** 测试模式强制触发间隔分钟（默认 0 = 不触发）。启动后每过该间隔依次触发一次 weekly、monthly（交替循环） */
+  testKindIntervalMin?: number
 }
 
 interface KindState {
@@ -125,9 +129,16 @@ export class Scheduler {
   private readonly clearIntervalFn: typeof clearInterval
   private readonly tickMs: number
   private readonly onTickFn: TickHandler
+  private readonly testMode: boolean
+  private readonly testIntervalMs: number
   private readonly states = new Map<TickKind, KindState>()
   private timer: ReturnType<typeof setInterval> | undefined
   private _stopped = true
+  /** 测试模式：下次强制触达时刻；undefined = 未启用 */
+  private testNextAt: number | undefined
+  /** 测试模式：下一个要强制触发的 kind（weekly → monthly 交替） */
+  private testSeq = 0
+  private static readonly TEST_KINDS: readonly TickKind[] = ['weekly', 'monthly']
 
   constructor(private readonly options: SchedulerOptions) {
     this.timeSpecs = {
@@ -142,6 +153,8 @@ export class Scheduler {
     this.clearIntervalFn = options.clearInterval ?? clearInterval
     this.tickMs = options.tickMs ?? 30_000
     this.onTickFn = options.onTick ?? (() => {}) // 报告生成留空（M3 接）
+    this.testMode = options.testMode ?? false
+    this.testIntervalMs = Math.max(0, (options.testKindIntervalMin ?? 0)) * 60_000
   }
 
   /**
@@ -152,6 +165,12 @@ export class Scheduler {
     if (this.timer) return () => this.stop()
     this.restore()
     this._stopped = false
+    // 快速测试模式：启动后每 testIntervalMs 依次强制触发 weekly/monthly（kind 照常传，下游按周期切窗）
+    this.testSeq = 0
+    this.testNextAt = this.testMode && this.testIntervalMs > 0 ? this.now() + this.testIntervalMs : undefined
+    if (this.testNextAt !== undefined) {
+      this.options.logger.info(`scheduler[test]: enabled, force weekly/monthly every ${this.testIntervalMs / 60_000}min`)
+    }
     this.timer = this.setIntervalFn(() => this.tick(), this.tickMs)
     this.timer.unref?.()
     return () => this.stop()
@@ -165,6 +184,7 @@ export class Scheduler {
       this.timer = undefined
     }
     this.states.clear()
+    this.testNextAt = undefined
   }
 
   /**
@@ -176,6 +196,25 @@ export class Scheduler {
     const t = this.now()
     for (const kind of TICK_KINDS) {
       this.advance(kind, t)
+    }
+    this.advanceTest(t)
+  }
+
+  /** 快速测试模式：到点强制触发 weekly/monthly（全群立即、不分错峰；去重交下游幂等） */
+  private advanceTest(t: number): void {
+    if (this.testNextAt === undefined || t < this.testNextAt) return
+    while (this.testNextAt !== undefined && t >= this.testNextAt) {
+      const kind = Scheduler.TEST_KINDS[this.testSeq % Scheduler.TEST_KINDS.length]
+      this.testSeq++
+      this.testNextAt! += this.testIntervalMs
+      for (const chatId of this.options.groups) {
+        try {
+          this.onTickFn(kind, chatId, { catchup: false, scheduledAt: t })
+        } catch (error) {
+          this.options.logger.error(`scheduler[test][${kind}] onTick(${chatId}) failed: ${String(error)}`)
+        }
+      }
+      this.options.logger.info(`scheduler[test]: force-fired ${kind} at ${new Date(t).toISOString()}`)
     }
   }
 

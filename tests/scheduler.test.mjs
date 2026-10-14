@@ -230,3 +230,77 @@ test('onTick 回调抛错不拖垮调度循环', () => {
     stop()
   }
 })
+
+// ——— 快速测试模式（scheduleTestMode） ———
+
+test('testMode：每 interval 依次强制触发 weekly/monthly，kind 照常传递', () => {
+  const clock = makeClock(at(2026, 3, 10, 9, 0)) // 周二白天——日历闸门本不会触发周/月报
+  const { ticks, onTick } = collect()
+  const s = new Scheduler({
+    groups: ['a@chatroom', 'b@chatroom'], logger: silentLogger, onTick,
+    now: clock.now, tickMs: 60_000,
+    testMode: true, testKindIntervalMin: 10,
+  })
+  const stop = s.start()
+  try {
+    clock.stepMin(10); s.tick() // +10min → weekly（全群）
+    assert.deepEqual(ticks.map(t => `${t.kind}:${t.chatId}`), ['weekly:a@chatroom', 'weekly:b@chatroom'])
+    assert.equal(ticks[0].catchup, false)
+    clock.stepMin(10); s.tick() // +20min → monthly
+    assert.deepEqual(ticks.map(t => t.kind), ['weekly', 'weekly', 'monthly', 'monthly'])
+    clock.stepMin(10); s.tick() // +30min → 交替回 weekly
+    assert.deepEqual(ticks.map(t => t.kind), ['weekly', 'weekly', 'monthly', 'monthly', 'weekly', 'weekly'])
+    // 间隔未到不触发
+    clock.stepMin(5); s.tick()
+    assert.equal(ticks.length, 6)
+  } finally {
+    stop()
+  }
+})
+
+test('testMode：间隔边界——interval<=0 或 testMode 缺省 = 零变化', () => {
+  // testMode=true 但 interval=0：不触发
+  const clock = makeClock(at(2026, 3, 10, 9, 0))
+  const a = collect()
+  const s1 = new Scheduler({ groups, logger: silentLogger, onTick: a.onTick, now: clock.now, tickMs: 60_000, testMode: true, testKindIntervalMin: 0 })
+  const stop1 = s1.start()
+  clock.stepMin(120); s1.tick()
+  stop1()
+  assert.equal(a.ticks.length, 0)
+  // 不配 testMode（undefined）：行为与原版一致
+  const clock2 = makeClock(at(2026, 3, 10, 9, 0))
+  const b = collect()
+  const s2 = new Scheduler({ groups: ['a@chatroom'], logger: silentLogger, onTick: b.onTick, now: clock2.now, tickMs: 60_000, testKindIntervalMin: 10 })
+  const stop2 = s2.start()
+  clock2.stepMin(60); s2.tick()
+  stop2()
+  assert.equal(b.ticks.length, 0)
+  // 负数 interval 同样不触发
+  const s3 = new Scheduler({ groups, logger: silentLogger, onTick: () => {}, now: clock.now, tickMs: 60_000, testMode: true, testKindIntervalMin: -5 })
+  const stop3 = s3.start()
+  clock.stepMin(10); s3.tick()
+  stop3()
+})
+
+test('testMode：与日历触发并存，stop 后不再强制触发', () => {
+  // 周日 20:30 启动，interval=10：日历 weekly 正常触发，test 链路独立交替
+  const clock = makeClock(at(2026, 3, 15, 20, 30))
+  const { ticks, onTick } = collect()
+  const s = new Scheduler({
+    groups: ['a@chatroom'], logger: silentLogger, onTick,
+    now: clock.now, tickMs: 60_000,
+    testMode: true, testKindIntervalMin: 10,
+  })
+  const stop = s.start()
+  try {
+    clock.stepMin(10); s.tick() // 20:40：日历 daily+weekly，test weekly，共 3 次
+    const weekly = ticks.filter(t => t.kind === 'weekly')
+    assert.equal(weekly.length, 2)
+    assert.equal(ticks.filter(t => t.kind === 'monthly').length, 0)
+    stop()
+    clock.stepMin(10); s.tick()
+    assert.equal(ticks.length, 3, 'stop 后 test 链路停止')
+  } finally {
+    stop()
+  }
+})

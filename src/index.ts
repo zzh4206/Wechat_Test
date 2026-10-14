@@ -82,6 +82,10 @@ export interface PluginConfig {
   schedulerEnabled: boolean
   /** 调度时点（本地时区 "HH:MM"）：日 / 周日 / 每月 1 日 */
   dailyReportTime: string
+  /** 快速测试模式（默认 false）：true 且 testKindIntervalMin>0 时按间隔依次强制触发 weekly/monthly 完整链路 */
+  scheduleTestMode: boolean
+  /** 测试模式强制触发间隔分钟（默认 0 = 不触发） */
+  testKindIntervalMin: number
   weeklyReportTime: string
   monthlyReportTime: string
   /** 按白名单顺序每群错峰分钟数（默认 5） */
@@ -181,6 +185,8 @@ export const Config: Schema<PluginConfig> = Schema.object({
   minTaskConfidence: Schema.number().default(0).description('M6 识别 confidence 门槛（默认 0 = 现行为：全部落库待确认；低于门槛的事件识别丢弃）'),
   fulfilConfidence: Schema.number().default(0.5).description('M6 承诺兑现软关联 confidence 阈值（默认 0.5 = 现行为；低于只提示不自动置已兑现）'),
   activitySpikeMultiplier: Schema.number().default(3).description('M6 活跃度突变倍数（默认 3 = 现行为：今日 > 近 7 日均值 × N 标注异常）'),
+  scheduleTestMode: Schema.boolean().default(false).description('快速测试模式（默认关）：true 且 testKindIntervalMin>0 时，每间隔分钟依次强制触发 weekly/monthly 的完整生成链路（周/月报不再等日历闸门）。测试完务必关掉，避免频繁 LLM 调用'),
+  testKindIntervalMin: Schema.number().default(0).description('测试模式强制触发间隔（分钟，默认 0 = 不触发）'),
 })
 
 /**
@@ -289,6 +295,8 @@ export function apply(ctx: Context, config: PluginConfig): void {
       weeklyTime: config.weeklyReportTime,
       monthlyTime: config.monthlyReportTime,
       staggerMinutes: config.staggerMinutes,
+      testMode: config.scheduleTestMode,
+      testKindIntervalMin: config.testKindIntervalMin,
       onTick: (kind: TickKind, chatId: string, meta) => {
         // M3 接线：tick → 报告生成（按 scheduledAt 所在自然周期切窗，补跑不错窗）
         // → 成功后短通知（正文不进通知）+ 正文/指针落 outbox（不发消息）。
@@ -721,7 +729,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
     if (scheduler) {
       try {
         stopScheduler = scheduler.start()
-        logger.info(`scheduler started (daily=${config.dailyReportTime}, weekly=${config.weeklyReportTime}, monthly=${config.monthlyReportTime}, stagger=${config.staggerMinutes}m)`)
+        logger.info(`scheduler started (daily=${config.dailyReportTime}, weekly=${config.weeklyReportTime}, monthly=${config.monthlyReportTime}, stagger=${config.staggerMinutes}m${config.scheduleTestMode && config.testKindIntervalMin > 0 ? `, testMode=every ${config.testKindIntervalMin}min force weekly/monthly` : ''})`)
       } catch (error) {
         logger.error(`scheduler start refused: ${String(error)}`)
       }

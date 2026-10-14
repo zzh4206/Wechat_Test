@@ -201,6 +201,20 @@ await runAbComparison(
 
 产物：`<stateDir>/ab/<日期>/`（input-window.json / fused-output.md / split-facts.md / split-output.md / meta.json），人工比对提炼质量。**fused vs split 的最终选择待运行期真实数据对比后定夺**，届时才实装切换逻辑。
 
+### 7.10 快速迭代测试（scheduleTestMode，测完必关）
+
+周报等周日 20:40、月报等每月 1 日 08:00 才触发，平时没法快速验证完整生成链路。临时打开测试模式：
+
+```yaml
+# cordis.patch.yml（profile 的 dsh-group-lurker 配置）
+scheduleTestMode: true        # 默认 false，不配 = 行为与原版完全一致
+testKindIntervalMin: 10       # 启动后每 10 分钟依次强制触发一次 weekly → monthly（交替循环），0 = 不触发
+```
+
+行为：调度器照常走日历 tick（不改既有触发逻辑），只是额外每 `testKindIntervalMin` 分钟强制触发一次 weekly、monthly 的 onTick——kind 照常传 `'weekly'` / `'monthly'`，报告引擎按对应周期切窗，真实走完整 LLM 生成链路。与正常日历触发的重复由 report/reminder 幂等机制自然去重（report_meta 同键覆盖），不会出双份报告。
+
+⚠️ **测试完务必把 `scheduleTestMode` 改回 false（或删掉这两行）并重启**——开着它每 N 分钟就跑一轮周报+月报 LLM 调用，烧 token 且重复写 outbox。
+
 ## 8. 排障
 
 **第一诊断工具：读取层探针 `spikes/db-probe.mjs`**（插件仓库内，只读）——任何"读不到消息/昵称解析失败/库打不开"问题先跑它再查插件：
