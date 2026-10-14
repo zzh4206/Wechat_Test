@@ -6,4 +6,10 @@ vendor/
 *.log
 .npm-cache/
 spikes/
+sec-tests/
+# 安全经理工作线资产（审计台账，不入产品仓库）
+SECURITY-*.md
+ERROR-REFERENCE.md
+SECURITY-REPORT-*.md
+docs/SECURITY-REPORT-*.md
 *.tsbuildinfo
