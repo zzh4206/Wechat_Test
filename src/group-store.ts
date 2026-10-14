@@ -13,7 +13,7 @@
  * - 写失败只记 logger，绝不抛致命错误拖垮宿主（与 store.ts 同口径）；
  * - 不发送任何消息，不读取除白名单传入路径外的任何微信数据。
  */
-import { mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { assertInsideState } from './guard.js'
@@ -1568,6 +1568,32 @@ export class GroupStoreService {
     return st
   }
 
+  /**
+   * 读路径懒加载开库（热修：报告恒空 bug）：库文件存在但本进程未打开过时，
+   * 原先只查内存 map 直接返回空——静默群重启后（无新消息、ingestion 从未开库）
+   * 定时报告读到 0 条消息。这里改为：已开复用现有连接（open 幂等）；未开但库
+   * 文件存在则惰性打开。读路径开库本意只读，但复用现有连接/连接管理，可接受。
+   * fail-closed 纪律：chatId 不在白名单（CHAT_ID_RE，open 内亦有同口径校验）或
+   * 开库失败 → 返回 null，调用方照旧返回空；库文件不存在则不建库不落盘
+   * （保持"读操作不产生落盘"约定，从未见过的群查询不产生 store.db）。
+   */
+  private ensureOpenForRead(chatId: string): GroupStore | null {
+    const existing = this.stores.get(chatId)
+    if (existing) return existing
+    if (!CHAT_ID_RE.test(chatId)) {
+      this.logger.warn(`group-store: read on non-whitelisted chatId rejected: ${JSON.stringify(chatId)}`)
+      return null
+    }
+    const dbPath = join(this.stateDir, 'groups', chatId, 'store.db')
+    if (!existsSync(dbPath)) return null
+    try {
+      return this.open(chatId)
+    } catch (error) {
+      this.logger.error(`group-store ensureOpenForRead(${chatId}) failed: ${String(error)}`)
+      return null
+    }
+  }
+
   /** 写入某群消息（不存在则先建库）。返回成功写入条数；非法输入/失败返回 0。 */
   async appendMessages(chatId: string, msgs: readonly StorableMessage[]): Promise<number> {
     try {
@@ -1578,9 +1604,9 @@ export class GroupStoreService {
     }
   }
 
-  /** 查询某群消息；库不存在/失败返回 []（惰性不建库，读操作不产生落盘） */
+  /** 查询某群消息；库文件不存在/失败返回 []（读路径懒加载开库见 ensureOpenForRead；从未建库的群不落盘） */
   getMessages(chatId: string, opts?: QueryMessagesOptions): StoredMessage[] {
-    const st = this.stores.get(chatId)
+    const st = this.ensureOpenForRead(chatId)
     if (!st) return []
     try {
       return st.getMessages(opts)
@@ -1592,7 +1618,7 @@ export class GroupStoreService {
 
   /** 按群取单条消息（服务层只读包装；库未开返回 null，不为此建库） */
   getMessage(chatId: string, msgId: string): StoredMessage | null {
-    const st = this.stores.get(chatId)
+    const st = this.ensureOpenForRead(chatId)
     if (!st) return null
     return st.getMessage(msgId)
   }
@@ -1602,7 +1628,7 @@ export class GroupStoreService {
    * TODO(M2+)：软关联（时序+语义近似）留给后续任务，这里只走 quote_of_msg_id 硬链。
    */
   getQuoteChain(chatId: string, msgId: string, maxDepth = 5): StoredMessage[] {
-    const st = this.stores.get(chatId)
+    const st = this.ensureOpenForRead(chatId)
     if (!st) return []
     try {
       return st.getQuoteChain(msgId, maxDepth)
@@ -1629,7 +1655,7 @@ export class GroupStoreService {
     keyword?: string,
     opts?: { afterTs?: number; beforeTs?: number; limit?: number },
   ): StoredMessage[] {
-    const st = this.stores.get(chatId)
+    const st = this.ensureOpenForRead(chatId)
     if (!st) return []
     try {
       return st.searchByPerson(senderKeys, keyword, opts)
@@ -1641,7 +1667,7 @@ export class GroupStoreService {
 
   /** 某GroupStore库 schema 版本（未建库返回 0） */
   schemaVersion(chatId: string): number {
-    return this.stores.get(chatId)?.schemaVersion ?? 0
+    return this.ensureOpenForRead(chatId)?.schemaVersion ?? 0
   }
 
   /** 是否已打开 */
@@ -1673,7 +1699,7 @@ export class GroupStoreService {
     date: string,
     opts: { includeSuperseded?: boolean } = {},
   ): Array<PersonDigestRow & { windowStart: number; windowEnd: number }> {
-    const st = this.stores.get(chatId)
+    const st = this.ensureOpenForRead(chatId)
     if (!st) return []
     try {
       return st.getPersonDigests(personPid, date, opts)
@@ -1689,7 +1715,7 @@ export class GroupStoreService {
     senderKeys: readonly string[] | undefined,
     opts?: { afterTs?: number; beforeTs?: number },
   ): number {
-    const st = this.stores.get(chatId)
+    const st = this.ensureOpenForRead(chatId)
     if (!st) return 0
     try {
       return st.countMessagesBy(senderKeys, opts)
@@ -1707,7 +1733,7 @@ export class GroupStoreService {
     endTs: number,
     pad = 2,
   ): StoredMessage[] {
-    const st = this.stores.get(chatId)
+    const st = this.ensureOpenForRead(chatId)
     if (!st) return []
     try {
       return st.getPersonDayContext(senderKeys, startTs, endTs, pad)
@@ -1725,7 +1751,7 @@ getIdentities(
   chatId: string,
   opts: { watchLevel?: 'global' | 'group' | 'off' } = {},
 ): Array<{ pid: string; wxid: string; groupNick: string; remark: string; watchLevel: 'global' | 'group' | 'off' }> {
-  const st = this.stores.get(chatId)
+  const st = this.ensureOpenForRead(chatId)
   if (!st) return []
   return st.getIdentities(opts)
 }
@@ -1757,7 +1783,7 @@ async appendReportMeta(chatId: string, row: ReportMetaRow): Promise<boolean> {
 
 /** 读某群报告元数据（按 generated_at 降序；库未开返回 []）。 */
 getReportMetas(chatId: string, opts: { kind?: ReportMetaRow['kind']; limit?: number } = {}): ReportMetaRow[] {
-  const st = this.stores.get(chatId)
+  const st = this.ensureOpenForRead(chatId)
   if (!st) return []
   return st.getReportMetas(opts)
 }
@@ -1776,14 +1802,14 @@ getReportMetas(chatId: string, opts: { kind?: ReportMetaRow['kind']; limit?: num
 
   /** 按 id 取任务；库未打开返回 null（读操作不建库） */
   getTask(chatId: string, taskId: number): TaskRow | null {
-    const st = this.stores.get(chatId)
+    const st = this.ensureOpenForRead(chatId)
     if (!st) return null
     return st.getTask(taskId)
   }
 
   /** 查任务；库未打开返回 [] */
   getTasks(chatId: string, opts?: { status?: TaskRow['status']; deadlineFrom?: number; deadlineTo?: number; limit?: number }): TaskRow[] {
-    const st = this.stores.get(chatId)
+    const st = this.ensureOpenForRead(chatId)
     if (!st) return []
     return st.getTasks(opts)
   }
@@ -1828,14 +1854,14 @@ getReportMetas(chatId: string, opts: { kind?: ReportMetaRow['kind']; limit?: num
 
   /** 按 id 取事件；库未打开返回 null */
   getEvent(chatId: string, eventId: number): EventRow | null {
-    const st = this.stores.get(chatId)
+    const st = this.ensureOpenForRead(chatId)
     if (!st) return null
     return st.getEvent(eventId)
   }
 
   /** 查事件；库未打开返回 [] */
   getEvents(chatId: string, opts?: { status?: string; source?: 'auto' | 'manual'; category?: string; limit?: number }): EventRow[] {
-    const st = this.stores.get(chatId)
+    const st = this.ensureOpenForRead(chatId)
     if (!st) return []
     return st.getEvents(opts)
   }
@@ -1874,13 +1900,13 @@ getReportMetas(chatId: string, opts: { kind?: ReportMetaRow['kind']; limit?: num
   }
 
   getPromise(chatId: string, promiseId: number): PromiseRow | null {
-    const st = this.stores.get(chatId)
+    const st = this.ensureOpenForRead(chatId)
     if (!st) return null
     return st.getPromise(promiseId)
   }
 
   getPromises(chatId: string, opts?: { status?: PromiseStatus; limit?: number }): PromiseRow[] {
-    const st = this.stores.get(chatId)
+    const st = this.ensureOpenForRead(chatId)
     if (!st) return []
     return st.getPromises(opts)
   }
@@ -1925,13 +1951,13 @@ getReportMetas(chatId: string, opts: { kind?: ReportMetaRow['kind']; limit?: num
   }
 
   getFile(chatId: string, fileId: string): FileRow | null {
-    const st = this.stores.get(chatId)
+    const st = this.ensureOpenForRead(chatId)
     if (!st) return null
     return st.getFile(fileId)
   }
 
   getFiles(chatId: string, opts?: { senderPid?: string; category?: string; limit?: number }): FileRow[] {
-    const st = this.stores.get(chatId)
+    const st = this.ensureOpenForRead(chatId)
     if (!st) return []
     return st.getFiles(opts)
   }

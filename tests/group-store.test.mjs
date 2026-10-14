@@ -110,6 +110,41 @@ test('围栏纪律：库目录确实在 stateDir 内（mkdir 前 assertInsideSta
   assert.throws(() => assertInsideState(realStateDir, realStateDir + '-sibling/groups'))
 })
 
+test('热修·读路径懒加载：进程重启后（新 Service 实例、库文件已有数据）直接 getMessages 能读到存量消息', async () => {
+  // 模拟：写库后"重启"——旧 Service 丢弃，新 Service 先 open 过另一个群（本进程未开过 CHAT）
+  const reborn = new GroupStoreService(realStateDir, logger)
+  const other = 'other@chatroom'
+  await reborn.appendMessages(other, [{ msgId: 'o1', ts: 1, senderPid: 'P01', text: 'warm' }])
+  assert.ok(!reborn.isOpen(CHAT))
+  // 库文件存在但本进程未打开过：读路径应先确保打开，读到存量数据
+  const msgs = reborn.getMessages(CHAT, { afterTs: 0, limit: 100 })
+  assert.equal(msgs.length, 4)
+  assert.equal(msgs[0].msgId, 'm1')
+  assert.ok(reborn.isOpen(CHAT), '读后应已懒加载开库')
+  assert.equal(reborn.getMessage(CHAT, 'm2')?.senderName, '乙')
+  // 报告数据源同口径：tasks/promises/files 读路径同样懒加载可读（此处为空表）
+  assert.deepEqual(reborn.getTasks(CHAT), [])
+  assert.deepEqual(reborn.getPromises(CHAT), [])
+  assert.deepEqual(reborn.getFiles(CHAT), [])
+  // 从未建库的群：读仍返回空且不落盘建库（读操作不产生 store.db）
+  const ghost2 = 'ghost2@chatroom'
+  assert.deepEqual(reborn.getMessages(ghost2), [])
+  assert.ok(!reborn.isOpen(ghost2))
+  assert.ok(!existsSync(join(realStateDir, 'groups', ghost2)))
+  reborn.dispose()
+})
+
+test('热修·fail-closed：非白名单 chatId 读查询返回空（不抛错、不开库）', async () => {
+  const reborn2 = new GroupStoreService(realStateDir, logger)
+  for (const bad of ['../evil', 'a/b@c', 'x'.repeat(200)]) {
+    assert.deepEqual(reborn2.getMessages(bad), [], `getMessages(${bad}) 应返回 []`)
+    assert.deepEqual(reborn2.getTasks(bad), [])
+    assert.equal(reborn2.schemaVersion(bad), 0)
+    assert.ok(!reborn2.isOpen(bad))
+  }
+  reborn2.dispose()
+})
+
 test('dispose：关闭全部句柄，写入/查询失败安全返回', async () => {
   const st = svc.open(CHAT)
   st.close()
