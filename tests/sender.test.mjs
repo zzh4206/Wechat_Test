@@ -36,6 +36,7 @@ function makeEnv(overrides = {}) {
     logger: overrides.logger ?? silentLogger,
     enabled: overrides.enabled ?? true,
     dryRun: overrides.dryRun ?? false,
+    sendMethod: overrides.sendMethod ?? 'wechat-ui', // 本文件沿用旧 wechat-ui 实现语义；keyboard 键序见 keyboard-sender.test.mjs
     maxSendsPerDay: overrides.maxSendsPerDay ?? 20,
     wechatUiPath: overrides.wechatUiPath ?? 'wechat-ui',
     composerTop: overrides.composerTop ?? 0.7,
@@ -129,6 +130,7 @@ test('通道闸：非 filehelper 的 pending 条目直接 skip 并 error 日志�
   const sender = new SenderService({
     outbox, store, logger,
     enabled: true, dryRun: false,
+    sendMethod: 'wechat-ui',
     runCommand: (file, args) => { spawnCalls.push({ file, args }); return Promise.resolve({ code: 0, stdout: 'sent_ui_verified', stderr: '' }) },
     isFrontmost: () => Promise.resolve(true),
   })
@@ -189,7 +191,7 @@ test('交互闸：微信非前台 → 跳过本轮条目保持 pending，连续 
   env2.frontmost = false
   env2.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
   for (let i = 0; i < 3; i++) await env2.sender.processOnce()
-  assert.ok(env2.logger.logs.warn.some((m) => m.includes('文件传输助手')))
+  assert.ok(env2.logger.logs.warn.some((m) => m.includes('not frontmost') && m.includes('前台')))
   rmSync(env2.dir, { recursive: true, force: true })
 })
 
@@ -219,7 +221,7 @@ test('start()/stop：enabled=false 为 noop；enabled=true 心跳运行并可清
   const fakeClearInterval = (handle) => { if (handle === 42) fired = -1 }
   const sender = new SenderService({
     outbox: env.outbox, store: env.store, logger: silentLogger,
-    enabled: true, dryRun: true,
+    enabled: true, dryRun: true, sendMethod: 'wechat-ui',
     runCommand: () => Promise.resolve({ code: 0, stdout: 'sent_ui_verified', stderr: '' }),
     isFrontmost: () => Promise.resolve(true),
     setInterval: fakeSetInterval,

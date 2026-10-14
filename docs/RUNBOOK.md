@@ -274,43 +274,83 @@ rm -rf /path/to/macos-wechat-export/.wechat-local
 2. **切勿**把旧机器的 `.wechat-local/` 拷过去：旧签名快照会让 `bootstrap_keys.py` 的原版签名对照（第 101 行）误判"原版被改动"而中止；旧 keys.json 对新环境的库也不适用；
 3. 取钥成功后插件侧只需核对 `sourceDbRoot`/`sourceToolDir` 指向无误，游标（stateDir/cursor.json）与新库位点不一致时会自动按新库重新对齐（最坏情况：少量近期消息重复投递，下游幂等消化）。
 
-## 12.5 filehelper 发送 worker（红线升级 2026-10-14）
+## 12.5 filehelper 发送 worker（发送原语：键盘模拟 + DB 回读验证，2026-10-15 重写）
 
-> 用户于 2026-10-14 明确批准红线升级：从此前 no-send 升级为**仅允许 `filehelper` 一个受控出口**。
-> 通道白名单在 `src/sender.ts` 代码级硬编码（`ALLOWED_CHANNELS = ['filehelper']`），其他 channel 永不发送；
-> 绝不发群聊；发送内容 = `【lurker】<标题>` + ≤160 字摘要（单行 ≤200 字符），**绝不发全文**（全文在本地 reports/，指针在 outbox）。
+> 红线（2026-10-14 用户批准，不变）：**仅允许 `filehelper` 一个受控出口**。通道白名单在
+> `src/sender.ts` 代码级硬编码（`ALLOWED_CHANNELS = ['filehelper']`），其他 channel 永不发送；
+> 绝不发群聊；发送内容 = `【lurker】<标题>` + ≤160 字摘要 + 特征串（单行 ≤200 字符），**绝不发全文**。
+>
+> 2026-10-15 原语替换：用户否决 wechat-ui UI 校准方案（要求常驻聊天窗口太麻烦），改用
+> **wx-chatbot 式键盘模拟**（参考 github.com/sanjiao403/wx-chatbot 的 Windows 键序，移植 macOS 键位），
+> 验证从截图/OCR 换成 **wechat_db.py 只读回读**。发送原语抽为可替换接口 `SendPrimitive`：
+> `sendMethod: 'keyboard'`（默认）/ `'wechat-ui'`（旧实现保留在 `WechatUiSender`，可随时切回）。
+
+### 发送原语键序（KeyboardSender，13 步）
+
+1. osascript 激活微信（`tell application "WeChat" to activate`）+ 确认前台（非前台直接放弃，防按键落到别的应用）；
+2. 保存当前剪贴板内容（发送后恢复——礼貌且防用户数据丢失）；
+3. 剪贴板设为 `文件传输助手`；
+4. System Events 按键：**Cmd+F**（微信搜索）；
+5. System Events 按键：**Cmd+V**（粘贴搜索词——中文走剪贴板，避开输入法）；
+6. 延迟 800ms（搜索结果渲染）；
+7. System Events 按键：**Return**（选中第一个结果 = 打开文件传输助手会话）；
+8. 延迟 500ms；
+9. 剪贴板设为消息文本（`【lurker】… + #l<id 前 8 位>` 特征串）；
+10. System Events 按键：**Cmd+V**（粘贴消息）；
+11. 延迟 300ms；
+12. System Events 按键：**Return**（发送）；
+13. 恢复剪贴板原内容（失败仅 warn，不阻塞）。
+
+### 验证：DB 回读（替代 OCR/截图——TCC 收益）
+
+真发后延迟 2s，只读调用 `wechat_db.py read --chat-id filehelper --limit 3`，确认文件传输助手
+最新消息包含本次文本特征串 `#l<outbox id 前 8 位>`——**验证通过才置 sent**，否则按失败计数
+（≥3 次转 failed）。因此 **TCC 只需"辅助功能"**（System Events 按键），**不再需要屏幕录制**——
+这是相对 wechat-ui 方案的额外收益。keyboard 模式下 `sourceToolDir` 未配置（无 wechat_db.py
+可回读）= **fail-closed 不发送**。
 
 ### TCC 前置（首次必做）
 
 系统设置 → 隐私与安全性 → 给 **DSH 宿主应用**（运行本插件的进程）开启：
 
-- **屏幕录制**：wechat-ui 截图核对聊天标题/草稿/绿色气泡需要；
-- **辅助功能**：wechat-ui 发送所需的鼠标/键盘事件需要。
+- **辅助功能**（System Events 按键 + osascript 激活/查询前台）——**唯一必需项**；
+- ~~屏幕录制~~（不再需要：验证走 DB 回读，无截图）。
 
-授权后如仍报权限缺失：重启宿主应用，并跑 `wechat-ui doctor` 核对。
+### 真实键位实证（待回填）
 
-### 微信侧前置
+微信 mac 4.x 搜索快捷键暂按 **Cmd+F** 设计（wechat-ui 时代参考 + Windows 版 Ctrl+F 的 mac 映射）。
+spike 脚本：`scripts/spike-search-shortcut.sh`（会真实敲键，**由 PM/用户在终端代跑**，
+agent 不自主执行）——自动依次试 Cmd+F / Ctrl+F / Cmd+Ctrl+F，输出各段 AXFocusedUIElement，
+哪段焦点变为搜索框即为真实键位。若全不中，脚本尾附 AX 路径备选（免按键定位，需现场用
+Accessibility Inspector 确认元素层级）。**实证结论回填此处：______**
 
-1. **手动打开微信"文件传输助手"聊天窗口**（窗口完整、不最小化、所在显示器内）；
-2. 按 UI_GUIDE §4 校准 `composerTop`（`wechat-ui read --chat '文件传输助手' --snapshot ./debug.png` 量横线位置；默认 0.70 不可盲用）；
-3. 发送期间**不要操作微信**（不切聊天、不切前台应用、不动窗口）；微信 Enter 发送（Cmd+Enter 需另配，当前未接）。
+### 首次启用步骤（两段式：dry_run 人工确认定位 → 真发）
 
-### 首次启用步骤（严格按顺序，两段验证、与定时日报解耦）
-
-1. TCC 授权（上节）+ 微信打开文件传输助手窗口 + composerTop 校准；
+1. TCC"辅助功能"授权 + 配置 `sourceToolDir`/`sourceDbRoot`（回读验证必需）；
 2. 配置保持 `senderEnabled: true`、`sendDryRun: true`（默认），重启插件；
-3. **第一段（干跑）**：调用 `groupLurker.sender.sendTestSample()`（如经宿主控制台/API）——样例条目走完整闸门链路但只记审计不真发；核对 `audit/sender.jsonl` 有 `dry_run` 行；
-4. **第二段（真发）**：配置 `sendDryRun: false` 重启，再调一次 `sendTestSample()`——文件传输助手里应出现"【lurker】【测试样例】发送链路验证 …"绿色气泡，返回 `{action:'sent'}`；
-5. 样例验证通过后，真实 pending 报告条目由消费循环（`sendIntervalSec`，默认 300s）自然发送，无需任何额外操作。
+3. **第一段（干跑）**：触发消费（或调 `groupLurker.sender.sendTestSample()`）——keyboard 模式
+   dry_run **执行键序到第 8 步为止**（激活 → 搜索 → 选中第一个结果 → 停），**不粘贴消息不回车**。
+   人工确认微信确实定位到"文件传输助手"会话（这是本方案最重要的安全特性：干跑即可验证搜索定位）；
+4. **第二段（真发）**：确认定位正确后配置 `sendDryRun: false` 重启，再跑一次——文件传输助手收到
+   `【lurker】…` 消息，且 `audit/sender.jsonl` 出现 `result:'sent', method:'keyboard'` 行（DB 回读已验证）；
+5. 之后真实 pending 报告条目由消费循环（`sendIntervalSec`，默认 300s）自然发送。
 
-### 行为要点
+### 闸门与行为要点
 
-- **三重闸门**：① `senderEnabled`（默认 false = 零活动）+ `sendDryRun`（默认 true）；② 通道白名单硬编码；③ 微信前台检测（osascript），非前台跳过本轮，连续 3 轮 warn 提醒开窗；
-- **频控**：`maxSendsPerDay`（默认 20）超限的当日 pending 标 `skipped_quota`（样例同样占配额，不开后门）；
-- **失败重试**：attempts 落盘，≥3 次转 `failed` 不再重试（防风暴）；`--id` 用 outbox 唯一 id，wechat-ui 侧幂等不重发；
+- **总闸**：`senderEnabled`（默认 false = 零活动）+ `sendDryRun`（默认 true）；
+- **通道闸**：白名单硬编码，非 filehelper 的 pending 直接 `skipped_channel`，零按键零回读；
+- **交互闸（强化，两道）**：① 微信前台（osascript，非前台跳过，连续 3 轮 warn）；② **用户操作闸**——
+  `ioreg -c IOHIDSystem` 读系统空闲秒数，**空闲 <10s 视为用户正在操作 → 跳过本轮**（审计
+  `user_active`），防按键串扰（用户正在打字/操作时绝不抢键盘）；
+- **频控**：`maxSendsPerDay`（默认 20）超限的当日 pending 标 `skipped_quota`（样例同样占配额）；
+- **失败重试**：attempts 落盘，≥3 次转 `failed` 不再重试（防风暴）；
 - **状态机**：`pending → sent | dry_run | skipped_quota | skipped_channel | failed`；
-- **审计**：`audit/sender.jsonl` 只记元数据（id/kind/结果/attempts），绝不记正文；
-- **测试模式隔离**：`scheduleTestMode` 产生的报告同样进 outbox、同样可发——**测试期务必保持 `sendDryRun: true`**，验证完及时关掉 scheduleTestMode。
+- **审计**：`audit/sender.jsonl` 只记元数据（id/kind/结果/attempts/method），绝不记正文；
+- **剪贴板**：发送前保存、发送后恢复；恢复失败只 warn；发送失败路径同样尝试恢复；
+- **切换回旧实现**：`sendMethod: 'wechat-ui'`（此时 `wechatUiPath`/`composerTop` 生效，TCC 需
+  屏幕录制，验证标志回到 `sent_ui_verified`）；
+- **测试模式隔离**：`scheduleTestMode` 产生的报告同样进 outbox、同样可发——测试期务必保持
+  `sendDryRun: true`，验证完及时关掉 scheduleTestMode。
 
 ## 附录：macos-wechat-export 目录盘点（2026-10-13）
 

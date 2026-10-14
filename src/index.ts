@@ -34,7 +34,7 @@ import type { ReportKind } from './report.js'
 import { localDayKey } from './person-digest.js'
 import { Outbox } from './outbox.js'
 // 红线升级（2026-10-14 用户批准）：filehelper 发送 worker——outbox 消费 + 三重闸门 + 频控
-import { SenderService } from './sender.js'
+import { SenderService, defaultSystemIdleSec } from './sender.js'
 // M4：任务/事件识别 + 待确认闭环（新增行，不动他人行）
 import { TaskRecognitionService } from './task-recognition.js'
 import type { RecognitionEvent } from './task-recognition.js'
@@ -140,15 +140,17 @@ export interface PluginConfig {
   llmBaseUrl: string
   /** 红线升级 2026-10-14：发送总闸（默认 false = 零发送活动） */
   senderEnabled: boolean
-  /** 发送 dry_run（默认 true = 只记日志不真调 wechat-ui send） */
+  /** 发送 dry_run（默认 true = keyboard 模式键序到第 8 步定位即停，不粘贴消息不回车） */
   sendDryRun: boolean
+  /** 发送原语（默认 'keyboard' = 键盘模拟 + DB 回读验证；'wechat-ui' 可切回旧实现） */
+  sendMethod: string
   /** 发送 worker 扫描间隔（秒，默认 300） */
   sendIntervalSec: number
   /** 每日发送上限（默认 20） */
   maxSendsPerDay: number
-  /** wechat-ui 可执行文件（默认 'wechat-ui'；建议绝对路径） */
+  /** wechat-ui 可执行文件（默认 'wechat-ui'；仅 sendMethod='wechat-ui' 用） */
   wechatUiPath: string
-  /** wechat-ui --composer-top（默认 0.7） */
+  /** wechat-ui --composer-top（默认 0.7；仅 sendMethod='wechat-ui' 用） */
   composerTop: number
 }
 
@@ -209,8 +211,9 @@ export const Config: Schema<PluginConfig> = Schema.object({
   llmModel: Schema.string().default('').description("LLM 模型（空 = 注册默认 'glm-5.3'；provider=zai）"),
   llmBaseUrl: Schema.string().default('').description('LLM openai 兼容 baseURL（空 = zai 默认端点）。API key 从 ZAI_API_KEY 环境变量读，绝不落日志/落盘'),
   // —— 红线升级（2026-10-14 用户批准）：filehelper 发送 worker（全部默认保守 = 关/干跑）——
-  senderEnabled: Schema.boolean().default(false).description('发送总闸（默认 false = 零发送活动）。开启前务必先完成 TCC 授权 + 微信打开"文件传输助手"窗口 + sendDryRun=true 试运行'),
-  sendDryRun: Schema.boolean().default(true).description('发送 dry_run（默认 true = 只记日志/审计，绝不调用 wechat-ui send）。真发前先跑一轮确认'),
+  senderEnabled: Schema.boolean().default(false).description('发送总闸（默认 false = 零发送活动）。开启前务必先完成 TCC"辅助功能"授权 + sendDryRun=true 干跑确认搜索定位'),
+  sendDryRun: Schema.boolean().default(true).description('发送 dry_run（默认 true = keyboard 模式执行搜索键序到第 8 步定位会话即停，不粘贴消息不回车；人工确认定位正确后再关掉真发）'),
+  sendMethod: Schema.string().default('keyboard').description("发送原语（默认 'keyboard' = wx-chatbot 式键盘模拟 + DB 回读验证，TCC 只需辅助功能；'wechat-ui' 可切回旧 UI 校准实现）"),
   sendIntervalSec: Schema.number().default(300).description('发送 worker 消费 outbox 的扫描间隔（秒）'),
   maxSendsPerDay: Schema.number().default(20).description('每日发送上限（默认 20；超限的当日 pending 标 skipped_quota 防风暴）'),
   wechatUiPath: Schema.string().default('wechat-ui').description('wechat-ui 可执行文件（PATH 解析；建议绝对路径，如 /path/to/macos-wechat-export/wechat-ui）'),
@@ -315,16 +318,21 @@ export function apply(ctx: Context, config: PluginConfig): void {
   // —— M3：发件箱日志替身（只落盘零发送；报告正文不进通知，全文指针进 outbox） ——
   const outbox = new Outbox({ store })
   // —— 红线升级（2026-10-14）：filehelper 发送 worker（默认 senderEnabled=false 零活动；
-  //    sendDryRun=true 只记日志；通道白名单在 sender.ts 代码级硬编码为 filehelper）。 ——
+  //    sendDryRun=true 只定位不发送；通道白名单在 sender.ts 代码级硬编码为 filehelper；
+  //    sendMethod 默认 'keyboard'（wx-chatbot 式键盘模拟 + DB 回读验证，TCC 只需辅助功能）。 ——
   const sender = new SenderService({
     outbox,
     store,
     logger,
     enabled: config.senderEnabled,
     dryRun: config.sendDryRun,
+    sendMethod: config.sendMethod === 'wechat-ui' ? 'wechat-ui' : 'keyboard',
     maxSendsPerDay: config.maxSendsPerDay,
     wechatUiPath: config.wechatUiPath,
     composerTop: config.composerTop,
+    sourceToolDir: config.sourceToolDir ?? '',
+    sourcePython: config.sourcePython,
+    systemIdleSec: defaultSystemIdleSec,
     intervalSec: config.sendIntervalSec,
   })
   // report 依赖 llmClient（其下才定义），先占位、llmClient 就绪后赋值
