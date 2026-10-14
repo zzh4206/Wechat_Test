@@ -33,6 +33,8 @@ import { ReportService } from './report.js'
 import type { ReportKind } from './report.js'
 import { localDayKey } from './person-digest.js'
 import { Outbox } from './outbox.js'
+// 红线升级（2026-10-14 用户批准）：filehelper 发送 worker——outbox 消费 + 三重闸门 + 频控
+import { SenderService } from './sender.js'
 // M4：任务/事件识别 + 待确认闭环（新增行，不动他人行）
 import { TaskRecognitionService } from './task-recognition.js'
 import type { RecognitionEvent } from './task-recognition.js'
@@ -136,6 +138,18 @@ export interface PluginConfig {
   llmModel: string
   /** LLM 注册表回退的 openai 兼容 baseURL（空 = zai 默认端点；API key 走 ZAI_API_KEY 环境变量） */
   llmBaseUrl: string
+  /** 红线升级 2026-10-14：发送总闸（默认 false = 零发送活动） */
+  senderEnabled: boolean
+  /** 发送 dry_run（默认 true = 只记日志不真调 wechat-ui send） */
+  sendDryRun: boolean
+  /** 发送 worker 扫描间隔（秒，默认 300） */
+  sendIntervalSec: number
+  /** 每日发送上限（默认 20） */
+  maxSendsPerDay: number
+  /** wechat-ui 可执行文件（默认 'wechat-ui'；建议绝对路径） */
+  wechatUiPath: string
+  /** wechat-ui --composer-top（默认 0.7） */
+  composerTop: number
 }
 
 export const name = 'dsh-group-lurker'
@@ -194,6 +208,13 @@ export const Config: Schema<PluginConfig> = Schema.object({
   activitySpikeMultiplier: Schema.number().default(3).description('M6 活跃度突变倍数（默认 3 = 现行为：今日 > 近 7 日均值 × N 标注异常）'),
   llmModel: Schema.string().default('').description("LLM 模型（空 = 注册默认 'glm-5.3'；provider=zai）"),
   llmBaseUrl: Schema.string().default('').description('LLM openai 兼容 baseURL（空 = zai 默认端点）。API key 从 ZAI_API_KEY 环境变量读，绝不落日志/落盘'),
+  // —— 红线升级（2026-10-14 用户批准）：filehelper 发送 worker（全部默认保守 = 关/干跑）——
+  senderEnabled: Schema.boolean().default(false).description('发送总闸（默认 false = 零发送活动）。开启前务必先完成 TCC 授权 + 微信打开"文件传输助手"窗口 + sendDryRun=true 试运行'),
+  sendDryRun: Schema.boolean().default(true).description('发送 dry_run（默认 true = 只记日志/审计，绝不调用 wechat-ui send）。真发前先跑一轮确认'),
+  sendIntervalSec: Schema.number().default(300).description('发送 worker 消费 outbox 的扫描间隔（秒）'),
+  maxSendsPerDay: Schema.number().default(20).description('每日发送上限（默认 20；超限的当日 pending 标 skipped_quota 防风暴）'),
+  wechatUiPath: Schema.string().default('wechat-ui').description('wechat-ui 可执行文件（PATH 解析；建议绝对路径，如 /path/to/macos-wechat-export/wechat-ui）'),
+  composerTop: Schema.number().default(0.7).description('wechat-ui --composer-top（默认 0.70；务必按 UI_GUIDE 用 read --snapshot 实测校准）'),
   scheduleTestMode: Schema.boolean().default(false).description('快速测试模式（默认关）：true 且 testKindIntervalMin>0 时，每间隔分钟依次强制触发 weekly/monthly 的完整生成链路（周/月报不再等日历闸门）。测试完务必关掉，避免频繁 LLM 调用'),
   testKindIntervalMin: Schema.number().default(0).description('测试模式强制触发间隔（分钟，默认 0 = 不触发）'),
 })
@@ -232,6 +253,8 @@ export interface GroupLurker {
   readonly report: ReportService | null
   /** 发件箱日志替身（M3 落地 M4-T4.4 最小版）：只落盘不发送 */
   readonly outbox: Outbox
+  /** filehelper 发送 worker（红线升级 2026-10-14）：senderEnabled=false 时零活动 */
+  readonly sender: SenderService
   /** 任务/事件识别 + 待确认闭环（M4-T4.1/T4.2）；taskRecognitionEnabled=false 时为 null（零活动） */
   readonly taskRecognition: TaskRecognitionService | null
   /** 提醒计划器（M4-T4.3）；reminderEnabled=false 时为 null（零活动） */
@@ -291,6 +314,19 @@ export function apply(ctx: Context, config: PluginConfig): void {
   // —— M1-T1.3：调度骨架（onTick → M3 报告生成 → 短通知 + outbox 落盘） ——
   // —— M3：发件箱日志替身（只落盘零发送；报告正文不进通知，全文指针进 outbox） ——
   const outbox = new Outbox({ store })
+  // —— 红线升级（2026-10-14）：filehelper 发送 worker（默认 senderEnabled=false 零活动；
+  //    sendDryRun=true 只记日志；通道白名单在 sender.ts 代码级硬编码为 filehelper）。 ——
+  const sender = new SenderService({
+    outbox,
+    store,
+    logger,
+    enabled: config.senderEnabled,
+    dryRun: config.sendDryRun,
+    maxSendsPerDay: config.maxSendsPerDay,
+    wechatUiPath: config.wechatUiPath,
+    composerTop: config.composerTop,
+    intervalSec: config.sendIntervalSec,
+  })
   // report 依赖 llmClient（其下才定义），先占位、llmClient 就绪后赋值
   let report: ReportService | null = null
 
@@ -690,6 +726,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
     personDigest,
     report,
     outbox,
+    sender,
     taskRecognition,
     reminder,
     promiseRecognition,
@@ -768,6 +805,8 @@ export function apply(ctx: Context, config: PluginConfig): void {
     }
     // M6-T1 保留期清理心跳：start() → clearInterval 约定（立即先跑一轮）。
     const stopRetention = retention.start()
+    // 红线升级（2026-10-14）：filehelper 发送 worker 心跳（senderEnabled=false 时为 noop 零活动）。
+    const stopSender = sender.start()
     return () => {
       stopTimer() // clearInterval：唯一 setInterval 的释放点
       stopSource?.() // clearInterval + 释放单实例锁
@@ -775,6 +814,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
       stopReminder?.() // clearInterval：提醒心跳唯一释放点
       stopPromiseReminder?.() // M5：承诺提醒心跳唯一释放点
       stopRetention() // M6：保留期清理心跳唯一释放点
+      stopSender() // 发送 worker 心跳唯一释放点（senderEnabled=false 时 noop）
       distiller.dispose()
       journal.dispose() // 无定时器，清计数/日报内存引用
       personDigest?.dispose() // M2-T2.3：无定时器，清并发去重表

@@ -4,11 +4,12 @@
  * 边界（实施计划 §4-M4-T4.4 / §6 决策 1）：
  * - 所有"本应发往文件传输助手"的内容统一 **追加写** <stateDir>/outbox.jsonl，
  *   schema：{ts, channel:'filehelper', kind, title, body, evidence_ref, status:'pending'}；
- * - **零发送调用**：本模块不 import 任何发送接口，不做网络/子进程调用——
- *   将来接入发送 worker 时另行评审（no-send 红线原样保留）；
+ * - **零发送调用**：本模块不 import 任何发送接口，不做网络/子进程调用；
+ *   2026-10-14 红线升级后，发送由 src/sender.ts（SenderService，唯一发送出口）消费本箱；
  * - tailOutbox(n) 只读（读文件尾部 n 条），供 `outbox tail` 查看辅助；
  * - 写入经 Store.appendJsonl（assertInsideState 围栏 + 单一 fs 入口）。
  */
+import { randomUUID } from 'node:crypto'
 import type { Store } from './store.js'
 
 /** 发件箱落盘相对路径（相对 stateDir） */
@@ -28,8 +29,15 @@ export interface OutboxEntry {
   body: string
   /** 证据指针（报告 md 路径 / msg_id 等，透传调用方） */
   evidence_ref: string
-  status: 'pending'
+  status: OutboxStatus
+  /** 唯一 id（sender worker 幂等 --id 用；appendOutbox 自动生成；旧条目可能缺失） */
+  id?: string
+  /** 发送 worker 已尝试次数（sender 维护；≥3 转 failed 不再重试） */
+  attempts?: number
 }
+
+/** 生命周期状态：pending → sent | dry_run | skipped_quota | skipped_channel | failed（sender worker 推进） */
+export type OutboxStatus = 'pending' | 'sent' | 'dry_run' | 'skipped_quota' | 'skipped_channel' | 'failed'
 
 /** appendOutbox 的入参（ts/channel/status 由本模块补全，调用方不给篡改口） */
 export interface OutboxAppendInput {
@@ -62,6 +70,7 @@ export class Outbox {
       body: String(input.body ?? ''),
       evidence_ref: String(input.evidence_ref ?? ''),
       status: 'pending',
+      id: randomUUID(),
     }
     return this.options.store.appendJsonl(OUTBOX_REL, entry) ? entry : null
   }
@@ -84,5 +93,37 @@ export class Outbox {
       }
     }
     return out.slice(-limit)
+  }
+
+  /** 只读：全量解析（sender worker 扫 pending/统计当日已发用）；损坏行跳过。 */
+  listOutbox(): OutboxEntry[] {
+    return this.tailOutbox(Number.MAX_SAFE_INTEGER)
+  }
+
+  /**
+   * 发送 worker 专用：按 id 推进条目生命周期状态（pending → sent / dry_run / skipped / failed）。
+   * 原地重写 outbox.jsonl（逐行 JSON，命中行打补丁）；找不到 id / 写失败返回 false。
+   */
+  updateSendState(id: string, patch: { status: OutboxStatus; attempts?: number }): boolean {
+    if (id === '') return false
+    const raw = this.options.store.readText(OUTBOX_REL)
+    if (!raw) return false
+    const lines = raw.split('\n')
+    let hit = false
+    const updated = lines.map((line) => {
+      if (hit || line.trim() === '') return line
+      try {
+        const v = JSON.parse(line) as OutboxEntry
+        if (v && typeof v === 'object' && v.id === id) {
+          hit = true
+          return JSON.stringify({ ...v, ...patch })
+        }
+      } catch {
+        /* 损坏行原样保留 */
+      }
+      return line
+    })
+    if (!hit) return false
+    return this.options.store.writeText(OUTBOX_REL, updated.join('\n'))
   }
 }

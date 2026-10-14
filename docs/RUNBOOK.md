@@ -274,6 +274,44 @@ rm -rf /path/to/macos-wechat-export/.wechat-local
 2. **切勿**把旧机器的 `.wechat-local/` 拷过去：旧签名快照会让 `bootstrap_keys.py` 的原版签名对照（第 101 行）误判"原版被改动"而中止；旧 keys.json 对新环境的库也不适用；
 3. 取钥成功后插件侧只需核对 `sourceDbRoot`/`sourceToolDir` 指向无误，游标（stateDir/cursor.json）与新库位点不一致时会自动按新库重新对齐（最坏情况：少量近期消息重复投递，下游幂等消化）。
 
+## 12.5 filehelper 发送 worker（红线升级 2026-10-14）
+
+> 用户于 2026-10-14 明确批准红线升级：从此前 no-send 升级为**仅允许 `filehelper` 一个受控出口**。
+> 通道白名单在 `src/sender.ts` 代码级硬编码（`ALLOWED_CHANNELS = ['filehelper']`），其他 channel 永不发送；
+> 绝不发群聊；发送内容 = `【lurker】<标题>` + ≤160 字摘要（单行 ≤200 字符），**绝不发全文**（全文在本地 reports/，指针在 outbox）。
+
+### TCC 前置（首次必做）
+
+系统设置 → 隐私与安全性 → 给 **DSH 宿主应用**（运行本插件的进程）开启：
+
+- **屏幕录制**：wechat-ui 截图核对聊天标题/草稿/绿色气泡需要；
+- **辅助功能**：wechat-ui 发送所需的鼠标/键盘事件需要。
+
+授权后如仍报权限缺失：重启宿主应用，并跑 `wechat-ui doctor` 核对。
+
+### 微信侧前置
+
+1. **手动打开微信"文件传输助手"聊天窗口**（窗口完整、不最小化、所在显示器内）；
+2. 按 UI_GUIDE §4 校准 `composerTop`（`wechat-ui read --chat '文件传输助手' --snapshot ./debug.png` 量横线位置；默认 0.70 不可盲用）；
+3. 发送期间**不要操作微信**（不切聊天、不切前台应用、不动窗口）；微信 Enter 发送（Cmd+Enter 需另配，当前未接）。
+
+### 首次启用步骤（严格按顺序，两段验证、与定时日报解耦）
+
+1. TCC 授权（上节）+ 微信打开文件传输助手窗口 + composerTop 校准；
+2. 配置保持 `senderEnabled: true`、`sendDryRun: true`（默认），重启插件；
+3. **第一段（干跑）**：调用 `groupLurker.sender.sendTestSample()`（如经宿主控制台/API）——样例条目走完整闸门链路但只记审计不真发；核对 `audit/sender.jsonl` 有 `dry_run` 行；
+4. **第二段（真发）**：配置 `sendDryRun: false` 重启，再调一次 `sendTestSample()`——文件传输助手里应出现"【lurker】【测试样例】发送链路验证 …"绿色气泡，返回 `{action:'sent'}`；
+5. 样例验证通过后，真实 pending 报告条目由消费循环（`sendIntervalSec`，默认 300s）自然发送，无需任何额外操作。
+
+### 行为要点
+
+- **三重闸门**：① `senderEnabled`（默认 false = 零活动）+ `sendDryRun`（默认 true）；② 通道白名单硬编码；③ 微信前台检测（osascript），非前台跳过本轮，连续 3 轮 warn 提醒开窗；
+- **频控**：`maxSendsPerDay`（默认 20）超限的当日 pending 标 `skipped_quota`（样例同样占配额，不开后门）；
+- **失败重试**：attempts 落盘，≥3 次转 `failed` 不再重试（防风暴）；`--id` 用 outbox 唯一 id，wechat-ui 侧幂等不重发；
+- **状态机**：`pending → sent | dry_run | skipped_quota | skipped_channel | failed`；
+- **审计**：`audit/sender.jsonl` 只记元数据（id/kind/结果/attempts），绝不记正文；
+- **测试模式隔离**：`scheduleTestMode` 产生的报告同样进 outbox、同样可发——**测试期务必保持 `sendDryRun: true`**，验证完及时关掉 scheduleTestMode。
+
 ## 附录：macos-wechat-export 目录盘点（2026-10-13）
 
 > 结论：除 `__pycache__`（92K 编译缓存，随时再生）外**无废弃物**，整目录 ~400KB，不做瘦身。逐类依据如下。
