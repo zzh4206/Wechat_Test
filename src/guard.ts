@@ -28,6 +28,16 @@ export function sanitize(raw: string, maxChars = 2000): SanitizedMessage {
 }
 
 /**
+ * 密钥形态脱敏（ERR-SRC-009）：把 ≥32 位连续 hex 串（sqlcipher enc_key 等密钥
+ * 的典型形态）替换为 `[redacted:N]`（N=原长度）。纯函数、无副作用。
+ * 用途：外部 CLI 的 stderr / 异常文本回显进 logger 前统一过一遍，
+ * 防止崩溃现场（如 traceback 中的 PRAGMA key）把密钥带进宿主日志。
+ */
+export function redactHexRuns(s: string): string {
+  return s.replace(/[0-9a-fA-F]{32,}/g, (m) => `[redacted:${m.length}]`)
+}
+
+/**
  * 断言 target（任意形态路径）解析后位于 base 目录内部，否则抛错。
  * - 两边都先 path.resolve 成绝对路径，杜绝 `..` 与绝对路径逃逸；
  * - 要求 target 位于 base 下（允许 target === base 本身，如 ensureDir('.')）。

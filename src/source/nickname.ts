@@ -24,6 +24,7 @@
  */
 import { spawn } from 'node:child_process'
 import { readFileSync } from 'node:fs'
+import { redactHexRuns } from '../guard.js'
 
 export interface NicknameLogger {
   info(message: string): unknown
@@ -186,8 +187,9 @@ export class NicknameResolver {
     try {
       map = await this.queryGroup(chatId)
     } catch (error) {
-      // 降级：返回空映射（lookup 会回落原 sender_id）；异常文本可能含 stderr，但密钥只在 stdin，不会出现。
-      this.logger.warn(`nickname resolve failed for ${chatId}, degrade to raw ids: ${String(error).slice(0, 200)}`)
+      // 降级：返回空映射（lookup 会回落原 sender_id）；异常文本可能含 stderr，回显前
+      // 统一过 redactHexRuns 脱敏（ERR-SRC-009，与 wechat-db 两处回显点同构覆盖）。
+      this.logger.warn(`nickname resolve failed for ${chatId}, degrade to raw ids: ${redactHexRuns(String(error).slice(0, 200))}`)
       map = new Map<string, string>()
     }
     this.cache.set(chatId, { map, expiresAt: this.now() + this.ttlMs })

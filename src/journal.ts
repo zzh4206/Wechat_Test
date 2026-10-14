@@ -9,7 +9,7 @@
  * 安全约定（TECH-DESIGN §3/§4 / PRD F4）：
  * - type 仅 topic/viewpoint/quote/opportunity，写入前二次校验（纵深防御，
  *   不信任 distiller 上游）；非法 type 丢弃并 warn，绝不落盘；
- * - 引用句字段（quote / text）截断到 ≤50 字，不落任何原始消息全文；
+ * - 引用句及一切自由文本字段截断到 ≤50 字（ERR-JRN-001），不落任何原始消息全文；
  * - 所有路径形如 groups/<chatId>/insights.jsonl、reports/YYYY-MM-DD.md，
  *   最终由 store 内 assertInsideState 兜底，只写 stateDir 内。
  */
@@ -43,11 +43,20 @@ export function clampQuote(value: unknown): unknown {
   return value.length > MAX_QUOTE_CHARS ? value.slice(0, MAX_QUOTE_CHARS) : value
 }
 
-/** 对单条 insight 做落盘前消毒：引用截断 + 群号回填 */
+/** 对单条 insight 做落盘前消毒：全字符串字段统一钳制 + 群号回填。
+ *
+ * ERR-JRN-001 修复：不再只钳制 quote/text——entry 的**全部字符串字段**
+ * （title/summary/about/stance/angle/reason/who/topic…含未来新增字段）统一
+ * 按 MAX_QUOTE_CHARS（50 字）口径截断，保证"原始消息全文不落盘"的纪律
+ * 不因字段漏配而失守。50 而非 200 的理由：安全报告绊网的 canary 全串
+ * 仅 76 字，≤200 的钳制无法阻断其落盘；报告本身亦给出"沿用 quote 的
+ * 50 字口径"这一保守选项。提炼期的语义上限（title≤100/其余≤200）由
+ * distiller.parseInsights 的 schema 校验承担（超长 → 整批拒绝走降级），
+ * 这里是最短必要的兜底钳制。 */
 function sanitizeEntry(chatId: string, insight: Insight): Insight {
   const out: Record<string, unknown> = { ...insight, group: chatId }
-  for (const field of ['quote', 'text']) {
-    if (field in out) out[field] = clampQuote(out[field])
+  for (const key of Object.keys(out)) {
+    out[key] = clampQuote(out[key])
   }
   return out as Insight
 }

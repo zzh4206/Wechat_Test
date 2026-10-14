@@ -217,9 +217,16 @@ export class Distiller {
   }
 }
 
+/** 自由文本字段 schema 上限（ERR-JRN-001）：title ≤100，其余自由文本字段 ≤200。
+ * 超长即校验失败（parseInsights 返回 null）→ 走既有"非法输出 → 批次丢弃"降级路径。 */
+export const MAX_TITLE_CHARS = 100
+export const MAX_FIELD_CHARS = 200
+
 /**
- * 解析并校验 LLM 输出：必须是 JSON 数组，且每条 type 属于四类；
- * 任何违规（含非法 JSON、未知 type、非数组）返回 null → 整批丢弃。
+ * 解析并校验 LLM 输出：必须是 JSON 数组，且每条 type 属于四类、
+ * 自由文本字段不超 schema 上限（title ≤ MAX_TITLE_CHARS，其余字符串值
+ * ≤ MAX_FIELD_CHARS）；任何违规（含非法 JSON、未知 type、非数组、超长）
+ * 返回 null → 整批丢弃。
  */
 export function parseInsights(raw: string): Insight[] | null {
   let text = String(raw ?? '').trim()
@@ -238,6 +245,11 @@ export function parseInsights(raw: string): Insight[] | null {
     if (typeof item !== 'object' || item === null) return null
     const rec = item as Record<string, unknown>
     if (typeof rec.type !== 'string' || !INSIGHT_TYPES.includes(rec.type as InsightType)) return null
+    for (const [key, value] of Object.entries(rec)) {
+      if (typeof value !== 'string') continue
+      const max = key === 'title' ? MAX_TITLE_CHARS : MAX_FIELD_CHARS
+      if (value.length > max) return null
+    }
   }
   return parsed as Insight[]
 }

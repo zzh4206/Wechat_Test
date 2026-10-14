@@ -21,6 +21,7 @@ import { spawn } from 'node:child_process'
 import { closeSync, openSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import type { Store } from '../store.js'
+import { redactHexRuns } from '../guard.js'
 import type { NicknameResolver } from './nickname.js'
 import { GroupCursor } from './cursor.js'
 
@@ -448,7 +449,7 @@ export class WechatDbSource {
       }
     } else {
       this.logger.warn(
-        `wechat_db read failed for ${chatId} (code=${first.code}): ${first.stderr.slice(0, 200)}`,
+        `wechat_db read failed for ${chatId} (code=${first.code}): ${redactHexRuns(first.stderr.slice(0, 200))}`,
       )
     }
     if (ok) collected.push(...page)
@@ -487,7 +488,7 @@ export class WechatDbSource {
         if (res.code !== 0) {
           ok = false
           this.logger.warn(
-            `wechat_db catch-up read failed for ${chatId} (code=${res.code}): ${res.stderr.slice(0, 200)}`,
+            `wechat_db catch-up read failed for ${chatId} (code=${res.code}): ${redactHexRuns(res.stderr.slice(0, 200))}`,
           )
           break
         }
