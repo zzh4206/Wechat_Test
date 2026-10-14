@@ -63,6 +63,37 @@ export interface DefaultLlmClientOptions {
 }
 
 /**
+ * 防御性多形态 delta 文本提取（零依赖、不抛错）：
+ * - 字符串：直接返回；
+ * - 数组：走 some/map-join（块数组 [{type:'text',text}|{text}] 或字符串数组）；
+ * - 对象：尝试 text/delta/content 常见字段（递归一层）；
+ * - 其他类型：忽略，返回空串。
+ */
+function extractDeltaText(...candidates: unknown[]): string {
+  for (const v of candidates) {
+    if (typeof v === 'string') return v
+    if (Array.isArray(v)) {
+      return v
+        .map((part) => {
+          if (typeof part === 'string') return part
+          if (part && typeof part === 'object') {
+            const o = part as { text?: unknown }
+            return typeof o.text === 'string' ? o.text : ''
+          }
+          return ''
+        })
+        .join('')
+    }
+    if (v && typeof v === 'object') {
+      const o = v as { text?: unknown; delta?: unknown; content?: unknown }
+      const nested = extractDeltaText(o.text, o.delta, o.content)
+      if (nested !== '') return nested
+    }
+  }
+  return ''
+}
+
+/**
  * 从宿主 stream 结果里稳健地取出 async iterable：
  * 兼容直接返回 iterable、Promise<iterable>、{ stream }、Promise<{ stream }> 四种形态。
  */
@@ -96,11 +127,14 @@ export class DefaultLlmClient implements LlmClient {
     this.baseUrl = (options.baseUrl && options.baseUrl !== '' ? options.baseUrl : 'https://api.z.ai/api/paas/v4').replace(/\/+$/, '')
     this.apiKeyEnv = options.apiKeyEnv ?? 'ZAI_API_KEY'
     this.fetchFn = options.fetch ?? globalThis.fetch.bind(globalThis)
+    this.log = options.logger
     // 启动探测（第一步②）：一次运行就能看清宿主 llm 服务到底暴露了什么
     const keys = host ? Object.keys(host) : []
-    options.logger?.info?.(`llm host methods: ${keys.length > 0 ? keys.join(', ') : '(none)'}`)
-    options.logger?.info?.(`llm route: provider=${this.provider} model=${this.model}`)
+    this.log?.info?.(`llm host methods: ${keys.length > 0 ? keys.join(', ') : '(none)'}`)
+    this.log?.info?.(`llm route: provider=${this.provider} model=${this.model}`)
   }
+
+  private readonly log?: { info?: (m: string) => void; warn?: (m: string) => void }
 
   /** 宿主可用方法名清单（探测可见化） */
   hostMethodNames(): string[] {
@@ -119,23 +153,46 @@ export class DefaultLlmClient implements LlmClient {
     )
   }
 
-  /** dsh-llm stream(GenerateOptions)：拼装 text-delta，finish=error/aborted 抛错 */
+  /**
+   * dsh-llm stream(GenerateOptions)：拼装 text-delta，finish=error/aborted 抛错。
+   * 线上实测（14:57 日报 degraded）："content.some is not a function" —— 宿主
+   * dsh-llm 的 contentHasFile/contentHasImage 对 message.content 调 .some()，
+   * content 必须是内容块数组 [{ type:'text', text }]，不能是裸字符串。
+   */
   private async completeViaStream(prompt: string): Promise<string> {
     const host = this.host!
     const iterable = await asAsyncIterable(host.stream!({
       provider: this.provider,
       model: this.model,
-      messages: [{ role: 'user', content: prompt }],
+      messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
       temperature: 0.2,
     }))
     let out = ''
+    let unknownChunkCount = 0
     for await (const chunk of iterable) {
-      const c = chunk as { type?: string; text?: string; reason?: { kind?: string; failure?: { message?: string } } }
-      if (c?.type === 'text-delta' && typeof c.text === 'string') out += c.text
+      const c = chunk as {
+        type?: string
+        text?: unknown
+        delta?: unknown
+        content?: unknown
+        reason?: { kind?: string; failure?: { message?: string } }
+      }
       if (c?.type === 'finish' && c.reason && (c.reason.kind === 'error' || c.reason.kind === 'aborted')) {
         throw new Error(`llm stream finished with ${c.reason.kind}: ${c.reason.failure?.message ?? '(no failure detail)'}`)
       }
+      // 防御性多形态提取：宿主 chunk 契约是 { type:'text-delta', text:string }，
+      // 但对 content/text/delta 字段做兼容兜底，避免宿主版本差异再抛 TypeError。
+      if (c?.type === 'text-delta') {
+        out += extractDeltaText(c.text ?? c.content, c.delta)
+      } else if (c && typeof c === 'object' && c.type === undefined) {
+        // 无 type 的裸 chunk：尝试 text/delta/content 字段（宿主演进兜底）
+        const t = extractDeltaText(c.text, c.delta ?? c.content)
+        if (t !== '') out += t
+        else unknownChunkCount++
+      }
     }
+    if (unknownChunkCount > 0) this.log?.warn?.(`llm stream: ignored ${unknownChunkCount} unrecognized chunk(s)`)
+    if (out === '') throw new Error('llm stream produced no text')
     return out
   }
 

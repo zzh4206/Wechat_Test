@@ -84,13 +84,63 @@ test('适配 ②：宿主只有 stream（dsh-llm GenerateOptions）→ 拼 text-
   assert.equal(captured[0].provider, 'zai')
   assert.equal(captured[0].model, 'glm-5.3')
   assert.equal(captured[0].messages[0].role, 'user')
-  assert.equal(captured[0].messages[0].content, 'PROMPT')
+  // 线上实测修复：content 必须是内容块数组（宿主 contentHasFile 对 content 调 .some()）
+  assert.deepEqual(captured[0].messages[0].content, [{ type: 'text', text: 'PROMPT' }])
 })
 
 test('适配 ②b：stream finish=error → 抛错（不静默）', async () => {
   const host = streamHost([{ type: 'finish', reason: { kind: 'error', failure: { message: 'quota', code: 'X' } } }])
   const client = new DefaultLlmClient(host)
   await assert.rejects(() => client.complete('p'), /stream finished with error/)
+})
+
+test('适配 ②c：stream finish=aborted → 抛错（不静默）', async () => {
+  const host = streamHost([{ type: 'text-delta', index: 0, text: 'half' }, { type: 'finish', reason: { kind: 'aborted', failure: { message: 'cancelled' } } }])
+  const client = new DefaultLlmClient(host)
+  await assert.rejects(() => client.complete('p'), /stream finished with aborted/)
+})
+
+// —— chunk 多形态兼容（防御性提取）——
+
+test('适配 ②d：chunk 四种形态——字符串 text / content 数组 / 对象 delta 字段 / 混合', async () => {
+  // ① 契约形态：text-delta + text 字符串
+  const h1 = streamHost([
+    { type: 'text-delta', index: 0, text: 'A' },
+    { type: 'finish', reason: { kind: 'stop' } },
+  ])
+  assert.equal(await new DefaultLlmClient(h1).complete('p'), 'A')
+  // ② content 为块数组（宿主演进兜底）
+  const h2 = streamHost([
+    { type: 'text-delta', index: 0, content: [{ type: 'text', text: 'B1' }, { text: 'B2' }] },
+    { type: 'finish', reason: { kind: 'stop' } },
+  ])
+  assert.equal(await new DefaultLlmClient(h2).complete('p'), 'B1B2')
+  // ③ 无 type 的裸 chunk，文本在 delta 字段
+  const h3 = streamHost([
+    { delta: 'C1' },
+    { text: 'C2' },
+    { type: 'finish', reason: { kind: 'stop' } },
+  ])
+  assert.equal(await new DefaultLlmClient(h3).complete('p'), 'C1C2')
+  // ④ 混合形态 + 无法识别的 chunk（忽略不抛错）
+  const logger = makeLogger()
+  const h4 = streamHost([
+    { type: 'block-start', index: 0, blockType: 'text' },
+    { type: 'text-delta', index: 0, text: 'D1' },
+    { delta: { text: 'D2' } },
+    { content: ['D3'] },
+    { nonsense: true },
+    { type: 'finish', reason: { kind: 'stop' } },
+  ])
+  const c4 = new DefaultLlmClient(h4, { logger })
+  assert.equal(await c4.complete('p'), 'D1D2D3')
+})
+
+test('适配 ②e：stream 零文本产出 → 视为错误而非静默成功', async () => {
+  const h1 = streamHost([{ type: 'finish', reason: { kind: 'stop' } }])
+  await assert.rejects(() => new DefaultLlmClient(h1).complete('p'), /produced no text/)
+  const h2 = streamHost([{ type: 'text-delta', index: 0, text: '' }, { type: 'finish', reason: { kind: 'stop' } }])
+  await assert.rejects(() => new DefaultLlmClient(h2).complete('p'), /produced no text/)
 })
 
 test('适配 ③：只有注册表 → openai 兼容 fetch（ZAI_API_KEY），key 不进日志/错误', async () => {
