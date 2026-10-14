@@ -129,6 +129,13 @@ export interface PluginConfig {
   fulfilConfidence: number
   /** M6-T4：活跃度突变倍数（默认 3 = 现行为：今日 > 7 日均值 × N） */
   activitySpikeMultiplier: number
+  /**
+   * LLM 路由：默认模型（空 = 用注册默认 'glm-5.3'）。仅当宿主 llm 服务退化为
+   * 注册表回退（openai 兼容 fetch）或 stream 路由时生效。
+   */
+  llmModel: string
+  /** LLM 注册表回退的 openai 兼容 baseURL（空 = zai 默认端点；API key 走 ZAI_API_KEY 环境变量） */
+  llmBaseUrl: string
 }
 
 export const name = 'dsh-group-lurker'
@@ -185,6 +192,8 @@ export const Config: Schema<PluginConfig> = Schema.object({
   minTaskConfidence: Schema.number().default(0).description('M6 识别 confidence 门槛（默认 0 = 现行为：全部落库待确认；低于门槛的事件识别丢弃）'),
   fulfilConfidence: Schema.number().default(0.5).description('M6 承诺兑现软关联 confidence 阈值（默认 0.5 = 现行为；低于只提示不自动置已兑现）'),
   activitySpikeMultiplier: Schema.number().default(3).description('M6 活跃度突变倍数（默认 3 = 现行为：今日 > 近 7 日均值 × N 标注异常）'),
+  llmModel: Schema.string().default('').description("LLM 模型（空 = 注册默认 'glm-5.3'；provider=zai）"),
+  llmBaseUrl: Schema.string().default('').description('LLM openai 兼容 baseURL（空 = zai 默认端点）。API key 从 ZAI_API_KEY 环境变量读，绝不落日志/落盘'),
   scheduleTestMode: Schema.boolean().default(false).description('快速测试模式（默认关）：true 且 testKindIntervalMin>0 时，每间隔分钟依次强制触发 weekly/monthly 的完整生成链路（周/月报不再等日历闸门）。测试完务必关掉，避免频繁 LLM 调用'),
   testKindIntervalMin: Schema.number().default(0).description('测试模式强制触发间隔（分钟，默认 0 = 不触发）'),
 })
@@ -363,6 +372,13 @@ export function apply(ctx: Context, config: PluginConfig): void {
 
   const llmClient: LlmClient = new DefaultLlmClient(
     (ctx as Context & { llm?: HostLlmService }).llm,
+    {
+      provider: 'zai',
+      model: config.llmModel,
+      baseUrl: config.llmBaseUrl,
+      apiKeyEnv: 'ZAI_API_KEY',
+      logger: logger as unknown as { info?: (m: string) => void; warn?: (m: string) => void },
+    },
   )
 
   // —— M3：报告引擎（reportEnabled 默认 false = 零活动；手动 generateReport 可调） ——

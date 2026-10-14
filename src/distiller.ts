@@ -11,9 +11,11 @@
  *   解析失败或含未知 type → 整批丢弃并 logger.warn；
  * - 每群人格（PersonaService.resolve）作为指令区的风格/关注点上下文。
  *
- * LLM 接入：宿主 'llm' 服务（经考察 vendor/im-connect 的用法）是 provider 注册表
- * （listProviders/listModels/resolveModelInfo），没有直接的单轮补全 API；故定义
- * LlmClient 接口 + DefaultLlmClient 适配层，测试可注入 mock。线上接法见仓库报告。
+ * LLM 接入：宿主 'llm' 服务真实暴露面为 listProviders/listModels/resolveModelInfo/
+ * resolveCallConfig/prepareCall/stream 等。DefaultLlmClient 按
+ * complete → chat → stream（GenerateOptions 流式拼装）→ 注册表回退（openai 兼容
+ * fetch，API key 只从环境变量读、绝不落日志/落盘/进 prompt）逐级探测适配。
+ * 构造时把宿主方法清单 dump 到 logger；测试可注入 mock host 与 fetch。
  */
 import type { BufferPool } from './buffer.js'
 import type { PersonaService } from './persona.js'
@@ -37,25 +39,132 @@ export interface LlmClient {
 
 export interface HostLlmService {
   listProviders?: () => Array<{ id: string }> | string[]
+  listModels?: (provider: string) => Promise<Array<{ id: string }>>
+  /** dsh-llm 流式补全（GenerateOptions → AsyncIterable<StreamChunk>，宿主真实暴露的补全路径） */
+  stream?: (options: unknown) => unknown
   complete?: (prompt: string, options?: unknown) => Promise<string>
   chat?: (prompt: string, options?: unknown) => Promise<string>
+  [key: string]: unknown
+}
+
+export interface DefaultLlmClientOptions {
+  /** openai-completions 兼容 provider 路由（stream/fetch 回退共用；默认 'zai'） */
+  provider?: string
+  /** 模型 id（Config.llmModel 覆盖；空 = 'glm-5.3'） */
+  model?: string
+  /** fetch 回退的 openai 兼容 baseURL（默认 zai 的 openai 兼容端点） */
+  baseUrl?: string
+  /** API key 的环境变量名（默认 ZAI_API_KEY；只记名字，绝不记值） */
+  apiKeyEnv?: string
+  /** fetch 注入（测试 mock；默认 globalThis.fetch） */
+  fetch?: typeof fetch
+  /** 可选 logger：宿主方法清单 dump 与探测路径日志 */
+  logger?: { info?: (m: string) => void; warn?: (m: string) => void }
 }
 
 /**
- * 默认实现：探测宿主 llm 服务的可用补全方法。
- * 两者都不可用时抛出明确错误（不静默吞掉），由调用方 warn。
+ * 从宿主 stream 结果里稳健地取出 async iterable：
+ * 兼容直接返回 iterable、Promise<iterable>、{ stream }、Promise<{ stream }> 四种形态。
+ */
+async function asAsyncIterable(result: unknown): Promise<AsyncIterable<unknown>> {
+  let cur = await result
+  if (cur && typeof cur === 'object' && Symbol.asyncIterator in (cur as object)) return cur as AsyncIterable<unknown>
+  const inner = (cur as { stream?: unknown } | null)?.stream
+  if (inner && typeof inner === 'object' && Symbol.asyncIterator in (inner as object)) return inner as AsyncIterable<unknown>
+  throw new Error('host llm stream() returned a non-stream result')
+}
+
+/**
+ * 默认实现：按宿主真实暴露的补全面探测——complete → chat → stream（dsh-llm
+ * GenerateOptions 流式，拼装 text-delta）→ 注册表回退（openai 兼容 fetch）。
+ * 构造时把宿主方法清单 dump 到 logger（一次运行即可看清宿主暴露面）。
+ * 全部不可用时抛出明确错误（含方法清单），由调用方 warn。
  */
 export class DefaultLlmClient implements LlmClient {
-  constructor(private readonly host: HostLlmService | undefined) {}
+  private readonly provider: string
+  private readonly model: string
+  private readonly baseUrl: string
+  private readonly apiKeyEnv: string
+  private readonly fetchFn: typeof fetch
+
+  constructor(
+    private readonly host: HostLlmService | undefined,
+    options: DefaultLlmClientOptions = {},
+  ) {
+    this.provider = options.provider ?? 'zai'
+    this.model = options.model && options.model !== '' ? options.model : 'glm-5.3'
+    this.baseUrl = (options.baseUrl && options.baseUrl !== '' ? options.baseUrl : 'https://api.z.ai/api/paas/v4').replace(/\/+$/, '')
+    this.apiKeyEnv = options.apiKeyEnv ?? 'ZAI_API_KEY'
+    this.fetchFn = options.fetch ?? globalThis.fetch.bind(globalThis)
+    // 启动探测（第一步②）：一次运行就能看清宿主 llm 服务到底暴露了什么
+    const keys = host ? Object.keys(host) : []
+    options.logger?.info?.(`llm host methods: ${keys.length > 0 ? keys.join(', ') : '(none)'}`)
+    options.logger?.info?.(`llm route: provider=${this.provider} model=${this.model}`)
+  }
+
+  /** 宿主可用方法名清单（探测可见化） */
+  hostMethodNames(): string[] {
+    return this.host ? Object.keys(this.host) : []
+  }
 
   async complete(prompt: string): Promise<string> {
     const host = this.host
     if (host?.complete) return host.complete(prompt, { temperature: 0.2 })
     if (host?.chat) return host.chat(prompt, { temperature: 0.2 })
+    if (host?.stream) return this.completeViaStream(prompt)
+    if (host?.listProviders) return this.completeViaFetch(prompt)
     throw new Error(
-      'host llm service exposes no direct completion API ' +
-        '(listProviders/listModels only). Wire a single-turn adapter here.',
+      `host llm service exposes no usable completion API; available methods: ` +
+        `${this.hostMethodNames().join(', ') || '(none)'}`,
     )
+  }
+
+  /** dsh-llm stream(GenerateOptions)：拼装 text-delta，finish=error/aborted 抛错 */
+  private async completeViaStream(prompt: string): Promise<string> {
+    const host = this.host!
+    const iterable = await asAsyncIterable(host.stream!({
+      provider: this.provider,
+      model: this.model,
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0.2,
+    }))
+    let out = ''
+    for await (const chunk of iterable) {
+      const c = chunk as { type?: string; text?: string; reason?: { kind?: string; failure?: { message?: string } } }
+      if (c?.type === 'text-delta' && typeof c.text === 'string') out += c.text
+      if (c?.type === 'finish' && c.reason && (c.reason.kind === 'error' || c.reason.kind === 'aborted')) {
+        throw new Error(`llm stream finished with ${c.reason.kind}: ${c.reason.failure?.message ?? '(no failure detail)'}`)
+      }
+    }
+    return out
+  }
+
+  /** 注册表回退：openai-completions 兼容单轮补全（Node 原生 fetch，零依赖）。 */
+  private async completeViaFetch(prompt: string): Promise<string> {
+    const key = process.env[this.apiKeyEnv]
+    if (!key || key === '') {
+      throw new Error(`env ${this.apiKeyEnv} is not set; cannot call llm via ${this.baseUrl}/chat/completions`)
+    }
+    const res = await this.fetchFn(`${this.baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${key}`,
+      },
+      body: JSON.stringify({
+        model: this.model,
+        temperature: 0.2,
+        messages: [{ role: 'user', content: prompt }],
+      }),
+    })
+    if (!res.ok) {
+      // 只记状态码，不回显响应体（防网关把凭证相关细节回进日志）
+      throw new Error(`llm http ${res.status} from ${this.baseUrl}/chat/completions`)
+    }
+    const data = (await res.json()) as { choices?: Array<{ message?: { content?: unknown } }> }
+    const content = data?.choices?.[0]?.message?.content
+    if (typeof content !== 'string') throw new Error('llm response missing choices[0].message.content string')
+    return content
   }
 }
 

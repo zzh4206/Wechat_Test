@@ -162,8 +162,17 @@ test('定时器：经 start() 启动、stop() 清理（dispose 经 ctx.effect �
 })
 
 test('DefaultLlmClient：宿主无补全 API 时抛明确错误', async () => {
-  const client = new DefaultLlmClient({ listProviders: () => [] })
-  await assert.rejects(() => client.complete('x'), /no direct completion API/)
+  // 注册表形态走 openai 兼容回退：无环境变量时抛「变量名明确」的错误（不静默、不含 key）
+  const client = new DefaultLlmClient({ listProviders: () => [] }, { fetch: async () => { throw new Error('must not fetch') } })
+  const prev = process.env.ZAI_API_KEY
+  delete process.env.ZAI_API_KEY
+  try {
+    await assert.rejects(() => client.complete('x'), /ZAI_API_KEY is not set/)
+  } finally {
+    if (prev !== undefined) process.env.ZAI_API_KEY = prev
+  }
+  // 彻底无宿主 → 抛错并列方法清单
+  await assert.rejects(() => new DefaultLlmClient(undefined).complete('x'), /no usable completion API/)
   const ok = new DefaultLlmClient({ complete: async (p) => `echo:${p}` })
   assert.equal(await ok.complete('x'), 'echo:x')
 })

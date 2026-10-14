@@ -38,6 +38,16 @@ export function redactHexRuns(s: string): string {
 }
 
 /**
+ * 密钥形态脱敏（加强版）：redactHexRuns 之外，再把 ≥32 位连续
+ * [A-Za-z0-9_-] 串（sk-… / zk-… 等 API key 的典型形态，含分隔符内段）整体
+ * 替换为 `[redacted-token:N]`。用于把 LLM/HTTP 异常文本写进报告或 logger 前
+ * 兜底，保证 API key 绝不落日志/落盘。纯函数、无副作用。
+ */
+export function redactSecretLike(s: string): string {
+  return redactHexRuns(s.replace(/[A-Za-z0-9_-]{32,}/g, (m) => `[redacted-token:${m.length}]`))
+}
+
+/**
  * 断言 target（任意形态路径）解析后位于 base 目录内部，否则抛错。
  * - 两边都先 path.resolve 成绝对路径，杜绝 `..` 与绝对路径逃逸；
  * - 要求 target 位于 base 下（允许 target === base 本身，如 ensureDir('.')）。

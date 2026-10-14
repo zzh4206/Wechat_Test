@@ -400,6 +400,8 @@ export interface ReportMetaRow {
   topicCount: number
   messageCount: number
   generatedAt: number
+  /** degraded 真实原因（可见化：LLM 调用异常 vs 断言两次失败）；ok/empty 为空串 */
+  note?: string
 }
 
 /** tasks 表单行（M4-T4.1 追加：任务识别写入/查询） */
@@ -949,13 +951,19 @@ export class GroupStore {
           judgment_count INTEGER NOT NULL DEFAULT 0,
           topic_count   INTEGER NOT NULL DEFAULT 0,
           message_count INTEGER NOT NULL DEFAULT 0,
-          generated_at  INTEGER NOT NULL
+          generated_at  INTEGER NOT NULL,
+          note          TEXT NOT NULL DEFAULT ''
         );
-      `)
+        `)
+      // 旧库迁移：report_meta 已存在时补 note 列（幂等）
+      const cols = db.prepare(`PRAGMA table_info(report_meta)`).all() as Array<{ name: string }>
+      if (!cols.some((c) => c.name === 'note')) {
+        db.exec(`ALTER TABLE report_meta ADD COLUMN note TEXT NOT NULL DEFAULT ''`)
+      }
       db.prepare(`
         INSERT INTO report_meta
-          (kind, date, window_start, window_end, status, path, judgment_count, topic_count, message_count, generated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          (kind, date, window_start, window_end, status, path, judgment_count, topic_count, message_count, generated_at, note)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         row.kind,
         row.date,
@@ -967,6 +975,7 @@ export class GroupStore {
         Math.floor(row.topicCount ?? 0),
         Math.floor(row.messageCount ?? 0),
         Math.floor(row.generatedAt),
+        String(row.note ?? ''),
       )
       return true
     })
@@ -998,6 +1007,7 @@ export class GroupStore {
         topicCount: Number(r.topic_count),
         messageCount: Number(r.message_count),
         generatedAt: Number(r.generated_at),
+        note: r.note === undefined || r.note === null ? '' : String(r.note),
       }))
     } catch (error) {
       this.logger.error(`group-store[${this.chatId}] getReportMetas failed: ${String(error)}`)

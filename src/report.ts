@@ -26,7 +26,7 @@
  */
 import type { Store } from './store.js'
 import type { StoreLogger } from './store.js'
-import { assertInsideState } from './guard.js'
+import { assertInsideState, redactSecretLike } from './guard.js'
 import type { GroupStoreService, StoredMessage, ReportMetaRow } from './group-store.js'
 import type { LlmClient } from './distiller.js'
 import { localDayKey } from './person-digest.js'
@@ -183,6 +183,11 @@ export interface RenderInput {
   window: ReportWindow
   draft: ReportDraft | null
   status: 'ok' | 'degraded' | 'empty'
+  /**
+   * degraded 真实原因（第一步①可见化）：'LLM 调用异常：…' 或
+   * '断言两次失败：…'。ok/empty 时忽略。缺省沿用旧固定文案。
+   */
+  degradedReason?: string
   messageCount: number
   /** L3 引用（已映射 msg_id，text 已截断） */
   quotes: Array<{ msgId: string; ts: number; senderName: string; text: string }>
@@ -209,7 +214,7 @@ export function renderReport(input: RenderInput): string {
   const lines: string[] = []
   lines.push(`# ${kindName} · ${chatId} · ${win.dateKey}`, '')
   if (status === 'degraded') {
-    lines.push('> ⚠️ degraded：LLM 输出两次均未通过金字塔断言，本期降级输出骨架（不缺报告）。', '')
+    lines.push(`> ⚠️ degraded：${input.degradedReason ?? 'LLM 输出两次均未通过金字塔断言'}，本期降级输出骨架（不缺报告）。`, '')
   }
   if (status === 'empty') {
     lines.push('本期窗口内无消息，无内容可归纳。', '')
@@ -410,23 +415,31 @@ export class ReportService {
     if (messageCount === 0) {
       const md = renderReport({ kind, chatId, window: win, draft: null, status: 'empty', messageCount: 0, quotes: [], persons: [], actions: this.collectActions(chatId, win), board: this.collectBoard(chatId, win), fileLines: this.collectFileLines(chatId, win) })
       this.options.store.writeText(rel, md)
-      await this.recordMeta(chatId, kind, win, 'empty', rel, 0, 0, 0)
+      await this.recordMeta(chatId, kind, win, 'empty', rel, 0, 0, 0, '')
       return { status: 'empty', path: rel, judgmentCount: 0, topicCount: 0, messageCount: 0 }
     }
     const persons = this.collectPersons(chatId, win.dateKey)
 
     let draft: ReportDraft | null = null
+    // 第一步①：真实失败原因可见化——LLM 调用异常 vs 断言两次失败，必须可区分
+    let llmError: string | null = null
+    let assertionFails = 0
     for (let attempt = 0; attempt < 2 && draft === null; attempt++) {
       try {
         const raw = await this.options.llm.complete(this.buildPrompt(chatId, kind, win, messages, persons)) // eslint-disable-line
         draft = parseReportDraft(raw, messages.length)
+        if (draft === null) assertionFails++
       } catch (error) {
-        this.options.logger.warn(`report[${chatId}/${kind}/${win.dateKey}] llm failed: ${String(error).slice(0, 160)}`)
+        llmError = redactSecretLike(String(error).slice(0, 160))
+        this.options.logger.warn(`report[${chatId}/${kind}/${win.dateKey}] llm failed: ${llmError}`)
       }
       if (draft === null && attempt === 0) {
-        this.options.logger.warn(`report[${chatId}/${kind}/${win.dateKey}]: 金字塔断言未通过，重试一次`)
+        this.options.logger.warn(`report[${chatId}/${kind}/${win.dateKey}]: ${llmError !== null ? 'LLM 调用异常，重试一次' : '金字塔断言未通过，重试一次'}`)
       }
     }
+    const degradedReason = llmError !== null
+      ? `LLM 调用异常：${llmError}`
+      : `断言两次失败：金字塔输出断言未通过（judgments 须 3–5 条且每条带 evidence；解析/越界均计失败，共 ${assertionFails} 次解析失败）`
 
     let status: 'ok' | 'degraded' = draft !== null ? 'ok' : 'degraded'
     // 序号 → msg_id 映射（映射不到的丢弃；映射后关键判断断言不满足 → 整体降级）
@@ -442,12 +455,12 @@ export class ReportService {
     }
 
     const quotes = this.pickQuotes(draft, messages)
-    const md = renderReport({ kind, chatId, window: win, draft, status, messageCount, quotes, persons, actions: this.collectActions(chatId, win), board: this.collectBoard(chatId, win), fileLines: this.collectFileLines(chatId, win) })
+    const md = renderReport({ kind, chatId, window: win, draft, status, messageCount, degradedReason, quotes, persons, actions: this.collectActions(chatId, win), board: this.collectBoard(chatId, win), fileLines: this.collectFileLines(chatId, win) })
     const written = this.options.store.writeText(rel, md)
     const path = written ? rel : null
     const judgmentCount = draft?.judgments.length ?? 0
     const topicCount = draft?.topics.length ?? 0
-    await this.recordMeta(chatId, kind, win, status, rel, judgmentCount, topicCount, messageCount)
+    await this.recordMeta(chatId, kind, win, status, rel, judgmentCount, topicCount, messageCount, status === 'degraded' ? degradedReason : '')
     return { status, path, judgmentCount, topicCount, messageCount }
   }
 
@@ -530,6 +543,7 @@ export class ReportService {
     judgmentCount: number,
     topicCount: number,
     messageCount: number,
+    note: string,
   ): Promise<void> {
     const row: ReportMetaRow = {
       kind,
@@ -542,6 +556,7 @@ export class ReportService {
       topicCount,
       messageCount,
       generatedAt: this.now(),
+      note,
     }
     const ok = await this.options.groupStore.appendReportMeta(chatId, row)
     if (!ok) this.options.logger.warn(`report[${chatId}]: appendReportMeta failed for ${win.dateKey}`)
