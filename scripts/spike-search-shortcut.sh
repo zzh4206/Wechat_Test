@@ -17,7 +17,7 @@ run_probe() {
   osascript -e "$script"
   sleep 1
   echo -n "FOCUSED: "
-  osascript -e 'tell application "System Events" to tell process "WeChat" to get description of front window's focused UI element' 2>/dev/null \
+  osascript -e 'tell application "System Events" to tell process "WeChat" to get value of attribute "AXFocusedUIElement" of front window' 2>/dev/null \
     || osascript -e 'tell application "System Events" to tell process "WeChat" to get role description of focused UI element of front window' 2>/dev/null \
     || echo "(取焦点元素失败——TCC 未授权或窗口结构异常)"
   # 清理：按 Esc 退出搜索框，避免残留状态影响下一段探测
