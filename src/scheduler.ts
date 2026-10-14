@@ -227,7 +227,15 @@ export class Scheduler {
 
   // —————————————————— 内部 ——————————————————
 
-  /** 从持久化状态恢复；超窗 occurrence 直接放弃（不补做陈旧触达） */
+  /**
+   * 从持久化状态恢复（config 优先原则）：
+   * - 持久化 base 仅用于「今天是否已触发过」的防重复判断 + 窗口内补跑，
+   *   不得覆盖 Config 时点的排定——运行期改了 dailyReportTime 等配置后重启，
+   *   新时点当日即生效，而不是无视新配置顺延到明天。
+   * - 排定：Config 时点的「今天时刻」未过 → 今天排定（config 优先）；
+   *   已过才回退持久化 base / nextOccurrence 顺延明天。
+   * 超窗 occurrence 直接放弃（不补做陈旧触达）。
+   */
   private restore(): void {
     const t = this.now()
     let persisted: PersistedState = {}
@@ -240,22 +248,32 @@ export class Scheduler {
       }
     }
     for (const kind of TICK_KINDS) {
+      const spec = this.timeSpecs[kind]
+      const { h, m } = parseTimeOfDay(spec)
+      const today = new Date(t)
+      const todayAt = atTime(today, h, m).getTime() // Config 时点的「今天时刻」
+      // 今天是否为该 kind 的合法日（weekly 仅周日、monthly 仅 1 日）
+      const todayValid = kind === 'daily' || (kind === 'weekly' ? today.getDay() === 0 : today.getDate() === 1)
       const saved = persisted[kind]
-      if (saved && typeof saved.base === 'number') {
-        const deadline = saved.base + this.totalStagger()
+      const persistedPast = saved !== undefined && typeof saved.base === 'number' && saved.base <= t
+      if (persistedPast) {
+        const base = saved!.base
+        const deadline = base + this.totalStagger()
         if (t - deadline <= this.catchupMs) {
           // 窗口内：恢复 occurrence，剩余群补跑（catchup=true）
-          this.states.set(kind, { base: saved.base, fired: new Set(saved.fired ?? []), missed: true })
-          this.options.logger.info(`scheduler[${kind}]: restored occurrence base=${saved.base} (catchup window)`)
-        } else {
-          this.options.logger.warn(`scheduler[${kind}]: missed occurrence base=${saved.base} beyond catchup window, abandoned`)
-          this.states.set(kind, { base: nextOccurrence(kind, saved.base, this.timeSpecs[kind]), fired: new Set(), missed: false })
+          this.states.set(kind, { base, fired: new Set(saved!.fired ?? []), missed: true })
+          this.options.logger.info(`scheduler[${kind}]: restored occurrence base=${base} (catchup window)`)
+          continue
         }
-      } else {
-        // 首次运行：只安排未来时点，绝不把历史时点当错过来补。
-        // t-1：nextOccurrence 语义是"严格大于 after"，-1ms 让"启动时刻恰好是时点"也照常触发。
-        this.states.set(kind, { base: nextOccurrence(kind, t - 1, this.timeSpecs[kind]), fired: new Set(), missed: false })
+        this.options.logger.warn(`scheduler[${kind}]: missed occurrence base=${base} beyond catchup window, abandoned`)
       }
+      // 排定下一次（config 优先）：今天时点未过 → 今天；已过 → 顺延未来。
+      // 持久化 base 在此只兜底防重（max(saved.base, t-1) 保证跳过今天已触发过的时点）。
+      const after = persistedPast ? Math.max(saved!.base, t - 1) : t - 1
+      const base = todayValid && t < todayAt ? todayAt : nextOccurrence(kind, after, spec)
+      // t-1：nextOccurrence 语义是"严格大于 after"，-1ms 让"启动时刻恰好是时点"也照常触发。
+      this.states.set(kind, { base, fired: new Set(), missed: false })
+      this.options.logger.info?.(`scheduler[${kind}]: scheduled base=${base} from config time ${spec}`)
     }
   }
 

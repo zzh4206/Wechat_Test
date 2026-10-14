@@ -231,6 +231,106 @@ test('onTick 回调抛错不拖垮调度循环', () => {
   }
 })
 
+// ——— config 时点优先于持久化 base（配置变更当日生效）———
+
+test('config 优先：config 时点未过 → 今天触发（旧 base 不影响）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sched-config-'))
+  try {
+    const store = new Store(realpathSync(dir), silentLogger)
+    // 旧配置 20:30 已于昨天触发完毕（base=昨天 20:30），重启于今天 10:00
+    store.ensureDir('scheduler')
+    store.writeText('scheduler/state.json', JSON.stringify({
+      daily: { base: at(2026, 3, 9, 20, 30), fired: ['a@chatroom', 'b@chatroom', 'c@chatroom'] },
+    }))
+    // 运行期把 dailyReportTime 改成 11:00，今天 10:00 重启 → 新时点今天生效
+    const clock = makeClock(at(2026, 3, 10, 10, 0))
+    const { ticks, onTick } = collect()
+    const s = new Scheduler({
+      groups, logger: silentLogger, store, onTick,
+      dailyTime: '11:00', now: clock.now, tickMs: 60_000,
+    })
+    const stop = s.start()
+    try {
+      assert.equal(s.status().daily, at(2026, 3, 10, 11, 0), '今天的新 config 时点被排定')
+      clock.stepMin(60) // 11:00
+      s.tick()
+      clock.stepMin(10) // 11:10：错峰走完
+      s.tick()
+      assert.deepEqual(ticks.map(t => t.chatId), groups)
+      assert.equal(ticks[0].scheduledAt, at(2026, 3, 10, 11, 0))
+      assert.equal(ticks[0].catchup, false)
+    } finally {
+      stop()
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('config 优先：config 时点已过 → 回退顺延明天（持久化 base 只防重）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sched-config-'))
+  try {
+    const store = new Store(realpathSync(dir), silentLogger)
+    // 旧配置 09:00，昨天已触发；新配置 08:30 今天已过 → 顺延明天 08:30（新 config 时点）
+    store.ensureDir('scheduler')
+    store.writeText('scheduler/state.json', JSON.stringify({
+      daily: { base: at(2026, 3, 9, 9, 0), fired: ['a@chatroom'] },
+    }))
+    const clock = makeClock(at(2026, 3, 10, 10, 0))
+    const { ticks, onTick } = collect()
+    const s = new Scheduler({
+      groups: ['a@chatroom'], logger: silentLogger, store, onTick,
+      dailyTime: '08:30', now: clock.now, tickMs: 60_000,
+    })
+    const stop = s.start()
+    try {
+      assert.equal(s.status().daily, at(2026, 3, 11, 8, 30), '明天的新 config 时点')
+      s.tick()
+      assert.equal(ticks.length, 0, '今天不重复触发')
+      clock.set(at(2026, 3, 11, 8, 30))
+      s.tick()
+      assert.equal(ticks[0].scheduledAt, at(2026, 3, 11, 8, 30))
+    } finally {
+      stop()
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('config 优先：今天已触发 + config 时点已过 → 不重复触发', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sched-config-'))
+  try {
+    const store = new Store(realpathSync(dir), silentLogger)
+    // 今天 09:00（旧配置）已触发完毕，finish 已把 base 推到明天 09:00；重启于今天 22:00
+    store.ensureDir('scheduler')
+    store.writeText('scheduler/state.json', JSON.stringify({
+      daily: { base: at(2026, 3, 11, 9, 0), fired: [] },
+    }))
+    // 新配置 20:30 今天已过：不得因新时点 > 已触发的 09:00 就今天再发一次
+    const clock = makeClock(at(2026, 3, 10, 22, 0))
+    const { ticks, onTick } = collect()
+    const s = new Scheduler({
+      groups: ['a@chatroom'], logger: silentLogger, store, onTick,
+      dailyTime: '20:30', now: clock.now, tickMs: 60_000,
+    })
+    const stop = s.start()
+    try {
+      assert.equal(s.status().daily, at(2026, 3, 11, 20, 30), '明天的新 config 时点（持久化 base 防住今天的重发）')
+      clock.stepMin(120)
+      s.tick()
+      assert.equal(ticks.length, 0, '今天不重复')
+      clock.set(at(2026, 3, 11, 20, 30))
+      s.tick()
+      assert.deepEqual(ticks.map(t => t.chatId), ['a@chatroom'])
+    } finally {
+      stop()
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 // ——— 快速测试模式（scheduleTestMode） ———
 
 test('testMode：每 interval 依次强制触发 weekly/monthly，kind 照常传递', () => {
