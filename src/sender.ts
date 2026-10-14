@@ -20,6 +20,9 @@
  *   ② 通道闸：仅 ALLOWED_CHANNELS；
  *   ③ 交互闸：微信前台（osascript）+ 系统空闲秒数（ioreg IOHIDSystem），空闲 <10s 视为用户
  *      正在操作 → 跳过本轮防按键串扰；连续 N 次非前台 warn；
+ *      allowTakeFocus=true（抢前台模式，默认 false）：跳过前台检查（键序第 1 步 activate 本就
+ *      会激活微信），但**保留用户空闲检测**（空闲 <10s 仍跳过并计数——允许抢前台，绝不抢
+ *      正在打字的手）；抢前台模式发送成功审计记 result='take_focus_sent'，与普通模式可区分。
  * - 失败重试 ≤3 次（attempts 落盘 outbox 行），超限 status='failed' 不再重试（防风暴）；
  *   wechat-ui 模式 --id 用 outbox 唯一 id（工具侧幂等）；
  * - 频控：maxSendsPerDay（默认 20）超限的当日 pending 标 'skipped_quota'；
@@ -136,6 +139,8 @@ export interface SenderOptions {
   sourcePython?: string
   /** Config.sendIntervalSec（默认 300） */
   intervalSec?: number
+  /** Config.allowTakeFocus：抢前台模式（默认 false = 微信非前台跳过本轮）。true = 跳过前台闸（仍保留用户空闲检测） */
+  allowTakeFocus?: boolean
   /** 交互闸连续非前台 N 次后 warn（默认 3） */
   frontmostWarnAfter?: number
   /** 系统空闲秒数注入（默认 Infinity = 闸不生效；生产由 index.ts 注入 defaultSystemIdleSec） */
@@ -214,17 +219,21 @@ export class KeyboardSender implements SendPrimitive {
   private readonly runCommandFn: (file: string, args: string[]) => Promise<CommandResult>
   private readonly sleep: (ms: number) => Promise<void>
   private readonly isFrontmostFn: () => Promise<boolean>
+  private readonly allowTakeFocus: boolean
   private readonly warn?: (message: string) => void
 
   constructor(options: {
     runCommand: (file: string, args: string[]) => Promise<CommandResult>
     sleepMs: (ms: number) => Promise<void>
     isFrontmost: () => Promise<boolean>
+    /** 抢前台模式：activate 后不做前台中止检查（微信不在前台也继续键序） */
+    allowTakeFocus?: boolean
     warn?: (message: string) => void
   }) {
     this.runCommandFn = options.runCommand
     this.sleep = options.sleepMs
     this.isFrontmostFn = options.isFrontmost
+    this.allowTakeFocus = options.allowTakeFocus ?? false
     this.warn = options.warn
   }
 
@@ -247,11 +256,13 @@ export class KeyboardSender implements SendPrimitive {
   }
 
   async transmit(input: PrimitiveSendInput): Promise<PrimitiveSendResult> {
-    // 1. 激活微信 + 确认前台
+    // 1. 激活微信 + 确认前台（抢前台模式跳过确认——activate 本就是抢前台动作）
     await this.run(OSC_ACTIVATE)
-    let front = false
-    try { front = await this.isFrontmostFn() } catch { front = false }
-    if (!front) return { ok: false, stage: 'error', detail: 'WeChat activate 后仍非前台——放弃键序（防按键落到别的应用）' }
+    if (!this.allowTakeFocus) {
+      let front = false
+      try { front = await this.isFrontmostFn() } catch { front = false }
+      if (!front) return { ok: false, stage: 'error', detail: 'WeChat activate 后仍非前台——放弃键序（防按键落到别的应用）' }
+    }
     // 2. 保存剪贴板（发送后恢复——礼貌且防用户数据丢失）
     const saved = await this.saveClipboard()
     // 3. 剪贴板设为"文件传输助手"
@@ -322,6 +333,7 @@ export class SenderService {
   private readonly enabled: boolean
   private readonly dryRun: boolean
   private readonly method: SendMethod
+  private readonly allowTakeFocus: boolean
   private readonly maxSendsPerDay: number
   private readonly frontmostWarnAfter: number
   private readonly intervalSec: number
@@ -344,6 +356,7 @@ export class SenderService {
     this.enabled = options.enabled ?? false
     this.dryRun = options.dryRun ?? true
     this.method = options.sendMethod === 'wechat-ui' ? 'wechat-ui' : 'keyboard'
+    this.allowTakeFocus = options.allowTakeFocus ?? false
     this.maxSendsPerDay = Math.max(0, Math.floor(options.maxSendsPerDay ?? 20))
     this.frontmostWarnAfter = Math.max(1, Math.floor(options.frontmostWarnAfter ?? 3))
     this.intervalSec = Math.max(1, Math.floor(options.intervalSec ?? 300))
@@ -359,7 +372,7 @@ export class SenderService {
     this.sourcePython = options.sourcePython ?? 'python3'
     this.primitive = this.method === 'wechat-ui'
       ? new WechatUiSender({ wechatUiPath: options.wechatUiPath ?? 'wechat-ui', composerTop: options.composerTop ?? 0.7, runCommand: this.runCommandFn })
-      : new KeyboardSender({ runCommand: this.runCommandFn, sleepMs: this.sleep, isFrontmost: this.isFrontmostFn, warn: (m) => this.options.logger.warn(m) })
+      : new KeyboardSender({ runCommand: this.runCommandFn, sleepMs: this.sleep, isFrontmost: this.isFrontmostFn, allowTakeFocus: this.allowTakeFocus, warn: (m) => this.options.logger.warn(m) })
   }
 
   /** 本地自然日 key（与 person-digest.localDayKey 同口径，避免跨模块依赖自实现） */
@@ -388,7 +401,7 @@ export class SenderService {
    * 发送单条 outbox 条目（与消费循环完全同一路径：dry_run / 状态机 / 审计 / 验证）。
    * 闸门（总闸/通道闸/交互闸/频控）由调用方先过；这里只负责"怎么发 + 怎么验"。
    */
-  private async sendEntry(entry: OutboxEntry): Promise<{ action: string }> {
+  private async sendEntry(entry: OutboxEntry, tookFocus = false): Promise<{ action: string }> {
     const id = entry.id ?? ''
     if (id === '') {
       this.options.logger.error('sender: entry without id — skipped (cannot send idempotently)')
@@ -443,8 +456,9 @@ export class SenderService {
     }
     if (ok) {
       this.options.outbox.updateSendState(id, { status: 'sent', attempts })
-      this.audit({ id, kind: entry.kind, result: 'sent', attempts, method: this.method })
-      this.options.logger.info(`sender: sent id=${id} kind=${entry.kind} (method=${this.method}, db_verified, content not logged)`)
+      // 抢前台模式放行的发送单独记 result，审计可区分两种模式
+      this.audit({ id, kind: entry.kind, result: tookFocus ? 'take_focus_sent' : 'sent', attempts, method: this.method })
+      this.options.logger.info(`sender: sent id=${id} kind=${entry.kind}${tookFocus ? ' (take_focus)' : ''} (method=${this.method}, db_verified, content not logged)`)
       return { action: 'sent' }
     }
     const status: OutboxEntry['status'] = attempts >= MAX_ATTEMPTS ? 'failed' : 'pending'
@@ -490,16 +504,33 @@ export class SenderService {
     }
     // ③ 交互闸：微信前台 + 用户空闲（防按键串扰）
     const gate = await this.interactionGate('test sample')
-    if (gate !== null) return { action: gate, id }
-    const r = await this.sendEntry(this.options.outbox.listOutbox().find((e) => e.id === id) ?? appended)
+    if (gate.blocked !== null) return { action: gate.blocked, id }
+    const r = await this.sendEntry(this.options.outbox.listOutbox().find((e) => e.id === id) ?? appended, gate.tookFocus)
     return { action: r.action, id }
   }
 
   /**
-   * ③ 交互闸（共用）：微信必须前台 + 系统空闲 ≥ IDLE_SKIP_BELOW_SEC。
-   * 不通过返回动作名（'not_frontmost' | 'user_active'）；通过返回 null。
+   * ③ 交互闸（共用）：
+   * - 默认模式：微信必须前台 + 系统空闲 ≥ IDLE_SKIP_BELOW_SEC；
+   * - 抢前台模式（allowTakeFocus=true）：跳过前台检查（键序第 1 步 activate 抢前台），
+   *   但保留用户空闲检测（<10s 仍跳过并计数——绝不抢正在打字的手）。
+   * 返回 { blocked, tookFocus }：blocked 为动作名（'not_frontmost' | 'user_active'）或 null；
+   * tookFocus=true 表示本轮是抢前台放行（审计据此区分）。
    */
-  private async interactionGate(what: string): Promise<'not_frontmost' | 'user_active' | null> {
+  private async interactionGate(what: string): Promise<{ blocked: 'not_frontmost' | 'user_active' | null; tookFocus: boolean }> {
+    // 抢前台模式：跳过前台检查，直接看用户空闲
+    if (this.allowTakeFocus) {
+      if (await this.userBusy()) {
+        this.consecutiveNotFront += 1
+        if (this.consecutiveNotFront >= this.frontmostWarnAfter) {
+          this.options.logger.warn(`sender: 用户持续操作中（系统空闲 <${IDLE_SKIP_BELOW_SEC}s）连续 ${this.consecutiveNotFront} 轮 — 抢前台模式也让路，绝不打断打字（${what} 暂缓）`)
+        }
+        this.audit({ result: 'user_active', takeFocus: true, streak: this.consecutiveNotFront })
+        return { blocked: 'user_active', tookFocus: false }
+      }
+      this.consecutiveNotFront = 0
+      return { blocked: null, tookFocus: true }
+    }
     let frontmost = true
     try {
       frontmost = await this.isFrontmostFn()
@@ -512,15 +543,16 @@ export class SenderService {
         this.options.logger.warn(`sender: WeChat not frontmost ${this.consecutiveNotFront} rounds — 键盘模拟要求微信可被激活为前台（${what} 暂缓）`)
       }
       this.audit({ result: 'not_frontmost', streak: this.consecutiveNotFront })
-      return 'not_frontmost'
+      return { blocked: 'not_frontmost', tookFocus: false }
     }
     if (await this.userBusy()) {
+      this.consecutiveNotFront += 1
       this.audit({ result: 'user_active' })
       this.options.logger.info(`sender: 用户正在操作（系统空闲 <${IDLE_SKIP_BELOW_SEC}s）— 跳过本轮防按键串扰（${what}）`)
-      return 'user_active'
+      return { blocked: 'user_active', tookFocus: false }
     }
     this.consecutiveNotFront = 0
-    return null
+    return { blocked: null, tookFocus: false }
   }
 
   /**
@@ -564,12 +596,12 @@ export class SenderService {
 
     // ③ 交互闸：微信前台 + 用户空闲
     const gate = await this.interactionGate(`${batch.length} 条`)
-    if (gate !== null) return { action: gate, processed: 0 }
+    if (gate.blocked !== null) return { action: gate.blocked, processed: 0 }
 
     let sent = 0
     let failed = 0
     for (const entry of batch) {
-      const r = await this.sendEntry(entry)
+      const r = await this.sendEntry(entry, gate.tookFocus)
       if (r.action === 'sent' || r.action === 'dry_run') sent += 1
       else failed += 1
     }
@@ -615,6 +647,7 @@ export interface SenderConfigInput {
   composerTop: number
   sourceToolDir: string
   sourcePython: string
+  allowTakeFocus: boolean
 }
 
 export function senderOptionsFromConfig(options: {
@@ -638,6 +671,7 @@ export function senderOptionsFromConfig(options: {
     composerTop: options.config.composerTop,
     sourceToolDir: options.config.sourceToolDir,
     sourcePython: options.config.sourcePython,
+    allowTakeFocus: options.config.allowTakeFocus,
     systemIdleSec: defaultSystemIdleSec,
     setInterval: options.setInterval,
     clearInterval: options.clearInterval,

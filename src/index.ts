@@ -146,6 +146,8 @@ export interface PluginConfig {
   sendMethod: string
   /** 发送 worker 扫描间隔（秒，默认 300） */
   sendIntervalSec: number
+  /** 抢前台模式（默认 false = 微信非前台跳过本轮）。true = 自动激活微信前台发送，仍让路给正在打字的用户（空闲 <10s 跳过） */
+  allowTakeFocus: boolean
   /** 每日发送上限（默认 20） */
   maxSendsPerDay: number
   /** wechat-ui 可执行文件（默认 'wechat-ui'；仅 sendMethod='wechat-ui' 用） */
@@ -215,6 +217,7 @@ export const Config: Schema<PluginConfig> = Schema.object({
   sendDryRun: Schema.boolean().default(true).description('发送 dry_run（默认 true = keyboard 模式执行搜索键序到第 8 步定位会话即停，不粘贴消息不回车；人工确认定位正确后再关掉真发）'),
   sendMethod: Schema.string().default('keyboard').description("发送原语（默认 'keyboard' = wx-chatbot 式键盘模拟 + DB 回读验证，TCC 只需辅助功能；'wechat-ui' 可切回旧 UI 校准实现）"),
   sendIntervalSec: Schema.number().default(300).description('发送 worker 消费 outbox 的扫描间隔（秒）'),
+  allowTakeFocus: Schema.boolean().default(false).description('抢前台模式（默认 false = 微信非前台跳过本轮，人在电脑前模式）。true = 全自动无人值守：自动激活微信前台发送，但系统空闲 <10s（用户正在打字/操作）仍让路跳过'),
   maxSendsPerDay: Schema.number().default(20).description('每日发送上限（默认 20；超限的当日 pending 标 skipped_quota 防风暴）'),
   wechatUiPath: Schema.string().default('wechat-ui').description('wechat-ui 可执行文件（PATH 解析；建议绝对路径，如 /path/to/macos-wechat-export/wechat-ui）'),
   composerTop: Schema.number().default(0.7).description('wechat-ui --composer-top（默认 0.70；务必按 UI_GUIDE 用 read --snapshot 实测校准）'),
@@ -333,6 +336,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
     sourceToolDir: config.sourceToolDir ?? '',
     sourcePython: config.sourcePython,
     systemIdleSec: defaultSystemIdleSec,
+    allowTakeFocus: config.allowTakeFocus,
     intervalSec: config.sendIntervalSec,
   })
   // report 依赖 llmClient（其下才定义），先占位、llmClient 就绪后赋值

@@ -342,6 +342,12 @@ Accessibility Inspector 确认元素层级）。**实证结论回填此处：___
 - **交互闸（强化，两道）**：① 微信前台（osascript，非前台跳过，连续 3 轮 warn）；② **用户操作闸**——
   `ioreg -c IOHIDSystem` 读系统空闲秒数，**空闲 <10s 视为用户正在操作 → 跳过本轮**（审计
   `user_active`），防按键串扰（用户正在打字/操作时绝不抢键盘）；
+- **两种前台模式（`allowTakeFocus`，默认 false）**：
+  - **现模式（false，人在电脑前）**：微信非前台 → 跳过本轮（`not_frontmost`），等你回来看；
+  - **抢前台模式（true，全自动无人值守）**：跳过前台检查（键序第 1 步 activate 本就自动把微信
+    拉到前台），微信不在前台也照发——代价是**发送瞬间会抢走焦点**；但**用户空闲检测原样保留**：
+    空闲 <10s（你正在打字/动鼠标）仍跳过让路并计数——允许抢前台，绝不抢正在打字的手；
+  - 审计可区分：抢前台放行的发送记 `result='take_focus_sent'`，普通模式记 `sent`；
 - **频控**：`maxSendsPerDay`（默认 20）超限的当日 pending 标 `skipped_quota`（样例同样占配额）；
 - **失败重试**：attempts 落盘，≥3 次转 `failed` 不再重试（防风暴）；
 - **状态机**：`pending → sent | dry_run | skipped_quota | skipped_channel | failed`；

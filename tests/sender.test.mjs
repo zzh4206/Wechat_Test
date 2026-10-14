@@ -291,3 +291,66 @@ test('sendTestSample：交互闸/频控同样生效（不开后门）', async ()
   assert.equal(readOutbox(env2.dir).find((x) => x.id === r2.id).status, 'skipped_quota')
   rmSync(env2.dir, { recursive: true, force: true })
 })
+
+// —— allowTakeFocus 抢前台模式（默认 false = 现行为零变化） ——
+
+function makeTakeFocusEnv({ allowTakeFocus, idleSec, frontmost, logger = silentLogger }) {
+  const dir = resolve(mkdtempSync(join(tmpdir(), 'sender-tf-')))
+  const store = new Store(dir, { warn() {}, error() {} })
+  store.ensureDir('.')
+  const outbox = new Outbox({ store })
+  const spawnCalls = []
+  const sender = new SenderService({
+    outbox, store, logger,
+    enabled: true, dryRun: false, sendMethod: 'wechat-ui',
+    allowTakeFocus,
+    runCommand: (file, args) => {
+      spawnCalls.push({ file, args })
+      return Promise.resolve({ code: 0, stdout: 'sent_ui_verified', stderr: '' })
+    },
+    isFrontmost: () => Promise.resolve(frontmost),
+    systemIdleSec: () => Promise.resolve(idleSec),
+  })
+  return { dir, store, outbox, spawnCalls, sender }
+}
+
+test('allowTakeFocus=true：微信非前台也照发（跳过前台闸），审计记 take_focus_sent', async () => {
+  const env = makeTakeFocusEnv({ allowTakeFocus: true, idleSec: 120, frontmost: false })
+  const e = env.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
+  const r = await env.sender.processOnce()
+  assert.equal(r.action, 'sent')
+  assert.equal(env.spawnCalls.length, 1, '非前台照发（抢前台模式）')
+  assert.equal(readOutbox(env.dir).find((x) => x.id === e.id).status, 'sent')
+  const audit = readAudit(env.dir).find((a) => a.id === e.id)
+  assert.equal(audit.result, 'take_focus_sent', '审计可区分两种模式')
+  rmSync(env.dir, { recursive: true, force: true })
+})
+
+test('allowTakeFocus=true：空闲 <10s（用户正在打字）仍跳过并计数——绝不抢正在打字的手', async () => {
+  const logs = recordingLogger()
+  const env = makeTakeFocusEnv({ allowTakeFocus: true, idleSec: 3, frontmost: false, logger: logs })
+  const e = env.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
+  for (let i = 0; i < 3; i++) {
+    const r = await env.sender.processOnce()
+    assert.equal(r.action, 'user_active')
+    assert.equal(env.spawnCalls.length, 0, '用户忙绝不发键')
+  }
+  assert.equal(readOutbox(env.dir).find((x) => x.id === e.id).status, 'pending', '条目保持 pending 下轮再试')
+  assert.ok(logs.logs.warn.some((m) => m.includes('让路')), '连续 3 轮后 warn 提醒')
+  const gates = readAudit(env.dir).filter((a) => a.result === 'user_active')
+  assert.equal(gates.length, 3)
+  assert.ok(gates.every((a) => a.takeFocus === true))
+  rmSync(env.dir, { recursive: true, force: true })
+})
+
+test('allowTakeFocus 默认 false：行为零变化（非前台仍跳过 not_frontmost，审计无 take_focus_sent）', async () => {
+  const env = makeTakeFocusEnv({ allowTakeFocus: undefined, idleSec: 120, frontmost: false })
+  const e = env.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
+  const r = await env.sender.processOnce()
+  assert.equal(r.action, 'not_frontmost')
+  assert.equal(env.spawnCalls.length, 0, '默认模式非前台绝不发送')
+  assert.equal(readOutbox(env.dir).find((x) => x.id === e.id).status, 'pending')
+  assert.ok(readAudit(env.dir).some((a) => a.result === 'not_frontmost'))
+  assert.ok(!readAudit(env.dir).some((a) => String(a.result).startsWith('take_focus')))
+  rmSync(env.dir, { recursive: true, force: true })
+})
