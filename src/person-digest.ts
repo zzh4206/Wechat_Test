@@ -71,6 +71,11 @@ export interface PersonDigestOptions {
   enabled: boolean
   /** 发言前后各取多少条他人消息作兜底上下文（默认 2） */
   contextPad?: number
+  /**
+   * M6-T4：活跃度突变倍数（Config.activitySpikeMultiplier，默认 3 = 现行为：
+   * 今日 > 近 7 日均值 × N 即标记异常）。
+   */
+  activitySpikeMultiplier?: number
   now?: () => number
 }
 
@@ -102,11 +107,15 @@ export function resolveSenderKeys(
 export class PersonDigestService {
   private readonly now: () => number
   private readonly pad: number
+  /** M6-T4：活跃度突变倍数（可配置） */
+  private readonly spikeMultiplier: number
   private readonly inFlight = new Map<string, Promise<GenerateDailyResult>>()
 
   constructor(private readonly options: PersonDigestOptions) {
     this.now = options.now ?? (() => Date.now())
     this.pad = Math.max(0, Math.floor(options.contextPad ?? 2))
+    // M6-T4：突变倍数配置化（默认 3 = 现行为）
+    this.spikeMultiplier = Math.max(1, options.activitySpikeMultiplier ?? 3)
   }
 
   /**
@@ -154,7 +163,7 @@ export class PersonDigestService {
       return { status: 'empty', path: rel, topics: 0 }
     }
 
-    const anomaly = weekAvg > 0 && count > weekAvg * 3
+    const anomaly = weekAvg > 0 && count > weekAvg * this.spikeMultiplier
     const { prompt, wire, ctx } = this.buildPrompt(pid, day, displayName, dayMsgs, personMsgs, keys)
 
     let digest: PersonDigest | null = null
@@ -193,7 +202,7 @@ export class PersonDigestService {
       }
     }
 
-    const path = this.options.store.writeText(rel, renderMarkdown(day, displayName || pid, day, digest, digest.status, count, anomaly, weekAvg))
+    const path = this.options.store.writeText(rel, renderMarkdown(day, displayName || pid, day, digest, digest.status, count, anomaly, weekAvg, this.spikeMultiplier))
       ? rel
       : null
     // M3 定夺点②：同日重跑 = 覆盖——旧行标记 superseded（不物理删除），随后新行生效
@@ -433,6 +442,8 @@ export function renderMarkdown(
   messageCount: number,
   activityAnomaly: boolean,
   weekAvg: number,
+  /** M6-T4：突变倍数（速览文案展示用；缺省 3 = 现行为） */
+  spikeMultiplier = 3,
 ): string {
   void _day
   const topics = Array.isArray(digest) ? digest : digest.topics
@@ -444,7 +455,7 @@ export function renderMarkdown(
     `- 当日消息数：${messageCount}（近 7 日均值 ${weekAvg}）`,
   ]
   if (activityAnomaly) {
-    lines.push(`> 📈 活跃度异常：今日 ${messageCount} 条 > 近 7 日均值 ${weekAvg} × 3`)
+    lines.push(`> 📈 活跃度异常：今日 ${messageCount} 条 > 近 7 日均值 ${weekAvg} × ${spikeMultiplier}`)
   }
   lines.push('')
   if (status === 'degraded') {

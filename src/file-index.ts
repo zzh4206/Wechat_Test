@@ -164,10 +164,16 @@ export interface FileIndexOptions {
   /** 水位持久化；缺省 = 纯内存水位（测试用） */
   store?: Store
   /**
-   * wx_path 定位注入点（现有 CLI 能力接线；本模块不做路径解析/不复制本体）。
+   * wx_path 定位注入点（M6-T2 接线：接线层传 wechat_db.py files 子命令的缓存查询）。
    * 返回 null/缺省 → 记"待下载"占位（离线期媒体未下载的已知场景）。
+   * M6：签名补 chatId（files 子命令按会话查询，单看 msgId 无法定界）。
    */
-  locatePath?: (msg: StoredMessage) => string | null
+  locatePath?: (chatId: string, msg: StoredMessage) => string | null
+  /**
+   * M6-T2：扫描前刷新该群文件路径缓存（接线层异步调工具 files 子命令后填缓存，
+   * locatePath 只做同步读）。失败/缺省不阻塞扫描（保持"待下载"占位）。
+   */
+  refreshPaths?: (chatId: string) => Promise<void>
   /** 大小注入点（消息行不携带文件大小；接线层可从源库补，缺省 0） */
   getSize?: (msg: StoredMessage) => number | null
   now?: () => number
@@ -211,6 +217,14 @@ export class FileIndexService {
 
   private async run(chatId: string, untilTs: number): Promise<FileScanResult> {
     const empty = { ran: false, newFiles: 0, appearancesMerged: 0, summariesWritten: 0, degraded: false }
+    // M6-T2：扫描前刷新 wx_path 缓存（接线层调工具 files 子命令；失败不阻塞扫描）
+    if (this.options.refreshPaths) {
+      try {
+        await this.options.refreshPaths(chatId)
+      } catch (error) {
+        this.options.logger.warn(`file-index refreshPaths(${chatId}) failed: ${String(error)}`)
+      }
+    }
     const msgs = this.options.groupStore.getMessages(chatId, {
       afterTs: this.watermark(chatId),
       beforeTs: untilTs,
@@ -245,7 +259,7 @@ export class FileIndexService {
         continue
       }
       const fileId = `f_${msg.msgId}`
-      const wxPath = this.options.locatePath?.(msg) ?? ''
+      const wxPath = this.options.locatePath?.(chatId, msg) ?? ''
       const inserted = await this.options.groupStore.appendFile(chatId, {
         fileId,
         name,
@@ -379,4 +393,84 @@ export class FileIndexService {
   dispose(): void {
     this.inFlight.clear()
   }
+}
+
+// ————————————————————————————————————————————————————————————————
+// M6-T3：事件 ↔ 文件自动关联（M5 遗留）。
+// 低风险自动动作：只把文件 id 追加进 events.file_ids（attachFilesToEvent），
+// 不改事件本体（statement/category/status 一律不动）；关联依据 = 同群 +
+// 时间邻近（文件出现时刻落在事件 evidence 前后 ±WINDOW 内），confidence 按
+// 时间贴近度衰减（贴窗 0.5，正中 1.0），仅记 audit 元数据供人工核查。
+// ————————————————————————————————————————————————————————————————
+
+/** 时间邻近窗口（毫秒）：事件 evidence 前后 ±10 分钟（功能文档 M6 口径） */
+export const EVENT_FILE_LINK_WINDOW_MS = 10 * 60_000
+
+export interface EventFileLinkOptions {
+  groupStore: GroupStoreService
+  logger: StoreLogger
+  /** 关联审计落盘点（元数据 only：eventId/fileIds/confidence，无内容） */
+  auditAppend?: (entry: Record<string, unknown>) => void
+  now?: () => number
+  /** 时间窗覆盖（测试用；默认 ±10 分钟） */
+  windowMs?: number
+  /** 单次最多关联的事件数（防首扫大库时爆炸，默认 20） */
+  maxEvents?: number
+}
+
+export interface EventFileLinkResult {
+  linked: number
+  /** eventId → 本次新挂的 fileIds */
+  details: Record<string, string[]>
+}
+
+/**
+ * 扫描该群 active 事件，按时间邻近把未挂的文件挂上去（幂等：已挂不重复）。
+ * confidence = 1 - |Δt|/window（∈ (0,1]，Δt=文件出现时刻与事件 evidence 时刻的差）。
+ */
+export async function linkFilesToEvents(
+  chatId: string,
+  options: EventFileLinkOptions,
+): Promise<EventFileLinkResult> {
+  const now = options.now ?? (() => Date.now())
+  const windowMs = Math.max(1, Math.floor(options.windowMs ?? EVENT_FILE_LINK_WINDOW_MS))
+  const events = options.groupStore
+    .getEvents(chatId, { status: 'active', limit: options.maxEvents ?? 20 })
+    .filter((e) => e.evidenceMsgId !== null)
+  if (events.length === 0) return { linked: 0, details: {} }
+  const files = options.groupStore.getFiles(chatId, { limit: 1000 })
+  if (files.length === 0) return { linked: 0, details: {} }
+
+  let linked = 0
+  const details: Record<string, string[]> = {}
+  for (const ev of events) {
+    const evidence = options.groupStore.getMessage(chatId, ev.evidenceMsgId ?? '')
+    if (!evidence) continue
+    const candidates: Array<{ fileId: string; confidence: number }> = []
+    for (const f of files) {
+      if (ev.fileIds.includes(f.fileId)) continue
+      const delta = Math.abs(f.lastSeenTs - evidence.ts)
+      if (delta > windowMs) continue
+      candidates.push({ fileId: f.fileId, confidence: Math.round((1 - delta / windowMs) * 100) / 100 })
+    }
+    if (candidates.length === 0) continue
+    const ok = await options.groupStore.attachFilesToEvent(
+      chatId,
+      ev.eventId,
+      candidates.map((c) => c.fileId),
+    )
+    if (!ok) continue
+    const confidence = Math.max(...candidates.map((c) => c.confidence))
+    linked += candidates.length
+    details[String(ev.eventId)] = candidates.map((c) => c.fileId)
+    options.auditAppend?.({
+      ts: now(),
+      chatId,
+      eventId: ev.eventId,
+      fileIds: details[String(ev.eventId)],
+      confidence,
+      basis: 'time_proximity',
+    })
+  }
+  return { linked, details }
 }

@@ -100,7 +100,134 @@ ls ~/.dsh/dsh-group-lurker
 
 审计纪律：所有日志只记**元数据**（时间、群号、kind、计数），不记消息正文、不记密钥、不记通知正文。
 
-## 7. 验收清单
+## 7. D2 全模块使用指南（M3–M6）
+
+### 7.1 报告引擎（reportEnabled 开闸顺序）
+
+自底向上逐层开，每层观察一天再开下一层：
+
+1. 基础管线就绪（§6 验收清单过）后开 `reportEnabled: true`——报告生成可手动触发、调度到点会产出；
+2. 再开 `schedulerEnabled: true`——日 20:30 / 周日 20:40 / 月 1 日 08:00 按群错峰自动生成；
+3. 最后按需开 `personDigestEnabled` / `taskRecognitionEnabled` / `reminderEnabled` / `promiseRecognitionEnabled` / `fileIndexEnabled` / `followupDraftEnabled`（全部默认关，零 LLM 调用零落库）。
+
+报告正文只落 `reports/` 与 outbox 存档；通知中心只弹短句；零发送。
+
+### 7.2 任务/事件识别与确认
+
+- 识别：白名单群消息落库后自动扫描（`taskRecognitionEnabled: true` + 建议配 `selfWxid` 精确 @匹配）；候选进 `pending_confirm`，**不提醒不发送**，详情落 outbox。
+- 确认：经插件 API（DSH 控制台 `ctx.get('groupLurker')`）：
+
+```js
+const lurker = ctx.get('groupLurker')
+lurker.groupStore.getTasks('xxx@chatroom', { status: 'pending_confirm' })     // 看候选
+await lurker.taskRecognition.confirmTask('xxx@chatroom', taskId)             // 确认入清单（→ active）
+await lurker.taskRecognition.cancelTask('xxx@chatroom', taskId)              // 误报关闭
+```
+
+- 确认过的「派发人+句式」自动学习（`patternLearning` 默认开），同类消息免确认直接 active。
+- 阈值（M6 配置化）：`minTaskConfidence`（默认 0=全落库待确认）、`fulfilConfidence`（承诺兑现软关联阈值，默认 0.5）、`activitySpikeMultiplier`（活跃度突变倍数，默认 3）。误报多→上调。
+
+### 7.3 提醒时点表与 reminder_log
+
+`reminderEnabled: true` 后按时点表驱动（全部走通知中心 + outbox，零发送）：
+
+| 时点 | 行为 |
+|---|---|
+| 识别时 | 任务/承诺候选入 outbox 待确认卡片 |
+| 截止前 1 天 | 提醒 |
+| 截止前 1 小时 | 默认关（`deadline1hRemind: true` 开） |
+| 逾期 | 升级提醒 |
+| 每日 07:50 | 待办速览合并推送 |
+
+同一条提醒同一时点只发一次（`reminder_log` 表去重）；重启不重发。
+
+### 7.4 承诺状态机与催办草稿
+
+状态机：`pending_confirm → waiting → fulfilled / broken / cancelled`（跳票不删，进日报"人欠我的"直到手动关闭）。确认/关闭：
+
+```js
+await lurker.promiseRecognition.confirmPromise('xxx@chatroom', promiseId)    // 确认入追踪（→ waiting）
+await lurker.promiseRecognition.cancelPromise('xxx@chatroom', promiseId)     // 手动关闭
+```
+
+对方发出文件/答复且发送者=承诺人、confidence ≥ `fulfilConfidence` → 自动置 fulfilled（只读关联，无发送）。逾期时 `followupDraftEnabled: true` 生成得体催办**草稿**落 outbox 供复制——草稿绝不发送。
+
+### 7.5 文件索引与版本链
+
+`fileIndexEnabled: true` 后文件类消息自动入库：类型归类、同名同哈希合并（多次出现保留 appearances）、上下文一句话摘要、星标（被多人引用或上下文含 deadline 语义）、版本链折叠（"初版→修改稿→最终版"）。M6 起 wx_path 定位接线：工具 `files` 子命令按会话查路径，能定位记实际路径，定位不了（离线期未下载）保持"待下载"占位；每次定位记 `audit/file-locate.jsonl` 元数据。
+
+### 7.6 outbox 查看（tailOutbox）
+
+```sh
+tail -n 20 ~/.dsh/dsh-group-lurker/outbox.jsonl   # 最近 20 条待发替身日志
+```
+
+或经 API `lurker.outbox.tailOutbox(20)`。outbox 是"本应发往文件传输助手"的全部内容的日志替身——**本插件不发送任何消息**。
+
+### 7.7 保留期与清理
+
+`retentionDays: 90`（默认）：每日一次删除 90 天前的 messages 行；事件/任务/承诺/文件索引等长期保留数据（只含摘要与 ≤50 字引用）不动；被这些长期表引用的旧消息行也不删（引用完整性优先）。清理动作记 `retention/audit.jsonl`（只有时间/群/删除条数，无内容）。
+
+### 7.8 person-digest 与 watchList 配置示例
+
+```yaml
+config:
+  personDigestEnabled: true
+  watchList:                        # 空数组 = 无人被追踪（fail-closed 零活动）
+    - wxid: wxid_xxxxxxxx           # 目标人物 wxid（小号库可见者）
+      remark: 张三
+      scope: global                 # 全部白名单群；或 { groups: ['xxx@chatroom'] } 指定群
+  activitySpikeMultiplier: 3        # 活跃度突变倍数（M6 配置化，默认 3）
+```
+
+产出：`digests/<chatId>/<pid>/<date>.md` 一页速览（"他最近在忙什么"）。
+
+### 7.9 fused/split A/B 脚手架（决策待运行期定夺）
+
+`distillMode: 'fused' | 'split'`（默认 fused）目前**只是对比脚手架的记录标签**，不切换线上提炼路径。对比方法：
+
+```js
+// DSH 控制台：对同一消息窗口 fixture 跑两侧并落盘
+const { runAbComparison } = await import('@zzh4206/dsh-group-lurker/lib/ab-harness.js')
+await runAbComparison(
+  [{ sender: 'P01', text: '周五前把报告发我', ts: Date.now() } /* 代号化窗口 */],
+  { llm: ctx.llm 适配 LlmClient, store: lurker.store, distillMode: lurker 配置的 distillMode },
+)
+```
+
+产物：`<stateDir>/ab/<日期>/`（input-window.json / fused-output.md / split-facts.md / split-output.md / meta.json），人工比对提炼质量。**fused vs split 的最终选择待运行期真实数据对比后定夺**，届时才实装切换逻辑。
+
+## 8. 排障
+
+**第一诊断工具：读取层探针 `spikes/db-probe.mjs`**（插件仓库内，只读）——任何"读不到消息/昵称解析失败/库打不开"问题先跑它再查插件：
+
+```sh
+cd /path/to/2水群
+node spikes/db-probe.mjs /替换/为/【小号】db_storage   # 逐库验证密钥/表结构/可读性
+```
+
+常见故障速查：
+
+| 症状 | 排查 |
+|---|---|
+| `refused (fail-closed)` 日志 | groups 为空或 source 值非法；查 cordis.patch.yml |
+| `wechat_db read failed` | 先跑 `python3.14 wechat_db.py verify`（工具目录下）；再跑 db-probe |
+| 昵称全是 wxid 原值 | contact.db 密钥/路径问题 → db-probe 看 contact 段 |
+| 掉线后老消息丢失 | T1.5 追赶补读上限 2000 条/轮，触顶看 warn 建议 backfill |
+| 文件全是"待下载" | 离线期未下载正常；小号在线且已下载后 `wechat_db.py files --chat-id xxx` 应返回 available:true |
+| 定时报告没生成 | `scheduler/state.json` 看触发记录；`schedulerEnabled` 与 `reportEnabled` 是否都开 |
+| 消息重复投递 | 换机/重取钥后游标自动重对齐的正常现象（幂等消化）；持续重复查 cursor.json |
+
+## 9. v0.2.0 变更摘要（M6）
+
+- **保留期清理**：messages 90 天滚动删除（`retentionDays` 可配），长期表与引用行保留，审计只记条数；
+- **wx_path 文件定位**：工具端新增 `wechat_db.py files --chat-id` 子命令；插件端 locatePath 接线，未命中保持"待下载"占位，定位记审计；
+- **事件↔文件自动关联**：同群 ±10 分钟时间邻近自动挂 `events.file_ids`（confidence 记审计，不改事件本体）；
+- **误报阈值配置化**：`minTaskConfidence` / `fulfilConfidence` / `activitySpikeMultiplier`（默认值=原硬编码行为）；
+- **fused/split A/B 脚手架**：`distillMode` 标签 + `runAbComparison` 落盘两侧产出供人工比对（切换逻辑待运行期定夺）；
+- RUNBOOK 扩写至 D2 全模块；198+14=212 测试绿，sec-tests 68 绿。
+
+## 10. 验收清单
 
 - [ ] `wechat_db.py verify` 对**小号**库全部 verified；
 - [ ] 白名单里每个 chatId 都能用小号库 resolve 到；
@@ -108,7 +235,7 @@ ls ~/.dsh/dsh-group-lurker
 - [ ] `groups/<chatId>/insights.jsonl` 有新行；
 - [ ] `keys.json` 权限仍为 0600（`stat -f '%Lp' .wechat-local/keys.json`）。
 
-## 8. 卸载
+## 11. 卸载
 
 ```sh
 cd ~/.dsh/profiles/web
@@ -121,7 +248,7 @@ rm -rf /path/to/macos-wechat-export/.wechat-local
 
 宿主 dispose 保证无定时器/监听残留；卸载后自动回到"不读取"状态。
 
-## 9. 换机 / 重装微信（不迁移，重取钥）
+## 12. 换机 / 重装微信（不迁移，重取钥）
 
 `.wechat-local/` 整个目录（`keys.json`、`original-signature.txt` 等）是**绑定本机与本次取钥过程的临时产物**，换机、重装微信、微信大版本升级后一律**不迁移、重新取钥**：
 

@@ -41,7 +41,9 @@ import { ReminderService } from './reminder.js'
 // M5：承诺追踪（F8）+ 催办草稿 + 文件索引（F7）（新增行，不动他人行）
 import { PromiseRecognitionService, PromiseReminderService } from './promise-track.js'
 import type { PromiseEvent } from './promise-track.js'
-import { FileIndexService } from './file-index.js'
+import { FileIndexService, linkFilesToEvents } from './file-index.js'
+// M6：保留期清理（T1.1 遗留）+ A/B 脚手架类型（新增行，不动他人行）
+import { RetentionService } from './retention.js'
 import { WechatDbSource } from './source/wechat-db.js'
 import { NicknameResolver } from './source/nickname.js'
 import type { WechatDbMessage } from './source/wechat-db.js'
@@ -113,6 +115,16 @@ export interface PluginConfig {
   fileIndexEnabled: boolean
   /** M5-T5.2：逾期催办草稿落 outbox（默认 false；草稿绝不发送） */
   followupDraftEnabled: boolean
+  /** M6-T1：messages 滚动保留天数（默认 90；长期表 events/tasks/promises/files 不动） */
+  retentionDays: number
+  /** M6-T5：提炼落地形式标签（'fused' | 'split'；仅作 A/B 对比脚手架的记录标签） */
+  distillMode: string
+  /** M6-T4：识别 confidence 门槛（默认 0 = 现行为全落库待确认；只作用于 events） */
+  minTaskConfidence: number
+  /** M6-T4：承诺兑现软关联 confidence 阈值（默认 0.5 = 现行为） */
+  fulfilConfidence: number
+  /** M6-T4：活跃度突变倍数（默认 3 = 现行为：今日 > 7 日均值 × N） */
+  activitySpikeMultiplier: number
 }
 
 export const name = 'dsh-group-lurker'
@@ -164,6 +176,11 @@ export const Config: Schema<PluginConfig> = Schema.object({
   promiseRecognitionEnabled: Schema.boolean().default(false).description('M5 承诺识别（默认关）：指向我的他人承诺 → 待确认 → 等待中 → 兑现/跳票，只落库不发送'),
   fileIndexEnabled: Schema.boolean().default(false).description('M5 文件索引（默认关）：文件类消息入库 + 类型归类 + 上下文摘要 + 版本链 + 星标'),
   followupDraftEnabled: Schema.boolean().default(false).description('M5 逾期催办草稿（默认关）：生成得体话术草稿落 outbox 供复制，绝不发送'),
+  retentionDays: Schema.number().default(90).description('M6 messages 滚动保留天数（默认 90）：每日清理一次，长期表（事件/任务/承诺/文件）不动'),
+  distillMode: Schema.string().default('fused').description("M6 提炼落地形式标签：fused | split（仅记录标签供 A/B 对比；切换决策待运行期定夺）"),
+  minTaskConfidence: Schema.number().default(0).description('M6 识别 confidence 门槛（默认 0 = 现行为：全部落库待确认；低于门槛的事件识别丢弃）'),
+  fulfilConfidence: Schema.number().default(0.5).description('M6 承诺兑现软关联 confidence 阈值（默认 0.5 = 现行为；低于只提示不自动置已兑现）'),
+  activitySpikeMultiplier: Schema.number().default(3).description('M6 活跃度突变倍数（默认 3 = 现行为：今日 > 近 7 日均值 × N 标注异常）'),
 })
 
 /**
@@ -365,6 +382,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
       enabled: true,
       selfWxid: config.selfWxid,
       patternLearning: config.patternLearning,
+      minConfidence: config.minTaskConfidence, // M6-T4：识别 confidence 门槛
       onRecognitionEvent: (ev: RecognitionEvent) => {
         const isTask = ev.kind === 'task'
         const title = ev.type.endsWith('pending_confirm')
@@ -409,6 +427,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
       enabled: true,
       selfWxid: config.selfWxid,
       patternLearning: config.patternLearning,
+      fulfilConfidence: config.fulfilConfidence, // M6-T4：软关联阈值配置化
       store,
       onPromiseEvent,
     })
@@ -423,8 +442,19 @@ export function apply(ctx: Context, config: PluginConfig): void {
     })
   }
 
-  // —— M5-T5.3：文件索引（默认关 = 零活动）。wx_path 定位注入点暂缺（现有 CLI 无
-  // 文件路径查询通道），统一记"待下载"占位——离线期媒体未下载的已知场景。 ——
+  // —— M5-T5.3：文件索引（默认关 = 零活动）。 ——
+  // —— M6-T2：wx_path 定位接线——工具 `files` 子命令按会话查路径，异步刷新进缓存，
+  //    locatePath 只做同步读；未命中/不可用 → 保持"待下载"占位；每次定位记 audit 元数据。 ——
+  const wxPathCache = new Map<string, Map<string, string>>() // chatId → msgId → path
+  async function refreshWxPaths(chatId: string): Promise<void> {
+    if (!source) return
+    const entries = await source.locateFiles(chatId, 200)
+    const map = new Map<string, string>()
+    for (const e of entries) {
+      if (e.available && e.path !== null) map.set(e.msg_id, e.path)
+    }
+    wxPathCache.set(chatId, map)
+  }
   const fileIndex = config.fileIndexEnabled
     ? new FileIndexService({
         groupStore,
@@ -432,6 +462,13 @@ export function apply(ctx: Context, config: PluginConfig): void {
         logger: logger as unknown as StoreLogger,
         enabled: true,
         store,
+        locatePath: (chatId, msg) => {
+          const found = wxPathCache.get(chatId)?.get(msg.msgId) ?? null
+          // 定位审计：只记元数据（msgId/是否命中），绝不记路径外的内容
+          store.appendJsonl('audit/file-locate.jsonl', { ts: Date.now(), chatId, msgId: msg.msgId, found: found !== null })
+          return found
+        },
+        refreshPaths: (chatId) => refreshWxPaths(chatId),
       })
     : null
 
@@ -448,6 +485,15 @@ export function apply(ctx: Context, config: PluginConfig): void {
         groups: config.groups,
       })
     : null
+
+  // —— M6-T1：保留期清理（messages 90 天滚动；长期表不动；审计只记条数） ——
+  const retention = new RetentionService({
+    groupStore,
+    store,
+    groups: config.groups,
+    retentionDays: config.retentionDays,
+    logger,
+  })
 
   const distiller = new Distiller({
     buffer,
@@ -471,6 +517,9 @@ export function apply(ctx: Context, config: PluginConfig): void {
   // 白名单为空 → WechatDbSource 构造即抛错（fail-closed），这里降级为“无源运行”并大声记日志。
   if (config.source !== 'none' && config.source !== 'wechat-db') {
     throw new Error(`unknown source "${config.source}" (expected "none" | "wechat-db") — refuse to start (fail-closed)`)
+  }
+  if (config.distillMode !== 'fused' && config.distillMode !== 'split') {
+    throw new Error(`unknown distillMode "${config.distillMode}" (expected "fused" | "split") — refuse to start (fail-closed)`)
   }
   let source: WechatDbSource | null = null
   // M2-T2.1：昵称解析器引用（供 persona-track 复用 W3 映射链；source 未启用时为 null）
@@ -554,6 +603,19 @@ export function apply(ctx: Context, config: PluginConfig): void {
                       logger.warn(`file-index scan failed: ${String(error)}`),
                     )
                   }
+                  // M6-T3：事件↔文件自动关联（低风险：只写 events.file_ids 关联行，
+                  // 不改事件本体；confidence 只进 audit 元数据）
+                  if (fileIndex || taskRecognition) {
+                    void linkFilesToEvents(message.chatId, {
+                      groupStore,
+                      logger: logger as unknown as StoreLogger,
+                      auditAppend: (entry) => {
+                        store.appendJsonl('audit/event-file-link.jsonl', entry)
+                      },
+                    }).catch((error: unknown) =>
+                      logger.warn(`event-file link failed: ${String(error)}`),
+                    )
+                  }
                 })
                 .catch((error: unknown) =>
                   logger.warn(`group-store appendMessages failed: ${String(error)}`),
@@ -587,6 +649,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
         llm: llmClient,
         logger: logger as unknown as StoreLogger,
         enabled: true,
+        activitySpikeMultiplier: config.activitySpikeMultiplier, // M6-T4：突变倍数配置化
       })
     : null
 
@@ -679,12 +742,15 @@ export function apply(ctx: Context, config: PluginConfig): void {
       stopPromiseReminder = promiseReminder.start()
       logger.info('promise reminder started')
     }
+    // M6-T1 保留期清理心跳：start() → clearInterval 约定（立即先跑一轮）。
+    const stopRetention = retention.start()
     return () => {
       stopTimer() // clearInterval：唯一 setInterval 的释放点
       stopSource?.() // clearInterval + 释放单实例锁
       stopScheduler?.() // clearInterval：调度器心跳唯一释放点
       stopReminder?.() // clearInterval：提醒心跳唯一释放点
       stopPromiseReminder?.() // M5：承诺提醒心跳唯一释放点
+      stopRetention() // M6：保留期清理心跳唯一释放点
       distiller.dispose()
       journal.dispose() // 无定时器，清计数/日报内存引用
       personDigest?.dispose() // M2-T2.3：无定时器，清并发去重表

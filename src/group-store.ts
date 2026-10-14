@@ -384,6 +384,8 @@ export interface EventRow {
    */
   supersedesEventId: number | null
   source: 'auto' | 'manual'
+  /** M6-T3：已挂文件引用（events.file_ids JSON 数组） */
+  fileIds: string[]
 }
 
 /** 新事件入库入参 */
@@ -1404,6 +1406,33 @@ export class GroupStore {
     })
   }
 
+  /**
+   * 保留期清理（M6-T1）：删除 cutoff 之前、且未被任何长期表引用的 messages 行。
+   * events/tasks/promises 证据、files.msg_id、引用链（quote_of_msg_id）指向的行
+   * 一律保留——保留期不破坏引用完整性。返回实际删除条数。
+   */
+  async deleteMessagesBefore(beforeTs: number): Promise<number> {
+    let deleted = 0
+    const ok = await this.write((db) => {
+      const r = db
+        .prepare(
+          `DELETE FROM messages WHERE ts < ? AND msg_id NOT IN (
+             SELECT evidence_msg_id FROM events WHERE evidence_msg_id IS NOT NULL
+             UNION SELECT evidence_msg_id FROM tasks WHERE evidence_msg_id IS NOT NULL
+             UNION SELECT evidence_msg_id FROM promises WHERE evidence_msg_id IS NOT NULL
+             UNION SELECT requester_evidence_msg_id FROM promises WHERE requester_evidence_msg_id IS NOT NULL
+             UNION SELECT fulfilled_msg_id FROM promises WHERE fulfilled_msg_id IS NOT NULL
+             UNION SELECT msg_id FROM files WHERE msg_id IS NOT NULL
+             UNION SELECT quote_of_msg_id FROM messages WHERE quote_of_msg_id IS NOT NULL
+           )`,
+        )
+        .run(Math.floor(beforeTs))
+      deleted = Number(r.changes)
+      return true
+    })
+    return ok ? deleted : 0
+  }
+
   /** 事件挂文件引用（T5.4 最小实现：events.file_ids JSON 数组并集）。返回是否成功。 */
   async attachFilesToEvent(eventId: number, fileIds: readonly string[]): Promise<boolean> {
     if (fileIds.length === 0) return false
@@ -1853,6 +1882,14 @@ getReportMetas(chatId: string, opts: { kind?: ReportMetaRow['kind']; limit?: num
     return st.attachFilesToEvent(eventId, fileIds)
   }
 
+  /** M6-T1 保留期清理：删除 cutoff 前未被引用的 messages 行，返回删除条数（未开库 = 0） */
+  async deleteMessagesBefore(chatId: string, beforeTs: number): Promise<number> {
+    this.assertChatId(chatId)
+    const st = this.stores.get(chatId)
+    if (!st) return 0
+    return st.deleteMessagesBefore(beforeTs)
+  }
+
   /** 关闭全部库句柄（dispose 时调用，幂等） */
   dispose(): void {
     for (const st of this.stores.values()) st.close()
@@ -1888,6 +1925,8 @@ function mapEventRow(r: Record<string, unknown>): EventRow {
     status: String(r.status),
     supersedesEventId: r.supersedes_event_id === null ? null : Number(r.supersedes_event_id),
     source: String(r.source) as EventRow['source'],
+    // M6-T3：已挂文件引用（events.file_ids JSON 数组；attachFilesToEvent 写入侧）
+    fileIds: safeJsonArray(r.file_ids).map(String),
   }
 }
 

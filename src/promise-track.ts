@@ -232,6 +232,11 @@ export interface PromiseRecognitionOptions {
   now?: () => number
   /** LLM 扫描一次送入的最大消息条数（默认 80） */
   scanLimit?: number
+  /**
+   * M6-T4：兑现软关联 confidence 阈值（Config.fulfilConfidence，默认
+   * FULFIL_CONFIDENCE_MIN=0.5 = 现行为）。低于阈值只提示不自动置 fulfilled。
+   */
+  fulfilConfidence?: number
 }
 
 export class PromiseRecognitionService {
@@ -239,6 +244,8 @@ export class PromiseRecognitionService {
   private readonly scanLimit: number
   private readonly patternLearning: boolean
   private readonly selfWxid: string
+  /** M6-T4：兑现软关联阈值（可配置） */
+  private readonly fulfilConfidence: number
   private readonly log: StoreLogger & { info?: (m: string) => unknown }
   private warnedNoSelfWxid = false
   private readonly inFlight = new Map<string, Promise<PromiseScanResult>>()
@@ -251,6 +258,8 @@ export class PromiseRecognitionService {
     this.scanLimit = Math.max(1, Math.floor(options.scanLimit ?? 80))
     this.patternLearning = options.patternLearning ?? true
     this.selfWxid = options.selfWxid ?? ''
+    // M6-T4：软关联阈值配置化（默认 = 原常量，现行为不变）
+    this.fulfilConfidence = Math.min(1, Math.max(0, options.fulfilConfidence ?? FULFIL_CONFIDENCE_MIN))
     this.log = options.logger as StoreLogger & { info?: (m: string) => unknown }
   }
 
@@ -368,7 +377,7 @@ export class PromiseRecognitionService {
     for (const f of parsed.fulfilments) {
       const row = knownPromises[f.p - 1]
       if (!row || row.status === 'fulfilled' || row.status === 'cancelled') continue
-      if (f.confidence < FULFIL_CONFIDENCE_MIN) continue
+      if (f.confidence < this.fulfilConfidence) continue
       const msg = msgs[f.n - 1]
       if (!msg) continue
       // 兑现消息必须是承诺人本人发出（文件/答复），防他人代答误关

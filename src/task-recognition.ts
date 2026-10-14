@@ -359,6 +359,12 @@ export interface TaskRecognitionOptions {
   now?: () => number
   /** LLM 扫描一次送入的最大消息条数（默认 80） */
   scanLimit?: number
+  /**
+   * M6-T4：识别 confidence 门槛（Config.minTaskConfidence，默认 0 = 现行为：全部落库
+   * 待确认）。低于门槛的事件识别直接丢弃不落库；任务侧 LLM wire 无独立置信度字段，
+   * 门槛只作用于 events（含 supersedes 演变）。
+   */
+  minConfidence?: number
 }
 
 export class TaskRecognitionService {
@@ -366,6 +372,8 @@ export class TaskRecognitionService {
   private readonly scanLimit: number
   private readonly patternLearning: boolean
   private readonly selfWxid: string
+  /** M6-T4：识别 confidence 门槛（0 = 现行为全落库） */
+  private readonly minConfidence: number
   /** StoreLogger 之外的 info 档（宿主 logger 有 info；测试静默 logger 可无） */
   private readonly log: StoreLogger & { info?: (m: string) => unknown }
   private warnedNoSelfWxid = false
@@ -379,6 +387,8 @@ export class TaskRecognitionService {
     this.scanLimit = Math.max(1, Math.floor(options.scanLimit ?? 80))
     this.patternLearning = options.patternLearning ?? true
     this.selfWxid = options.selfWxid ?? ''
+    // M6-T4：confidence 门槛（默认 0 = 现行为）
+    this.minConfidence = Math.min(1, Math.max(0, options.minConfidence ?? 0))
     this.log = options.logger as StoreLogger & { info?: (m: string) => unknown }
   }
 
@@ -495,6 +505,8 @@ export class TaskRecognitionService {
     // —— 事件（含演变链）；同证据同陈述去重（重启后水位丢失也不重复入库） ——
     const existingEvents = this.options.groupStore.getEvents(chatId, { limit: 500 })
     for (const e of parsed.events) {
+      // M6-T4：低于 confidence 门槛的识别直接丢弃（默认门槛 0 = 现行为）
+      if (e.confidence < this.minConfidence) continue
       const evidenceId = msgs[e.n - 1]?.msgId ?? null
       if (evidenceId !== null && existingEvents.some((r) => r.evidenceMsgId === evidenceId && r.statement === e.statement)) continue
       const supersededRow = e.supersedesE > 0 ? knownEvents[e.supersedesE - 1] : undefined

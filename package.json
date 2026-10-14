@@ -1,6 +1,6 @@
 {
   "name": "@zzh4206/dsh-group-lurker",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "DSH Cordis 插件：只读旁听群聊，提炼关键信息并生成日志。MVP 不发送任何消息。",
   "keywords": [
     "dsh",

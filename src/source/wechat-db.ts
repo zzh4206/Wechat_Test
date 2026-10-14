@@ -234,6 +234,14 @@ export interface CliRunResult {
 /** 子进程运行器：接收 wechat_db.py 的子命令参数（不含 python/脚本路径本身） */
 export type CliRunner = (args: readonly string[]) => Promise<CliRunResult>
 
+/** M6-T2：wechat_db.py files 子命令的单条输出（只保留插件关心的字段） */
+export interface ToolFileEntry {
+  msg_id: string
+  name: string | null
+  path: string | null
+  available: boolean
+}
+
 export interface WechatDbSourceOptions {
   /** 白名单（chatId，xxx@chatroom）。空 = fail-closed，构造抛错 */
   groups: readonly string[]
@@ -528,6 +536,46 @@ export class WechatDbSource {
       }
     }
     return fresh
+  }
+
+  /**
+   * M6-T2：文件路径定位——调工具 `files` 子命令，按会话返回文件类消息的本地存储路径。
+   * 只读查询；失败（非 0 退出 / JSON 解析失败 / 闸门外）返回 []（上层保持"待下载"占位）。
+   */
+  async locateFiles(chatId: string, limit = 200): Promise<ToolFileEntry[]> {
+    this.gate(chatId)
+    const res = await this.runner([
+      '--db-root',
+      this.dbRoot,
+      'files',
+      '--chat-id',
+      chatId,
+      '--limit',
+      String(Math.max(1, Math.min(200, Math.floor(limit)))),
+    ])
+    if (res.code !== 0) {
+      this.logger.warn(
+        `wechat_db files failed for ${chatId} (code=${res.code}): ${redactHexRuns(res.stderr.slice(0, 200))}`,
+      )
+      return []
+    }
+    try {
+      const parsed: unknown = JSON.parse(res.stdout)
+      const files = (parsed as { files?: unknown }).files
+      if (!Array.isArray(files)) return []
+      return files
+        .filter((f): f is ToolFileEntry =>
+          typeof f === 'object' && f !== null && typeof (f as ToolFileEntry).msg_id === 'string')
+        .map((f) => ({
+          msg_id: f.msg_id,
+          name: typeof f.name === 'string' ? f.name : null,
+          path: typeof f.path === 'string' ? f.path : null,
+          available: f.available === true,
+        }))
+    } catch (error) {
+      this.logger.warn(`wechat_db files parse failed for ${chatId}: ${String(error)}`)
+      return []
+    }
   }
 
   /** server_id → 去重键；缺失（未上服务器的本地行）返回 null（无法稳定判重） */

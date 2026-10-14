@@ -246,7 +246,8 @@ test('locatePath 注入点：能定位则记路径；enabled=false 零活动', a
     ])
     const llm = mockLlm([{ summaries: [] }])
     const service = svc(env.groupStore, llm, {
-      locatePath: (msg) => (msg.msgId === 'f1' ? '/wechat/files/有路径.docx' : null),
+      // M6-T2：locatePath 签名补 chatId（按会话定位）；断言语义不变
+      locatePath: (_chatId, msg) => (msg.msgId === 'f1' ? '/wechat/files/有路径.docx' : null),
     })
     await service.scanChat(CHAT)
     const files = env.groupStore.getFiles(CHAT)
