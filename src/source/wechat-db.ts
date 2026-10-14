@@ -26,21 +26,72 @@ import type { NicknameResolver } from './nickname.js'
 import { GroupCursor } from './cursor.js'
 
 /**
- * W3 normalize：local_type → 占位标签（不做穷举，未知类型 '[type:N]'）。
+ * W3 normalize：local_type → 占位标签。
  * 1=文本保留原文；10000 附近的系统通知类型在 SYSTEM_TYPES，直接跳过不入管线。
+ * 热修：类型映射统一走 mapRawType（打包值解包 + 友好占位）。
  */
-const TYPE_LABELS: Readonly<Record<number, string>> = Object.freeze({
-  3: '[图片]',
-  34: '[语音]',
-  43: '[视频]',
-  47: '[表情]',
-  48: '[位置]',
-  49: '[链接/文件]',
-  42: '[名片]',
-  62: '[视频号]',
+/**
+ * 系统通知类（撤回/拍一拍/入群退群等提示行）：不入管线。
+ * 微信 4.x 的 local_type 可能是"打包值"：(scene << 32) | type。
+ * 实测例：25769803825 = (6 << 32) | 49 → 真实类型码取低 32 位 = 49（app/链接类）。
+ * 解包纯函数：>2^32-1 时取低 32 位，否则原值返回。
+ */
+export function decodePackedType(raw: number): number {
+  if (!Number.isFinite(raw) || raw < 0) return raw
+  return raw > 0xffff_ffff ? raw % 0x1_0000_0000 : raw
+}
+
+/** 类型归类结果：友好占位 + 管线 kind（kind 取值与 store MESSAGE_KINDS 扩展集对齐） */
+export interface MappedType {
+  /** 消息列表里展示的占位文本 */
+  label: string
+  /** 归类：image/voice/file/video/link/other（文本/引用不经过此函数） */
+  kind: 'image' | 'voice' | 'file' | 'video' | 'link' | 'other'
+}
+
+/**
+ * 热修：微信 raw_type 数值 → 友好占位 + kind 归类（纯函数，带单测）。
+ * 覆盖常见类型码（低 32 位）；未知的显示 `[消息:类型码]` 保持可调试。
+ * 1=文本不在本表（normalizeRowText 前置处理）；10000/10002 系统类型在 SYSTEM_TYPES。
+ */
+const RAW_TYPE_MAP: Readonly<Record<number, MappedType>> = Object.freeze({
+  3: { label: '[图片]', kind: 'image' },
+  34: { label: '[语音]', kind: 'voice' },
+  36: { label: '[语音]', kind: 'voice' },
+  43: { label: '[视频]', kind: 'video' },
+  62: { label: '[视频]', kind: 'video' },
+  47: { label: '[表情]', kind: 'other' },
+  48: { label: '[位置]', kind: 'other' },
+  42: { label: '[名片]', kind: 'other' },
+  49: { label: '[链接]', kind: 'link' }, // appmsg：链接/文件/小程序统称，XML 凭据不导出时按链接占位
+  50: { label: '[语音/视频通话]', kind: 'other' },
+  51: { label: '[状态]', kind: 'other' },
+  52: { label: '[语音通话]', kind: 'voice' },
+  53: { label: '[视频通话]', kind: 'video' },
 })
 
-/** 系统通知类（撤回/拍一拍/入群退群等提示行）：不入管线 */
+/** 热修导出：类型码（含打包值）→ 占位 + kind。未知类型 `[消息:N]` 保留可调试性。 */
+export function mapRawType(rawType: number): MappedType {
+  const type = decodePackedType(rawType)
+  return RAW_TYPE_MAP[type] ?? { label: `[消息:${type}]`, kind: 'other' }
+}
+
+/**
+ * 热修：create_time 解析纯函数（带单测）。CLI 实测返回字符串秒（"1791946486"），
+ * 旧实现 `typeof === 'number'` 判断直接落 0。此处兼容：
+ * - number / 纯数字字符串；秒（< 1e12）原值，毫秒（≥ 1e12）换算秒；
+ * - 无法解析（NaN/负数/空/非数字）返回 null，由调用方用当前轮询时间兜底并 warn 计数。
+ */
+export function parseCreateTime(value: unknown): number | null {
+  let n: number
+  if (typeof value === 'number') n = value
+  else if (typeof value === 'string' && /^-?\d+$/.test(value.trim())) n = Number(value.trim())
+  else return null
+  if (!Number.isFinite(n) || n <= 0) return null
+  return n >= 1e12 ? Math.floor(n / 1000) : Math.floor(n)
+}
+
+/** 系统通知类（撤回/拍一拍/入群退群等提示行）：不入管线（判定前先解包，见 SYSTEM_TYPES 用点） */
 const SYSTEM_TYPES: ReadonlySet<number> = new Set([10000, 10002])
 
 /** text 为系统/媒体 XML（以 '<' 开头且含特征标记）→ 按系统消息处理（跳过） */
@@ -187,7 +238,7 @@ export function normalizeRowText(
   const trimmed = text.trim()
   // XML 系统消息（sysmsg/emoji 等特征）→ 跳过
   if (trimmed.startsWith('<') && XML_SYSTEM_PATTERN.test(trimmed)) return null
-  const type = localType ?? 1 // 无 local_type 的行按文本处理（兼容旧 CLI 输出）
+  const type = decodePackedType(localType ?? 1) // 无 local_type 的行按文本处理（兼容旧 CLI 输出）
   if (SYSTEM_TYPES.has(type)) return null
   if (type === 1) {
     // 发送者剥离："wxid_xxx:\n正文"（前缀须匹配 sender 或形如 wxid）
@@ -198,7 +249,8 @@ export function normalizeRowText(
     }
     return text
   }
-  return TYPE_LABELS[type] ?? `[type:${type}]`
+  // 热修：走统一类型映射表（解包打包值 + 友好占位；未知 → '[消息:N]'）
+  return mapRawType(type).label
 }
 
 export interface WechatDbSourceLogger {
@@ -215,8 +267,16 @@ export interface WechatDbMessage {
   text: string
   messageId: string
   ts: number
-  /** M2-T1.2：'quote' = 引用回复消息（缺省 'text'） */
-  kind?: 'text' | 'quote'
+  /** M2-T1.2：'quote' = 引用回复消息；热修扩展：非文本消息按 mapRawType 归类（缺省 'text'） */
+  kind?:
+    | 'text'
+    | 'quote'
+    | 'image'
+    | 'voice'
+    | 'file'
+    | 'video'
+    | 'link'
+    | 'other'
   /** M2-T1.2：被引用消息的 msgId（被引用原文在库内为真实 server_id，否则为 qref-* 占位） */
   quoteOfMsgId?: string
   /** M2-T1.2：仅占位情形带回（落库侧建 qref-* 占位行用）：被引用者显示名 / 原文 */
@@ -639,6 +699,9 @@ export class WechatDbSource {
   /** 原始行 → 管线消息（server_id 去重 + 落游标 + W3 normalize + M2-T1.2 引用拆解） */
   private mapRows(chatId: string, rows: RawReadMessage[]): WechatDbMessage[] {
     const fresh: WechatDbMessage[] = []
+    // 热修：create_time 解析失败的行数（本批），用当前轮询时间兜底后统一 warn 一条
+    let tsFallbackCount = 0
+    const now = this.now()
     // M2-T1.2："已读消息" id 集 = 本轮批次全部 server_id ∪ 持久化游标（引用关联用）。
     // 先扫一遍批次 id：同批内 A→B→C 多级引用可互相指到真实 server_id。
     const knownIds = new Set<string>()
@@ -654,11 +717,22 @@ export class WechatDbSource {
       if (this.cursor.has(chatId, id)) continue
       this.cursor.add(chatId, id)
       const sender = row.sender_id === undefined ? 'unknown' : String(row.sender_id)
-      // W3 normalize：local_type 过滤/占位；系统消息与 XML → 跳过不入管线
-      const rawText = row.text === null || row.text === undefined ? '' : String(row.text)
+      // 热修：local_type 兼容字符串与打包值（实测 CLI 返回字符串 "25769803825"）
       const localType =
         typeof row.local_type === 'number' ? row.local_type : Number(row.local_type) || undefined
-      if (SYSTEM_TYPES.has(localType ?? -1)) continue // 系统消息过滤（既有逻辑，勿动）
+      const decodedType = localType === undefined ? undefined : decodePackedType(localType)
+      if (decodedType !== undefined && SYSTEM_TYPES.has(decodedType)) continue // 系统消息过滤
+      // 热修：ts 解析——CLI 实测 create_time 为字符串秒；解析失败用当前轮询时间兜底（不丢数据），warn 计数
+      const parsedTs = parseCreateTime(row.create_time)
+      let ts: number
+      if (parsedTs === null) {
+        ts = now
+        tsFallbackCount++
+      } else {
+        ts = parsedTs
+      }
+      // W3 normalize：local_type 过滤/占位；系统消息与 XML → 跳过不入管线
+      const rawText = row.text === null || row.text === undefined ? '' : String(row.text)
       // M2-T1.2：引用消息（<refermsg> XML）先于普通 normalize 拆解；
       // 解析失败 → 降级为纯文本（原文进 text）继续入管线，只 warn 不阻塞。
       if (isQuoteMessage(rawText)) {
@@ -671,7 +745,7 @@ export class WechatDbSource {
             senderName: sender,
             text: quote.text,
             messageId: id,
-            ts: typeof row.create_time === 'number' ? row.create_time : 0,
+            ts,
             kind: quote.kind,
             quoteOfMsgId: quote.quoteOfMsgId,
             quoteRefName: quote.quoteRefName,
@@ -685,14 +759,24 @@ export class WechatDbSource {
       }
       const text = normalizeRowText(rawText, localType, sender)
       if (text === null) continue
+      // 热修：非文本消息 kind 按映射表归类（文本行 decodedType === 1 → 'text'）
+      const kind: WechatDbMessage['kind'] =
+        decodedType === undefined || decodedType === 1 ? 'text' : mapRawType(decodedType).kind
       fresh.push({
         chatId,
         sender, // wxid（原值保留；senderName 才是显示名）
         senderName: sender, // readOnce 尾部若有 resolver 会覆写为昵称
         text,
         messageId: id,
-        ts: typeof row.create_time === 'number' ? row.create_time : 0,
+        ts,
+        kind,
       })
+    }
+    if (tsFallbackCount > 0) {
+      this.logger.warn(
+        `wechat-db ts mapping failed for ${tsFallbackCount}/${rows.length} rows in ${chatId} — ` +
+          'create_time 无法解析，已用当前轮询时间兜底（不丢数据）',
+      )
     }
     return fresh
   }

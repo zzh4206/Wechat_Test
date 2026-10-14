@@ -125,12 +125,12 @@ test('内存库迁移冒烟：:memory: 亦可完整建表（同 MIGRATIONS 路�
   const mem = new GroupStore(':memory:', ':memory:', logger)
   // M2-T2.3：topic_clusters person 维度（v2）→ M4：report_meta 收编 + tasks 增列（v3），
   // MIGRATIONS 只追加不回退，版本随迁移条目数推进
-  assert.equal(mem.schemaVersion, 4) // M5 v4：MIGRATIONS 只追加不回退（必要调整）
+  assert.equal(mem.schemaVersion, 5) // 热修 v5：messages kind CHECK 扩展（MIGRATIONS 只追加不回退，必要调整）
   assert.equal(await mem.appendMessages([{ msgId: 'a', ts: 1, senderPid: 'P01', text: 'x' }]), 1)
   assert.equal(mem.countMessages(), 1)
   mem.close()
 })
 
 test('可写 kind 集合与 D2 §3 一致', () => {
-  assert.deepEqual([...MESSAGE_KINDS], ['text', 'image', 'voice', 'file', 'system', 'quote'])
+  assert.deepEqual([...MESSAGE_KINDS], ['text', 'image', 'voice', 'file', 'system', 'quote', 'video', 'link', 'other'])
 })

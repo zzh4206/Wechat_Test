@@ -19,8 +19,18 @@ import { DatabaseSync } from 'node:sqlite'
 import { assertInsideState } from './guard.js'
 import type { StoreLogger } from './store.js'
 
-/** messages.kind 允许值（D2 §3） */
-export const MESSAGE_KINDS = ['text', 'image', 'voice', 'file', 'system', 'quote'] as const
+/** messages.kind 允许值（D2 §3 + 热修扩展：video/link/other 非文本归类，见 v5 迁移） */
+export const MESSAGE_KINDS = [
+  'text',
+  'image',
+  'voice',
+  'file',
+  'system',
+  'quote',
+  'video',
+  'link',
+  'other',
+] as const
 export type MessageKind = (typeof MESSAGE_KINDS)[number]
 
 /** chatId 只允许白名单字符（微信 chatId 形如 `123@chatroom` / wxid） */
@@ -309,6 +319,58 @@ const MIGRATIONS: readonly ((db: DatabaseSync) => void)[] = [
     addCol('files', 'context', `context TEXT NOT NULL DEFAULT ''`)
     addCol('files', 'keywords', `keywords TEXT NOT NULL DEFAULT '[]'`)
     addCol('events', 'file_ids', `file_ids TEXT NOT NULL DEFAULT '[]'`)
+  },
+  // v4 → v5（实测热修：非文本消息 kind 归类扩展）：
+  // 源适配器热修后会把非文本消息 kind 归类为 video/link/other（wechat-db mapRawType），
+  // 旧 CHECK ('text','image','voice','file','system','quote') 会把这些行静默丢弃
+  // （addMessage 对非法 kind 直接 continue）。SQLite 不能改 CHECK，只能重建表：
+  // messages_new（新增三值的 CHECK）→ 数据原样搬移 → 换名 → 重建索引。只前不退。
+  // 兼容部分建表库：messages 不存在则按新骨架直建。
+  (db) => {
+    // 部分建表库可能没有 files 表（外键目标缺失会让 CREATE 失败）：无 files 时用不带外键子句的兜底骨架
+    const hasFiles = db
+      .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'files'`)
+      .get()
+    const FK = hasFiles
+      ? `quote_of_msg_id TEXT REFERENCES messages(msg_id),
+        file_id         TEXT REFERENCES files(file_id),`
+      : `quote_of_msg_id TEXT,
+        file_id         TEXT,`
+    const MESSAGES_DDL = `
+      CREATE TABLE messages_new (
+        msg_id          TEXT PRIMARY KEY,
+        ts              INTEGER NOT NULL,
+        sender_pid      TEXT NOT NULL,
+        sender_name     TEXT NOT NULL DEFAULT '',
+        kind            TEXT NOT NULL DEFAULT 'text'
+                        CHECK (kind IN ('text','image','voice','file','system','quote','video','link','other')),
+        text            TEXT NOT NULL DEFAULT '',
+        ${FK}
+        raw_class       TEXT
+      );`
+    const hasMessages = db
+      .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'messages'`)
+      .get()
+    if (hasMessages) {
+      db.exec(`
+        ${MESSAGES_DDL}
+        INSERT INTO messages_new
+          (msg_id, ts, sender_pid, sender_name, kind, text, quote_of_msg_id, file_id, raw_class)
+        SELECT msg_id, ts, sender_pid, sender_name, kind, text, quote_of_msg_id, file_id, raw_class
+        FROM messages;
+        DROP TABLE messages;
+        ALTER TABLE messages_new RENAME TO messages;
+      `)
+    } else {
+      db.exec(`
+        ${MESSAGES_DDL}
+        ALTER TABLE messages_new RENAME TO messages;
+      `)
+    }
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);
+      CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_pid, ts);
+    `)
   },
 ]
 

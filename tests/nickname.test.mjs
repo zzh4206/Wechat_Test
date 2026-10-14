@@ -22,7 +22,7 @@ test('normalize：媒体占位与未知类型', () => {
   assert.equal(normalizeRowText('', 3, 'wxid_a'), '[图片]')
   assert.equal(normalizeRowText('', 34, 'wxid_a'), '[语音]')
   assert.equal(normalizeRowText('', 43, 'wxid_a'), '[视频]')
-  assert.equal(normalizeRowText('', 999, 'wxid_a'), '[type:999]')
+  assert.equal(normalizeRowText('', 999, 'wxid_a'), '[消息:999]') // 热修：未知类型占位格式调整
 })
 
 test('normalize：系统通知与 XML 系统消息跳过', () => {
