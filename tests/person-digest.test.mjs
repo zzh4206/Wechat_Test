@@ -305,7 +305,7 @@ test('schema v1→v2 迁移只前不退：旧 v1 库打开后自动加列、sche
   const gs = makeEnv(dir)
   gs.open(CHAT) // 惰性建/开库触发迁移
   // M4：MIGRATIONS 追加 v3（report_meta 收编 + tasks 增列）后版本推进到 3（只前不退）
-  assert.equal(gs.schemaVersion(CHAT), 3, '打开即迁移到最新版本')
+  assert.equal(gs.schemaVersion(CHAT), 4, "打开即迁移到最新版本") // M5 v4（必要调整）
   // 旧数据完好 + 新列可用（写一条 person 摘要行）
   const msgs = gs.getMessages(CHAT)
   assert.equal(msgs.length, 1)

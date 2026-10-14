@@ -42,6 +42,9 @@ import type {
 } from './group-store.js'
 import type { LlmClient } from './distiller.js'
 import { derivePid } from './persona-track.js'
+// M4 遗留收口：扫描水位持久化（助手函数住在 promise-track.ts，M5 追加；纯函数无环依赖）
+import { loadScanWatermark, saveScanWatermark } from './promise-track.js'
+import type { Store } from './store.js'
 
 /** LLM 输出中单个候选任务（校验后的形状；n 是数据区本地序号） */
 export interface RecognizedTask {
@@ -350,6 +353,8 @@ export interface TaskRecognitionOptions {
   patternLearning?: boolean
   /** 待确认/入清单回调（notify 短卡片 + outbox 详情由接线层完成） */
   onRecognitionEvent?: (ev: RecognitionEvent) => void
+  /** M4 遗留收口：扫描水位持久化（stateDir/scan-watermark.json；缺省 = 纯内存水位） */
+  store?: Store
   /** 时钟注入 */
   now?: () => number
   /** LLM 扫描一次送入的最大消息条数（默认 80） */
@@ -365,8 +370,9 @@ export class TaskRecognitionService {
   private readonly log: StoreLogger & { info?: (m: string) => unknown }
   private warnedNoSelfWxid = false
   private readonly inFlight = new Map<string, Promise<ScanResult>>()
-  /** 每群已扫描水位（内存）：扫描只取水位之后的新消息，避免重复识别同一批消息 */
+  /** 每群已扫描水位（内存写穿 + 重启经 store 恢复，M4 遗留收口） */
   private readonly scanWatermark = new Map<string, number>()
+  private readonly watermarkLoaded = new Set<string>()
 
   constructor(private readonly options: TaskRecognitionOptions) {
     this.now = options.now ?? (() => Date.now())
@@ -427,6 +433,13 @@ export class TaskRecognitionService {
   private async run(chatId: string, untilTs: number): Promise<ScanResult> {
     const empty = { ran: false, degraded: false, tasksInserted: 0, eventsInserted: 0, deadlinesUpdated: 0 }
     this.selfPreciseEnabled // 触发 selfWxid 缺失的一次性 warn（降级 '@' 代理信号）
+    if (!this.watermarkLoaded.has(chatId)) {
+      this.watermarkLoaded.add(chatId)
+      if (!this.scanWatermark.has(chatId)) {
+        const persisted = loadScanWatermark(this.options.store, chatId)
+        if (persisted !== null) this.scanWatermark.set(chatId, persisted)
+      }
+    }
     const msgs = this.options.groupStore.getMessages(chatId, {
       afterTs: this.scanWatermark.get(chatId) ?? 0,
       beforeTs: untilTs,
@@ -435,6 +448,7 @@ export class TaskRecognitionService {
     })
     if (msgs.length === 0) return empty
     this.scanWatermark.set(chatId, Math.max(this.scanWatermark.get(chatId) ?? 0, msgs[msgs.length - 1].ts))
+    saveScanWatermark(this.options.store, chatId, this.scanWatermark.get(chatId)!)
     const identities = this.options.groupStore.getIdentities(chatId)
     const knownTasks = this.options.groupStore.getTasks(chatId, { limit: 20 })
       .filter((t) => t.status === 'active' || t.status === 'pending_confirm')

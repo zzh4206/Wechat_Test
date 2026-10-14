@@ -193,11 +193,18 @@ export interface RenderInput {
    * 缺省（undefined）时保留 M3 占位行——旧调用方/旧测试行为不变。
    */
   actions?: readonly string[]
+  /**
+   * L2「双向任务看板」（M5-T5.4 接真数据源）：我欠人的（F4 tasks active/逾期）+
+   * 人欠我的（F8 promises waiting/broken，含【已跳票】）并列。缺省时保留 M4 占位行。
+   */
+  board?: { mineOwed: readonly string[]; owedMe: readonly string[] }
+  /** L3「本期文件索引」（M5-T5.4 接真数据源）：新文件行（星标/最新版/摘要）。缺省时保留占位行。 */
+  fileLines?: readonly string[]
 }
 
 /** 三层金字塔 Markdown 渲染（纯函数） */
 export function renderReport(input: RenderInput): string {
-  const { kind, chatId, window: win, draft, status, messageCount, quotes, persons, actions } = input
+  const { kind, chatId, window: win, draft, status, messageCount, quotes, persons, actions, board, fileLines } = input
   const kindName = kind === 'daily' ? '日报' : kind === 'weekly' ? '周报' : '月报'
   const lines: string[] = []
   lines.push(`# ${kindName} · ${chatId} · ${win.dateKey}`, '')
@@ -250,8 +257,19 @@ export function renderReport(input: RenderInput): string {
     lines.push('')
   }
   lines.push('### 双向任务看板', '')
-  lines.push('- 我欠人的：（M4 任务识别接入后回填）')
-  lines.push('- 人欠我的：（M4 承诺识别接入后回填）', '')
+  // M5-T5.4：接真数据源（F4 tasks active/逾期 + F8 promises waiting/broken 并列）；缺省保留占位
+  if (board !== undefined) {
+    lines.push('- 我欠人的：')
+    if (board.mineOwed.length > 0) for (const l of board.mineOwed) lines.push(`  - ${l}`)
+    else lines.push('  -（无）')
+    lines.push('- 人欠我的：')
+    if (board.owedMe.length > 0) for (const l of board.owedMe) lines.push(`  - ${l}`)
+    else lines.push('  -（无）')
+  } else {
+    lines.push('- 我欠人的：（M4 任务识别接入后回填）')
+    lines.push('- 人欠我的：（M4 承诺识别接入后回填）')
+  }
+  lines.push('')
   lines.push(`> 统计：窗口 ${isoDay(win.start)} 至 ${isoDay(win.end - 1)}，消息 ${messageCount} 条，话题 ${draft?.topics.length ?? 0} 个，引用 ${quotes.length} 条。`, '')
   // —— L3 溯源层 ——
   lines.push('## L3 溯源层', '')
@@ -264,7 +282,15 @@ export function renderReport(input: RenderInput): string {
   } else {
     lines.push('（无引用 / degraded）', '')
   }
-  lines.push('### 本期文件索引', '', '-（F7 文件索引接入后回填）', '')
+  lines.push('### 本期文件索引', '')
+  // M5-T5.4：接 files 表真数据（新文件+摘要+星标+版本链折叠）；缺省保留占位
+  if (fileLines !== undefined) {
+    if (fileLines.length > 0) for (const l of fileLines) lines.push(`- ${l}`)
+    else lines.push('-（本期无新文件）')
+  } else {
+    lines.push('-（F7 文件索引接入后回填）')
+  }
+  lines.push('')
   lines.push('### 条目变更记录', '', '-（M4 事件/任务/承诺变更记录接入后回填）', '')
   return lines.join('\n')
 }
@@ -382,7 +408,7 @@ export class ReportService {
     const messages = this.options.groupStore.getMessages(chatId, { afterTs: win.start - 1, beforeTs: win.end, limit: 2000 })
     const messageCount = messages.length
     if (messageCount === 0) {
-      const md = renderReport({ kind, chatId, window: win, draft: null, status: 'empty', messageCount: 0, quotes: [], persons: [], actions: this.collectActions(chatId, win) })
+      const md = renderReport({ kind, chatId, window: win, draft: null, status: 'empty', messageCount: 0, quotes: [], persons: [], actions: this.collectActions(chatId, win), board: this.collectBoard(chatId, win), fileLines: this.collectFileLines(chatId, win) })
       this.options.store.writeText(rel, md)
       await this.recordMeta(chatId, kind, win, 'empty', rel, 0, 0, 0)
       return { status: 'empty', path: rel, judgmentCount: 0, topicCount: 0, messageCount: 0 }
@@ -416,7 +442,7 @@ export class ReportService {
     }
 
     const quotes = this.pickQuotes(draft, messages)
-    const md = renderReport({ kind, chatId, window: win, draft, status, messageCount, quotes, persons, actions: this.collectActions(chatId, win) })
+    const md = renderReport({ kind, chatId, window: win, draft, status, messageCount, quotes, persons, actions: this.collectActions(chatId, win), board: this.collectBoard(chatId, win), fileLines: this.collectFileLines(chatId, win) })
     const written = this.options.store.writeText(rel, md)
     const path = written ? rel : null
     const judgmentCount = draft?.judgments.length ?? 0
@@ -544,6 +570,79 @@ export class ReportService {
       this.options.logger.warn(`report[${chatId}] collectActions failed: ${String(error)}`)
     }
     return out
+  }
+
+  /**
+   * L2「双向任务看板」数据源（M5-T5.4）：我欠人的 = tasks active（逾期标【逾期】）；
+   * 人欠我的 = promises waiting/broken（broken 标【已跳票】，跳票不删持续出现直到关闭）。
+   * 查询失败 → 双侧空数组（渲染"无"行）。只读。
+   */
+  private collectBoard(chatId: string, win: ReportWindow): { mineOwed: string[]; owedMe: string[] } {
+    const mineOwed: string[] = []
+    const owedMe: string[] = []
+    const now = this.now()
+    try {
+      for (const t of this.options.groupStore.getTasks(chatId, { status: 'active', limit: 200 })) {
+        const overdue = (t.deadline !== null && t.deadline < now) || t.overdueMarkedAt > 0
+        const dl = t.deadline === null
+          ? '无明确 deadline'
+          : new Date(t.deadline).toLocaleDateString('zh-CN')
+        mineOwed.push(`${overdue ? '【逾期】' : ''}${t.statement}（截止 ${dl}）`)
+      }
+      void win
+      for (const p of this.options.groupStore.getPromises(chatId, { status: 'waiting', limit: 200 })) {
+        const dl = p.deadline === null ? '无明确时限' : new Date(p.deadline).toLocaleDateString('zh-CN')
+        owedMe.push(`${p.statement}（承诺截止 ${dl}）`)
+      }
+      for (const p of this.options.groupStore.getPromises(chatId, { status: 'broken', limit: 200 })) {
+        const dl = p.deadline === null ? '无明确时限' : new Date(p.deadline).toLocaleDateString('zh-CN')
+        owedMe.push(`【已跳票】${p.statement}（原定 ${dl}）`)
+      }
+    } catch (error) {
+      this.options.logger.warn(`report[${chatId}] collectBoard failed: ${String(error)}`)
+    }
+    return { mineOwed, owedMe }
+  }
+
+  /**
+   * L3「本期文件索引」数据源（M5-T5.4）：files 表——首次出现或最近一次出现落在报告
+   * 窗口内的条目；版本链折叠（链中只保留 last_seen 最新的一条，标「最新版」）；
+   * 星标条目前缀 ★。只读。
+   */
+  private collectFileLines(chatId: string, win: ReportWindow): string[] {
+    const out: string[] = []
+    try {
+      const files = this.options.groupStore.getFiles(chatId, { limit: 500 })
+      // 版本链折叠：按 version_root_id 分组（无链的 fileId 自成一组），组内取最新
+      const groups = new Map<string, typeof files>()
+      for (const f of files) {
+        const root = f.versionRootId ?? f.fileId
+        const list = groups.get(root) ?? []
+        list.push(f)
+        groups.set(root, list)
+      }
+      for (const list of groups.values()) {
+        const latest = [...list].sort((a, b) => b.lastSeenTs - a.lastSeenTs)[0]
+        const inWindow = list.some(
+          (f) =>
+            (f.msgId !== null && this.msgTs(chatId, f.msgId) >= win.start && this.msgTs(chatId, f.msgId) < win.end) ||
+            (f.lastSeenTs >= win.start && f.lastSeenTs < win.end),
+        )
+        if (!inWindow) continue
+        const chained = list.length > 1
+        out.push(
+          `${latest.star > 0 ? '★ ' : ''}${latest.name}（${latest.category}，${latest.summary || '无摘要'}${chained ? `，版本链 ${list.length} 版，此为最新版` : ''}）`,
+        )
+      }
+    } catch (error) {
+      this.options.logger.warn(`report[${chatId}] collectFileLines failed: ${String(error)}`)
+    }
+    return out
+  }
+
+  /** 首次出现消息时刻（消息不在库返回 0） */
+  private msgTs(chatId: string, msgId: string): number {
+    return this.options.groupStore.getMessage(chatId, msgId)?.ts ?? 0
   }
 
   /** 重点人槽：watch 名单（watch_level != off）当日生效摘要（person-digest 数据源） */

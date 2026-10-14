@@ -38,6 +38,10 @@ import { TaskRecognitionService } from './task-recognition.js'
 import type { RecognitionEvent } from './task-recognition.js'
 // M4：提醒计划器（时点表 + 每日速览）
 import { ReminderService } from './reminder.js'
+// M5：承诺追踪（F8）+ 催办草稿 + 文件索引（F7）（新增行，不动他人行）
+import { PromiseRecognitionService, PromiseReminderService } from './promise-track.js'
+import type { PromiseEvent } from './promise-track.js'
+import { FileIndexService } from './file-index.js'
 import { WechatDbSource } from './source/wechat-db.js'
 import { NicknameResolver } from './source/nickname.js'
 import type { WechatDbMessage } from './source/wechat-db.js'
@@ -103,6 +107,12 @@ export interface PluginConfig {
   patternLearning: boolean
   /** M4-T4.3：截止前 1 小时提醒时点（功能文档 §6.3 默认关） */
   deadline1hRemind: boolean
+  /** M5-T5.1：承诺识别开关（默认 false = 零 LLM 调用、零落库） */
+  promiseRecognitionEnabled: boolean
+  /** M5-T5.3：文件索引开关（默认 false = 零活动） */
+  fileIndexEnabled: boolean
+  /** M5-T5.2：逾期催办草稿落 outbox（默认 false；草稿绝不发送） */
+  followupDraftEnabled: boolean
 }
 
 export const name = 'dsh-group-lurker'
@@ -151,6 +161,9 @@ export const Config: Schema<PluginConfig> = Schema.object({
   selfWxid: Schema.string().default('').description('本人 wxid（@我精确匹配 + 确认语义归属）。留空 = 关闭精确匹配，降级为 "@" 代理信号'),
   patternLearning: Schema.boolean().default(true).description('M4 模式学习：确认过的「派发人+句式指纹」同类消息免确认直接入清单'),
   deadline1hRemind: Schema.boolean().default(false).description('M4 截止前 1 小时提醒（功能文档 §6.3 默认关）'),
+  promiseRecognitionEnabled: Schema.boolean().default(false).description('M5 承诺识别（默认关）：指向我的他人承诺 → 待确认 → 等待中 → 兑现/跳票，只落库不发送'),
+  fileIndexEnabled: Schema.boolean().default(false).description('M5 文件索引（默认关）：文件类消息入库 + 类型归类 + 上下文摘要 + 版本链 + 星标'),
+  followupDraftEnabled: Schema.boolean().default(false).description('M5 逾期催办草稿（默认关）：生成得体话术草稿落 outbox 供复制，绝不发送'),
 })
 
 /**
@@ -191,6 +204,12 @@ export interface GroupLurker {
   readonly taskRecognition: TaskRecognitionService | null
   /** 提醒计划器（M4-T4.3）；reminderEnabled=false 时为 null（零活动） */
   readonly reminder: ReminderService | null
+  /** 承诺识别（M5-T5.1）；promiseRecognitionEnabled=false 时为 null（零活动） */
+  readonly promiseRecognition: PromiseRecognitionService | null
+  /** 承诺提醒/跳票标记/催办草稿（M5-T5.2）；随 promiseRecognitionEnabled 启用 */
+  readonly promiseReminder: PromiseReminderService | null
+  /** 文件索引（M5-T5.3）；fileIndexEnabled=false 时为 null（零活动） */
+  readonly fileIndex: FileIndexService | null
   /** 定时触达调度器（M1-T1.3）；schedulerEnabled=false 时为 null */
   readonly scheduler: Scheduler | null
   /** 系统通知通道（M1-T1.4）：notifyDryRun 控制是否真弹通知 */
@@ -362,6 +381,60 @@ export function apply(ctx: Context, config: PluginConfig): void {
     })
   }
 
+  // —— M5-T5.1/T5.2：承诺识别 + 承诺提醒（默认关 = 零 LLM 调用、零落库、零心跳） ——
+  // 待确认/兑现/跳票卡片：notify 只弹短句，详情落 outbox（零发送）。
+  let promiseRecognition: PromiseRecognitionService | null = null
+  let promiseReminder: PromiseReminderService | null = null
+  if (config.promiseRecognitionEnabled) {
+    const onPromiseEvent = (ev: PromiseEvent): void => {
+      const title = ev.type === 'promise_pending_confirm'
+        ? '识别到疑似承诺，待确认'
+        : ev.type === 'promise_fulfilled'
+          ? '承诺已兑现'
+          : ev.type === 'promise_broken'
+            ? '承诺已跳票'
+            : '承诺已入追踪'
+      void notifier.notify('promise-track', title, `群 ${ev.chatId} · 1 项`).catch(() => {})
+      outbox.appendOutbox({
+        kind: ev.type,
+        title,
+        body: `承诺：${ev.statement}\n群：${ev.chatId}\n编号：${ev.id}${ev.confidence > 0 ? `\n兑现关联置信度：${ev.confidence.toFixed(2)}` : ''}`,
+        evidence_ref: `promise:${ev.id}`,
+      })
+    }
+    promiseRecognition = new PromiseRecognitionService({
+      groupStore,
+      llm: llmClient,
+      logger: logger as unknown as StoreLogger,
+      enabled: true,
+      selfWxid: config.selfWxid,
+      patternLearning: config.patternLearning,
+      store,
+      onPromiseEvent,
+    })
+    promiseReminder = new PromiseReminderService({
+      groupStore,
+      notifier,
+      outbox,
+      logger: logger as unknown as StoreLogger,
+      followupDraftEnabled: config.followupDraftEnabled,
+      groups: config.groups,
+      onPromiseEvent,
+    })
+  }
+
+  // —— M5-T5.3：文件索引（默认关 = 零活动）。wx_path 定位注入点暂缺（现有 CLI 无
+  // 文件路径查询通道），统一记"待下载"占位——离线期媒体未下载的已知场景。 ——
+  const fileIndex = config.fileIndexEnabled
+    ? new FileIndexService({
+        groupStore,
+        llm: llmClient,
+        logger: logger as unknown as StoreLogger,
+        enabled: true,
+        store,
+      })
+    : null
+
   // —— M4-T4.3：提醒计划器（默认关 = 零心跳、零通知；时点表见 reminder.ts 头注） ——
   const reminder = config.reminderEnabled
     ? new ReminderService({
@@ -470,6 +543,17 @@ export function apply(ctx: Context, config: PluginConfig): void {
                       logger.warn(`task-recognition scan failed: ${String(error)}`),
                     )
                   }
+                  // M5-T5.1/T5.3 接线：承诺识别 + 文件索引同样落库后扫描（默认关 = null 零开销）
+                  if (promiseRecognition) {
+                    void promiseRecognition.scanChat(message.chatId).catch((error: unknown) =>
+                      logger.warn(`promise-recognition scan failed: ${String(error)}`),
+                    )
+                  }
+                  if (fileIndex) {
+                    void fileIndex.scanChat(message.chatId).catch((error: unknown) =>
+                      logger.warn(`file-index scan failed: ${String(error)}`),
+                    )
+                  }
                 })
                 .catch((error: unknown) =>
                   logger.warn(`group-store appendMessages failed: ${String(error)}`),
@@ -521,6 +605,9 @@ export function apply(ctx: Context, config: PluginConfig): void {
     outbox,
     taskRecognition,
     reminder,
+    promiseRecognition,
+    promiseReminder,
+    fileIndex,
     scheduler,
     notifier,
     source,
@@ -586,17 +673,27 @@ export function apply(ctx: Context, config: PluginConfig): void {
         logger.error(`reminder start refused: ${String(error)}`)
       }
     }
+    // M5-T5.2 承诺提醒心跳：同样 start() → 清理函数约定（disabled 时为 null）。
+    let stopPromiseReminder: (() => void) | null = null
+    if (promiseReminder) {
+      stopPromiseReminder = promiseReminder.start()
+      logger.info('promise reminder started')
+    }
     return () => {
       stopTimer() // clearInterval：唯一 setInterval 的释放点
       stopSource?.() // clearInterval + 释放单实例锁
       stopScheduler?.() // clearInterval：调度器心跳唯一释放点
       stopReminder?.() // clearInterval：提醒心跳唯一释放点
+      stopPromiseReminder?.() // M5：承诺提醒心跳唯一释放点
       distiller.dispose()
       journal.dispose() // 无定时器，清计数/日报内存引用
       personDigest?.dispose() // M2-T2.3：无定时器，清并发去重表
       report?.dispose() // M3：无定时器，清并发去重表
       taskRecognition?.dispose() // M4：无定时器，清并发去重表
+      promiseRecognition?.dispose() // M5：无定时器，清并发去重表
+      fileIndex?.dispose() // M5：无定时器，清并发去重表
       reminder?.stop() // M4：clearInterval（双保险）+ 清速览内存态
+      promiseReminder?.stop() // M5：clearInterval（双保险）
       groupStore.dispose() // 关闭全部 SQLite 句柄（WAL checkpoint 随 close 完成）
       buffer.clear()
       personas.clear()

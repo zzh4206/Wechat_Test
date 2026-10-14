@@ -245,6 +245,71 @@ const MIGRATIONS: readonly ((db: DatabaseSync) => void)[] = [
       );
     `)
   },
+  // v3 → v4（M5-T5.1/T5.3：promises 状态机扩列 + files/events 补列）：
+  // 1. promises 的 v1 骨架沿用了 tasks 的四态 CHECK（'pending_confirm','active','done','cancelled'），
+  //    与 F8 状态机（pending_confirm → waiting → fulfilled/broken/cancelled）冲突；
+  //    SQLite 不能改 CHECK，只能重建表：promises_new（新五态 CHECK + created_at/broken_marked_at
+  //    两列）→ 旧数据迁移（active→waiting、done→fulfilled 语义映射）→ 换名。只前不退。
+  // 2. files 补列（ADD COLUMN 前先 PRAGMA table_info 探测）：category（类型归类）、
+  //    appearances（多次出现记录 JSON 数组）、last_seen_ts（最近一次出现）、
+  //    context（发送前后上下文快照，摘要/星标依据）、keywords（摘要关键词 JSON 数组）。
+  // 3. events 补列 file_ids（T5.4：事件可挂文件引用，JSON 数组，最小实现）。
+  (db) => {
+    // 部分建表的库（v2 时代惰性产物）可能没有 promises：有则重建扩态，无则按新骨架建。
+    const PROMISES_DDL = `
+      CREATE TABLE promises_new (
+        promise_id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        statement                TEXT NOT NULL,
+        assigner_pid             TEXT REFERENCES identities(pid),
+        evidence_msg_id          TEXT REFERENCES messages(msg_id),
+        deadline                 INTEGER,
+        deadline_confidence      REAL NOT NULL DEFAULT 0,
+        status                   TEXT NOT NULL DEFAULT 'pending_confirm'
+                                 CHECK (status IN ('pending_confirm','waiting','fulfilled','broken','cancelled')),
+        learned_pattern          TEXT,
+        requester_evidence_msg_id TEXT REFERENCES messages(msg_id),
+        fulfilled_msg_id         TEXT REFERENCES messages(msg_id),
+        fulfilled_ts             INTEGER,
+        created_at               INTEGER NOT NULL DEFAULT 0,
+        broken_marked_at         INTEGER NOT NULL DEFAULT 0
+      );`
+    const hasPromises = db
+      .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'promises'`)
+      .get()
+    if (hasPromises) {
+      db.exec(`
+        ${PROMISES_DDL}
+        INSERT INTO promises_new
+          (promise_id, statement, assigner_pid, evidence_msg_id, deadline, deadline_confidence,
+           status, learned_pattern, requester_evidence_msg_id, fulfilled_msg_id, fulfilled_ts,
+           created_at, broken_marked_at)
+        SELECT
+          promise_id, statement, assigner_pid, evidence_msg_id, deadline, deadline_confidence,
+          CASE status WHEN 'active' THEN 'waiting' WHEN 'done' THEN 'fulfilled' ELSE status END,
+          learned_pattern, requester_evidence_msg_id, fulfilled_msg_id, fulfilled_ts, 0, 0
+        FROM promises;
+        DROP TABLE promises;
+        ALTER TABLE promises_new RENAME TO promises;
+      `)
+    } else {
+      db.exec(`
+        ${PROMISES_DDL}
+        ALTER TABLE promises_new RENAME TO promises;
+      `)
+    }
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_promises_status ON promises(status);`)
+    const addCol = (table: string, col: string, ddl: string): void => {
+      const cols = (db.prepare(`PRAGMA table_info(${table})`).all() as Record<string, unknown>[]).map((c) => String(c.name))
+      if (cols.length === 0) return // 表不存在（部分建表库）：跳过，不报 no such table
+      if (!cols.includes(col)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl};`)
+    }
+    addCol('files', 'category', `category TEXT NOT NULL DEFAULT ''`)
+    addCol('files', 'appearances', `appearances TEXT NOT NULL DEFAULT '[]'`)
+    addCol('files', 'last_seen_ts', `last_seen_ts INTEGER NOT NULL DEFAULT 0`)
+    addCol('files', 'context', `context TEXT NOT NULL DEFAULT ''`)
+    addCol('files', 'keywords', `keywords TEXT NOT NULL DEFAULT '[]'`)
+    addCol('events', 'file_ids', `file_ids TEXT NOT NULL DEFAULT '[]'`)
+  },
 ]
 
 /** identities 表行（M2-T2.1 追加：关注名单同步写入/查询） */
@@ -330,6 +395,90 @@ export interface NewEventInput {
   status?: string
   supersedesEventId?: number | null
   source?: 'auto' | 'manual'
+}
+
+// —— 以下为 M5-T5.1/T5.3 追加类型（promises / files 行与入参），不改上方既有行 ——
+
+/** promises.status 允许值（F8 状态机，功能文档 §10.2；v4 CHECK 同口径） */
+export const PROMISE_STATUSES = ['pending_confirm', 'waiting', 'fulfilled', 'broken', 'cancelled'] as const
+export type PromiseStatus = (typeof PROMISE_STATUSES)[number]
+
+/** promises 表单行 */
+export interface PromiseRow {
+  promiseId: number
+  statement: string
+  /** 承诺人 pid（他人） */
+  assignerPid: string | null
+  /** 承诺证据消息（他人的应答） */
+  evidenceMsgId: string | null
+  deadline: number | null
+  deadlineConfidence: number
+  status: PromiseStatus
+  /** 模式学习指纹（`${assigner_pid}:${hash}`）；null = 未登记 */
+  learnedPattern: string | null
+  /** 我的原始请求消息（如有）；null = 对方主动许诺 */
+  requesterEvidenceMsgId: string | null
+  /** 兑现消息 / 兑现时刻 */
+  fulfilledMsgId: string | null
+  fulfilledTs: number | null
+  /** 识别/入库时刻 */
+  createdAt: number
+  /** 跳票自动标记时刻（0 = 未标记；跳票不删条目） */
+  brokenMarkedAt: number
+}
+
+/** 新承诺入库入参（promiseId/createdAt/brokenMarkedAt 由本层补全） */
+export interface NewPromiseInput {
+  statement: string
+  assignerPid?: string | null
+  evidenceMsgId?: string | null
+  deadline?: number | null
+  deadlineConfidence?: number
+  status?: PromiseStatus
+  learnedPattern?: string | null
+  requesterEvidenceMsgId?: string | null
+}
+
+/** files 表单行（appearances/keywords 落库为 JSON，读出已解析） */
+export interface FileRow {
+  fileId: string
+  name: string
+  ext: string
+  size: number
+  senderPid: string | null
+  /** 首次出现消息 */
+  msgId: string | null
+  /** 微信内路径；'' 或 '待下载' = 离线期媒体未下载占位 */
+  wxPath: string
+  hash: string
+  summary: string
+  star: number
+  /** 版本链根（链首 file_id；自指/空 = 无链或链根自身） */
+  versionRootId: string | null
+  /** 类型归类（文档/表格/压缩包/代码文本/图片/视频/其他） */
+  category: string
+  /** 多次出现记录 [{msg_id, ts}]（首条与 msg_id 一致） */
+  appearances: Array<{ msgId: string; ts: number }>
+  /** 最近一次出现时刻 */
+  lastSeenTs: number
+  /** 发送前后上下文快照（供报告/检索） */
+  context: string
+  keywords: string[]
+}
+
+/** files 入库入参（fileId 必填——来源消息 msg_id 派生，天然幂等） */
+export interface NewFileInput {
+  fileId: string
+  name: string
+  ext?: string
+  size?: number
+  senderPid?: string | null
+  msgId?: string | null
+  wxPath?: string
+  hash?: string
+  versionRootId?: string | null
+  category?: string
+  context?: string
 }
 
 /** topic_clusters 单行（person 维度，M2-T2.3 追加：人物增量摘要写入/查询） */
@@ -1047,6 +1196,226 @@ export class GroupStore {
     })
   }
 
+  // —— 以下为 M5-T5.1/T5.3 追加 API（promises / files / events 文件引用），不改上方既有行 ——
+
+  /** 写一条承诺。返回新 promiseId；失败返回 null。 */
+  async appendPromise(input: NewPromiseInput, createdAt?: number): Promise<number | null> {
+    const status = input.status ?? 'pending_confirm'
+    if (!PROMISE_STATUSES.includes(status)) return null
+    let newId: number | null = null
+    const ok = await this.write((db) => {
+      const r = db.prepare(`
+        INSERT INTO promises
+          (statement, assigner_pid, evidence_msg_id, deadline, deadline_confidence,
+           status, learned_pattern, requester_evidence_msg_id, fulfilled_msg_id, fulfilled_ts,
+           created_at, broken_marked_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, 0)
+      `).run(
+        input.statement,
+        input.assignerPid ?? null,
+        input.evidenceMsgId ?? null,
+        input.deadline === null || input.deadline === undefined ? null : Math.floor(input.deadline),
+        input.deadlineConfidence ?? 0,
+        status,
+        input.learnedPattern ?? null,
+        input.requesterEvidenceMsgId ?? null,
+        createdAt === undefined ? Date.now() : Math.floor(createdAt),
+      )
+      newId = Number(r.lastInsertRowid)
+      return true
+    })
+    return ok ? newId : null
+  }
+
+  /** 按 id 取承诺；不存在/失败返回 null。 */
+  getPromise(promiseId: number): PromiseRow | null {
+    if (this.closed) return null
+    try {
+      const r = this.db.prepare('SELECT * FROM promises WHERE promise_id = ? LIMIT 1').get(promiseId) as Record<string, unknown> | undefined
+      return r ? mapPromiseRow(r) : null
+    } catch (error) {
+      this.logger.error(`group-store[${this.chatId}] getPromise failed: ${String(error)}`)
+      return null
+    }
+  }
+
+  /** 查承诺：可选 status 过滤，promise_id 升序。只读。 */
+  getPromises(opts: { status?: PromiseStatus; limit?: number } = {}): PromiseRow[] {
+    if (this.closed) return []
+    try {
+      const where = opts.status ? `WHERE status = '${opts.status}'` : ''
+      const limit = Math.max(0, Math.floor(opts.limit ?? 200))
+      const rows = this.db
+        .prepare(`SELECT * FROM promises ${where} ORDER BY promise_id ASC LIMIT ${limit}`)
+        .all() as Record<string, unknown>[]
+      return rows.map(mapPromiseRow)
+    } catch (error) {
+      this.logger.error(`group-store[${this.chatId}] getPromises failed: ${String(error)}`)
+      return []
+    }
+  }
+
+  /** 更新承诺状态（confirm/兑现/跳票/取消闭环）。返回是否成功。 */
+  async updatePromiseStatus(promiseId: number, status: PromiseStatus): Promise<boolean> {
+    if (!PROMISE_STATUSES.includes(status)) return false
+    return this.write((db) => {
+      const r = db.prepare('UPDATE promises SET status = ? WHERE promise_id = ?').run(status, promiseId)
+      return Number(r.changes) > 0
+    })
+  }
+
+  /** 登记承诺模式学习指纹（确认时调用）。返回是否成功。 */
+  async setPromiseLearnedPattern(promiseId: number, pattern: string): Promise<boolean> {
+    return this.write((db) => {
+      const r = db.prepare('UPDATE promises SET learned_pattern = ? WHERE promise_id = ?').run(pattern, promiseId)
+      return Number(r.changes) > 0
+    })
+  }
+
+  /** 承诺 deadline 变更（「延期到周五」）：更新原行不新建。返回是否成功。 */
+  async updatePromiseDeadline(promiseId: number, deadline: number | null, confidence: number): Promise<boolean> {
+    return this.write((db) => {
+      const r = db.prepare('UPDATE promises SET deadline = ?, deadline_confidence = ? WHERE promise_id = ?')
+        .run(deadline === null ? null : Math.floor(deadline), confidence, promiseId)
+      return Number(r.changes) > 0
+    })
+  }
+
+  /** 跳票自动标记（只记时刻不改删条目；幂等：broken_marked_at=0 时才写）。返回是否发生了新标记。 */
+  async markPromiseBroken(promiseId: number, at: number): Promise<boolean> {
+    return this.write((db) => {
+      const r = db
+        .prepare('UPDATE promises SET broken_marked_at = ?, status = ? WHERE promise_id = ? AND broken_marked_at = 0 AND status = ?')
+        .run(Math.floor(at), 'broken', promiseId, 'waiting')
+      return Number(r.changes) > 0
+    })
+  }
+
+  /** 兑现关联（自动或手动兜底）：fulfilled_msg_id/fulfilled_ts + status='fulfilled'。返回是否成功。 */
+  async fulfillPromise(promiseId: number, msgId: string | null, ts: number): Promise<boolean> {
+    return this.write((db) => {
+      const r = db
+        .prepare(`UPDATE promises SET fulfilled_msg_id = ?, fulfilled_ts = ?, status = 'fulfilled' WHERE promise_id = ?`)
+        .run(msgId, Math.floor(ts), promiseId)
+      return Number(r.changes) > 0
+    })
+  }
+
+  /**
+   * 文件索引写入：新文件插入；已存在（同 file_id）返回原 id 不重复建。
+   * 重复合并（同名+同大小+同发送者键）由 file-index 模块判定后走 updateFileAppearance。
+   */
+  async appendFile(input: NewFileInput): Promise<string | null> {
+    const ok = await this.write((db) => {
+      db.prepare(`
+        INSERT INTO files
+          (file_id, name, ext, size, sender_pid, msg_id, wx_path, hash, version_root_id,
+           category, appearances, last_seen_ts, context, keywords)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        input.fileId,
+        input.name,
+        input.ext ?? '',
+        Math.floor(input.size ?? 0),
+        input.senderPid ?? null,
+        input.msgId ?? null,
+        input.wxPath ?? '',
+        input.hash ?? '',
+        input.versionRootId ?? null,
+        input.category ?? '',
+        '[]',
+        0,
+        input.context ?? '',
+        '[]',
+      )
+      return true
+    })
+    return ok ? input.fileId : null
+  }
+
+  /** 按 id 取文件；不存在/失败返回 null。 */
+  getFile(fileId: string): FileRow | null {
+    if (this.closed) return null
+    try {
+      const r = this.db.prepare('SELECT * FROM files WHERE file_id = ? LIMIT 1').get(fileId) as Record<string, unknown> | undefined
+      return r ? mapFileRow(r) : null
+    } catch (error) {
+      this.logger.error(`group-store[${this.chatId}] getFile failed: ${String(error)}`)
+      return null
+    }
+  }
+
+  /** 查文件索引：可选发送者/类别过滤，first ts 升序（用 msg 的消息时间需 join，这里按 rowid）。只读。 */
+  getFiles(opts: { senderPid?: string; category?: string; limit?: number } = {}): FileRow[] {
+    if (this.closed) return []
+    try {
+      const conds: string[] = []
+      const params: string[] = []
+      if (opts.senderPid) { conds.push('sender_pid = ?'); params.push(opts.senderPid) }
+      if (opts.category) { conds.push('category = ?'); params.push(opts.category) }
+      const where = conds.length ? `WHERE ${conds.join(' AND ')}` : ''
+      const limit = Math.max(0, Math.floor(opts.limit ?? 500))
+      const rows = this.db
+        .prepare(`SELECT * FROM files ${where} ORDER BY rowid ASC LIMIT ${limit}`)
+        .all(...params) as Record<string, unknown>[]
+      return rows.map(mapFileRow)
+    } catch (error) {
+      this.logger.error(`group-store[${this.chatId}] getFiles failed: ${String(error)}`)
+      return []
+    }
+  }
+
+  /** 追加一次出现记录（重复合并；ts 0 = 未知时刻）。返回是否成功。 */
+  async appendFileAppearance(fileId: string, msgId: string, ts: number, wxPath?: string): Promise<boolean> {
+    return this.write((db) => {
+      const row = db.prepare('SELECT appearances, last_seen_ts FROM files WHERE file_id = ?').get(fileId) as Record<string, unknown> | undefined
+      if (!row) return false
+      const list = safeJsonArray(row.appearances).includes(msgId)
+        ? safeJsonArray(row.appearances)
+        : [...safeJsonArray(row.appearances), msgId]
+      db.prepare('UPDATE files SET appearances = ?, last_seen_ts = MAX(last_seen_ts, ?), wx_path = CASE WHEN ? IS NULL OR ? = \'\' THEN wx_path ELSE ? END WHERE file_id = ?')
+        .run(JSON.stringify(list), Math.floor(ts), wxPath ?? '', wxPath ?? '', wxPath ?? '', fileId)
+      return true
+    })
+  }
+
+  /** 更新文件摘要/关键词/上下文/星标（file-index 摘要阶段）。返回是否成功。 */
+  async updateFileMeta(fileId: string, meta: { summary?: string; keywords?: string[]; context?: string; star?: number; versionRootId?: string | null }): Promise<boolean> {
+    return this.write((db) => {
+      const cur = db.prepare('SELECT context FROM files WHERE file_id = ?').get(fileId) as Record<string, unknown> | undefined
+      if (!cur) return false
+      // 未提供的字段保留原值（COALESCE 兜底）：摘要阶段与星标/链阶段可分次写
+      db.prepare(`UPDATE files SET
+          summary = COALESCE(?, summary),
+          keywords = COALESCE(?, keywords),
+          context = COALESCE(?, context),
+          star = COALESCE(?, star),
+          version_root_id = COALESCE(?, version_root_id)
+        WHERE file_id = ?`)
+        .run(
+          meta.summary === undefined ? null : meta.summary,
+          meta.keywords === undefined ? null : JSON.stringify(meta.keywords),
+          meta.context === undefined ? null : meta.context,
+          meta.star === undefined ? null : Math.floor(meta.star),
+          meta.versionRootId === undefined ? null : meta.versionRootId,
+          fileId,
+        )
+      return true
+    })
+  }
+
+  /** 事件挂文件引用（T5.4 最小实现：events.file_ids JSON 数组并集）。返回是否成功。 */
+  async attachFilesToEvent(eventId: number, fileIds: readonly string[]): Promise<boolean> {
+    if (fileIds.length === 0) return false
+    return this.write((db) => {
+      const row = db.prepare('SELECT file_ids FROM events WHERE event_id = ?').get(eventId) as Record<string, unknown> | undefined
+      if (!row) return false
+      const merged = [...new Set([...safeJsonArray(row.file_ids), ...fileIds])]
+      db.prepare('UPDATE events SET file_ids = ? WHERE event_id = ?').run(JSON.stringify(merged), eventId)
+      return true
+    })
+  }
+
   /** 关闭库句柄（幂等） */
   close(): void {
     if (this.closed) return
@@ -1391,6 +1760,99 @@ getReportMetas(chatId: string, opts: { kind?: ReportMetaRow['kind']; limit?: num
     return st.appendReminderLog(taskId, point, firedAt)
   }
 
+  // —— 以下为 M5-T5.1/T5.3 追加（promises / files / 事件文件引用 服务层包装），不改上方既有行 ——
+
+  /** 写一条承诺（库未开则惰性建库；失败返回 null） */
+  async appendPromise(chatId: string, input: NewPromiseInput, createdAt?: number): Promise<number | null> {
+    try {
+      return await this.open(chatId).appendPromise(input, createdAt)
+    } catch (error) {
+      this.logger.error(`group-store appendPromise(${chatId}) failed: ${String(error)}`)
+      return null
+    }
+  }
+
+  getPromise(chatId: string, promiseId: number): PromiseRow | null {
+    const st = this.stores.get(chatId)
+    if (!st) return null
+    return st.getPromise(promiseId)
+  }
+
+  getPromises(chatId: string, opts?: { status?: PromiseStatus; limit?: number }): PromiseRow[] {
+    const st = this.stores.get(chatId)
+    if (!st) return []
+    return st.getPromises(opts)
+  }
+
+  async updatePromiseStatus(chatId: string, promiseId: number, status: PromiseStatus): Promise<boolean> {
+    const st = this.stores.get(chatId)
+    if (!st) return false
+    return st.updatePromiseStatus(promiseId, status)
+  }
+
+  async setPromiseLearnedPattern(chatId: string, promiseId: number, pattern: string): Promise<boolean> {
+    const st = this.stores.get(chatId)
+    if (!st) return false
+    return st.setPromiseLearnedPattern(promiseId, pattern)
+  }
+
+  async updatePromiseDeadline(chatId: string, promiseId: number, deadline: number | null, confidence: number): Promise<boolean> {
+    const st = this.stores.get(chatId)
+    if (!st) return false
+    return st.updatePromiseDeadline(promiseId, deadline, confidence)
+  }
+
+  async markPromiseBroken(chatId: string, promiseId: number, at: number): Promise<boolean> {
+    const st = this.stores.get(chatId)
+    if (!st) return false
+    return st.markPromiseBroken(promiseId, at)
+  }
+
+  async fulfillPromise(chatId: string, promiseId: number, msgId: string | null, ts: number): Promise<boolean> {
+    const st = this.stores.get(chatId)
+    if (!st) return false
+    return st.fulfillPromise(promiseId, msgId, ts)
+  }
+
+  async appendFile(chatId: string, input: NewFileInput): Promise<string | null> {
+    try {
+      return await this.open(chatId).appendFile(input)
+    } catch (error) {
+      this.logger.error(`group-store appendFile(${chatId}) failed: ${String(error)}`)
+      return null
+    }
+  }
+
+  getFile(chatId: string, fileId: string): FileRow | null {
+    const st = this.stores.get(chatId)
+    if (!st) return null
+    return st.getFile(fileId)
+  }
+
+  getFiles(chatId: string, opts?: { senderPid?: string; category?: string; limit?: number }): FileRow[] {
+    const st = this.stores.get(chatId)
+    if (!st) return []
+    return st.getFiles(opts)
+  }
+
+  async appendFileAppearance(chatId: string, fileId: string, msgId: string, ts: number, wxPath?: string): Promise<boolean> {
+    const st = this.stores.get(chatId)
+    if (!st) return false
+    return st.appendFileAppearance(fileId, msgId, ts, wxPath)
+  }
+
+  async updateFileMeta(chatId: string, fileId: string, meta: { summary?: string; keywords?: string[]; context?: string; star?: number; versionRootId?: string | null }): Promise<boolean> {
+    const st = this.stores.get(chatId)
+    if (!st) return false
+    return st.updateFileMeta(fileId, meta)
+  }
+
+  async attachFilesToEvent(chatId: string, eventId: number, fileIds: readonly string[]): Promise<boolean> {
+    const st = this.stores.get(chatId)
+    if (!st) return false
+    return st.attachFilesToEvent(eventId, fileIds)
+  }
+
   /** 关闭全部库句柄（dispose 时调用，幂等） */
   dispose(): void {
     for (const st of this.stores.values()) st.close()
@@ -1426,6 +1888,47 @@ function mapEventRow(r: Record<string, unknown>): EventRow {
     status: String(r.status),
     supersedesEventId: r.supersedes_event_id === null ? null : Number(r.supersedes_event_id),
     source: String(r.source) as EventRow['source'],
+  }
+}
+
+/** promises 行映射（M5 追加；appearances 类 JSON 在 files，见 mapFileRow） */
+function mapPromiseRow(r: Record<string, unknown>): PromiseRow {
+  return {
+    promiseId: Number(r.promise_id),
+    statement: String(r.statement),
+    assignerPid: r.assigner_pid === null ? null : String(r.assigner_pid),
+    evidenceMsgId: r.evidence_msg_id === null ? null : String(r.evidence_msg_id),
+    deadline: r.deadline === null ? null : Number(r.deadline),
+    deadlineConfidence: Number(r.deadline_confidence),
+    status: String(r.status) as PromiseRow['status'],
+    learnedPattern: r.learned_pattern === null ? null : String(r.learned_pattern),
+    requesterEvidenceMsgId: r.requester_evidence_msg_id === null ? null : String(r.requester_evidence_msg_id),
+    fulfilledMsgId: r.fulfilled_msg_id === null ? null : String(r.fulfilled_msg_id),
+    fulfilledTs: r.fulfilled_ts === null ? null : Number(r.fulfilled_ts),
+    createdAt: Number(r.created_at ?? 0),
+    brokenMarkedAt: Number(r.broken_marked_at ?? 0),
+  }
+}
+
+/** files 行映射（appearances/keywords 为 JSON 数组文本；损坏回退空） */
+function mapFileRow(r: Record<string, unknown>): FileRow {
+  return {
+    fileId: String(r.file_id),
+    name: String(r.name),
+    ext: String(r.ext),
+    size: Number(r.size ?? 0),
+    senderPid: r.sender_pid === null ? null : String(r.sender_pid),
+    msgId: r.msg_id === null ? null : String(r.msg_id),
+    wxPath: String(r.wx_path ?? ''),
+    hash: String(r.hash ?? ''),
+    summary: String(r.summary ?? ''),
+    star: Number(r.star ?? 0),
+    versionRootId: r.version_root_id === null ? null : String(r.version_root_id),
+    category: String(r.category ?? ''),
+    appearances: safeJsonArray(r.appearances).map((id) => ({ msgId: id, ts: 0 })),
+    lastSeenTs: Number(r.last_seen_ts ?? 0),
+    context: String(r.context ?? ''),
+    keywords: safeJsonArray(r.keywords),
   }
 }
 

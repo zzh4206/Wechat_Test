@@ -510,7 +510,7 @@ test('v3 迁移：全新库 → version 3 + reminder_log 可用', async () => {
   const env = makeEnv()
   try {
     const st = env.groupStore.open(CHAT)
-    assert.equal(st.schemaVersion, 3)
+    assert.equal(st.schemaVersion, 4) // M5 v4（必要调整）
     assert.ok(await env.groupStore.appendReminderLog(CHAT, 1, 'due-1d', NOW))
     assert.ok(!(await env.groupStore.appendReminderLog(CHAT, 1, 'due-1d', NOW)), '主键去重')
     assert.ok(await env.groupStore.appendReminderLog(CHAT, 1, 'overdue', NOW))
@@ -543,7 +543,7 @@ test('v3 迁移兼容：v2 时代惰性 report_meta 已存在 → 不重建、�
 
     const groupStore = new GroupStoreService(base, silentLogger)
     const st = groupStore.open(CHAT)
-    assert.equal(st.schemaVersion, 3, '迁移推进到 v3')
+    assert.equal(st.schemaVersion, 4, "迁移推进到 v4（M5，必要调整）")
     const metas = groupStore.getReportMetas(CHAT)
     assert.equal(metas.length, 1, '惰性表历史行完好（未被重建清空）')
     assert.equal(metas[0].date, '2026-03-09')
