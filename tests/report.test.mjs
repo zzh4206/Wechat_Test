@@ -127,6 +127,46 @@ test('合法输出：三层金字塔齐备，判断 3–5 条挂 msg_id 证据�
   rmSync(dir, { recursive: true, force: true })
 })
 
+test('槽位标签去重：LLM 输出自带【变化】等标签时不重复渲染；不带则正常补；prompt 明确禁止槽位带标签', async () => {
+  const msgs = [
+    { msgId: 'm1', ts: T(9), senderPid: 'wxid_a', senderName: '爱丽丝', text: '早' },
+    { msgId: 'm2', ts: T(10), senderPid: 'wxid_boss', senderName: '老板', text: 'UI 稿提前到周二交' },
+    { msgId: 'm3', ts: T(11), senderPid: 'wxid_c', senderName: '阿丙', text: '周四联调' },
+    { msgId: 'm4', ts: T(12), senderPid: 'wxid_bob', senderName: 'Bob', text: '下午给测试环境' },
+    { msgId: 'm5', ts: T(13), senderPid: 'wxid_a', senderName: '爱丽丝', text: '收到' },
+  ]
+  // 槽位字段混合形态：change 自带标签（含首尾空白），status 自带标签，people/watch 不带
+  const labeled = JSON.stringify({
+    title: 't', lead: '**l**：x',
+    judgments: [{ text: 'a', evidence: [1] }, { text: 'b', evidence: [2] }, { text: 'c', evidence: [4] }],
+    topics: [
+      { title: '一', change: ' 【变化】老大上午临时通知改期', status: '【现状】群里在传', people: '阿丙推进', watch: '明天确认', evidence: [2] },
+      { title: '二', change: '不带标签的正常内容', status: '也不带', people: '也不带', watch: '也不带', evidence: [1] },
+    ],
+    quotes: [2],
+  })
+  const { dir, gs, llm, report } = makeEnv([labeled])
+  await seedDay(gs, msgs)
+  const res = await report.generateReport(CHAT, 'daily', T(20, 30))
+  assert.equal(res.status, 'ok')
+  const md = readFileSync(join(dir, 'reports', CHAT, '2026-06-10.md'), 'utf8')
+  // 自带标签 → 不重复
+  assert.doesNotMatch(md, /【变化】\s*\*?\*?【变化】/)
+  assert.doesNotMatch(md, /【现状】\s*【现状】/)
+  assert.match(md, /- 【变化】\*\*老大上午临时通知改期\*\*/)
+  assert.match(md, /- 【现状】群里在传/)
+  // 不带标签 → 正常补前缀
+  assert.match(md, /- 【变化】\*\*不带标签的正常内容\*\*/)
+  assert.match(md, /- 【相关人】也不带/)
+  assert.match(md, /- 【待观察】也不带/)
+  // prompt 层约束：schema 示例不再内嵌标签，且明确禁止槽位带标签
+  assert.match(llm.calls[0], /topics 的 change\/status\/people\/watch 四个槽位字段直接写内容本身/)
+  assert.ok(!llm.calls[0].includes('"change":"【变化】'))
+  gs.dispose()
+  report.dispose()
+  rmSync(dir, { recursive: true, force: true })
+})
+
 test('违反金字塔（judgments 只有 2 条）→ 重试一次成功（llm 调 2 次）', async () => {
   const { dir, gs, llm, report } = makeEnv([
     JSON.stringify({ title: 't', lead: 'l', judgments: [{ text: '只有两条之一', evidence: [1] }, { text: '之二', evidence: [2] }], topics: [] }),
