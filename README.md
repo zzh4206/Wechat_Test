@@ -27,7 +27,7 @@
 
 ## 安装
 
-在 DSH profile 目录（如 `~/.dsh/profiles/web`）：
+在 DSH profile 目录（如 `~/.dsh/profiles/desktop`）：
 
 ```bash
 pnpm add --config.auto-install-peers=false file:/path/to/dsh-group-lurker

@@ -1,5 +1,9 @@
 # RUNBOOK：dsh-group-lurker 安装 / 授权 / 白名单 / 审计 / 卸载
 
+> **运行环境（2026-10-14 起 canonical）**：DSH **desktop** 桌面版 + `~/.dsh/profiles/desktop`。web profile 已弃用，仅存档。
+> **默认模型**：desktop 宿主 `agent-default-model` = glm-5.3（zai 源），可在 `cordis.patch.yml` 改。
+> ⚠️ 已知适配项：desktop 宿主为 Electron 内嵌 Node，`node:sqlite` 可用性待验证（见 PROGRESS 2026-10-14 行）；如加载失败按控制台报错处置。
+
 > 适用：macOS（Apple Silicon 已验证）+ DSH（`~/.dsh`）+ 插件 `@zzh4206/dsh-group-lurker`。
 > 本手册只覆盖**小号**路径。**大号只承担一个动作：把小号拉进需要旁听的群**（如 Test 群模式）；除此之外大号不出现：不取钥、不配置、不读取，本手册也不提供任何大号库的配置方法。
 
@@ -42,14 +46,14 @@ python3.14 wechat_db.py resolve '群名关键词'   # 用小号库查目标群 �
 cd /path/to/2水群
 npm run build
 
-# 2) 装进 profile（profile 目录以 ~/.dsh/profiles/web 为例，含自己的 package.json）
-cd ~/.dsh/profiles/web
+# 2) 装进 profile（profile 目录以 ~/.dsh/profiles/desktop 为例，含自己的 package.json）
+cd ~/.dsh/profiles/desktop
 pnpm add file:/path/to/2水群
 ```
 
 ## 4. 配置（profile 的 cordis.patch.yml）
 
-在 `~/.dsh/profiles/web/cordis.patch.yml` 的 `insert:` 列表加一段。**以下全部路径均为占位，必须替换为本机小号实际路径；仓库内 cordis.patch.yml 是本地运行配置，不入库。**
+在 `~/.dsh/profiles/desktop/cordis.patch.yml` 的 `insert:` 列表加一段。**以下全部路径均为占位，必须替换为本机小号实际路径；仓库内 cordis.patch.yml 是本地运行配置，不入库。**
 
 ```yaml
 - id: group-lurker
@@ -238,7 +242,7 @@ node spikes/db-probe.mjs /替换/为/【小号】db_storage   # 逐库验证密�
 ## 11. 卸载
 
 ```sh
-cd ~/.dsh/profiles/web
+cd ~/.dsh/profiles/desktop
 pnpm remove @zzh4206/dsh-group-lurker   # 移除插件（cordis.patch.yml 对应 insert 段一并删掉）
 # 数据删除（不可逆，含全部提炼产出与日报）：
 rm -rf ~/.dsh/dsh-group-lurker
