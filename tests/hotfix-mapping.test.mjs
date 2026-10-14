@@ -9,15 +9,17 @@ const {
   normalizeRowText,
 } = await import('../lib/source/wechat-db.js')
 
-test('parseCreateTime：CLI 实测字符串秒', () => {
-  assert.equal(parseCreateTime('1791946486'), 1791946486)
-  assert.equal(parseCreateTime(' 1791946486 '), 1791946486)
+test('parseCreateTime：字符串秒 → 毫秒（统一 Date.now() 口径）', () => {
+  assert.equal(parseCreateTime('1791946486'), 1791946486000)
+  assert.equal(parseCreateTime(' 1791946486 '), 1791946486000)
 })
 
-test('parseCreateTime：number 秒 / 毫秒换算', () => {
-  assert.equal(parseCreateTime(1791946486), 1791946486)
-  assert.equal(parseCreateTime(1791946486000), 1791946486)
-  assert.equal(parseCreateTime('1791946486000'), 1791946486)
+test('parseCreateTime：number 秒 ×1000；已是毫秒原值保留（自动兼容）', () => {
+  assert.equal(parseCreateTime(1791946486), 1791946486000)
+  assert.equal(parseCreateTime(1791946486000), 1791946486000)
+  assert.equal(parseCreateTime('1791946486000'), 1791946486000)
+  const nowMs = Date.now()
+  assert.equal(parseCreateTime(String(nowMs)), nowMs, '已是毫秒 → 原值保留')
 })
 
 test('parseCreateTime：无法解析一律 null（调用方兜底，不落 0）', () => {

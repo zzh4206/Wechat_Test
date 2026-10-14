@@ -75,7 +75,7 @@ test('消息解析映射 + server_id 去重 + 无 server_id 行跳过', async ()
   assert.equal(collected[0].messageId, 'a1')
   assert.equal(collected[0].sender, 'wxid_x')
   assert.equal(collected[0].text, '你好')
-  assert.equal(collected[0].ts, 1791862498)
+  assert.equal(collected[0].ts, 1791862498 * 1000, '秒级 create_time 统一落毫秒')
   assert.equal(collected[0].chatId, '10000@chatroom')
   // 再轮询同样输出 → 去重后 0 条新
   await source.pollOnce()

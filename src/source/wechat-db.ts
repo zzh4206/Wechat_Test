@@ -79,8 +79,12 @@ export function mapRawType(rawType: number): MappedType {
 /**
  * 热修：create_time 解析纯函数（带单测）。CLI 实测返回字符串秒（"1791946486"），
  * 旧实现 `typeof === 'number'` 判断直接落 0。此处兼容：
- * - number / 纯数字字符串；秒（< 1e12）原值，毫秒（≥ 1e12）换算秒；
+ * - number / 纯数字字符串；秒（< 1e12）×1000 换算毫秒，毫秒（≥ 1e12）原值保留；
  * - 无法解析（NaN/负数/空/非数字）返回 null，由调用方用当前轮询时间兜底并 warn 计数。
+ *
+ * 统一口径：返回值一律毫秒（Date.now() 体系）——下游 report/person-digest/reminder/
+ * task-recognition 的窗口比较全按毫秒。旧实现返回秒，秒级 ts 恒小于毫秒窗口起点，
+ * 实测导致报告/摘要过滤不到任何消息。
  */
 export function parseCreateTime(value: unknown): number | null {
   let n: number
@@ -88,7 +92,7 @@ export function parseCreateTime(value: unknown): number | null {
   else if (typeof value === 'string' && /^-?\d+$/.test(value.trim())) n = Number(value.trim())
   else return null
   if (!Number.isFinite(n) || n <= 0) return null
-  return n >= 1e12 ? Math.floor(n / 1000) : Math.floor(n)
+  return n >= 1e12 ? Math.floor(n) : Math.floor(n * 1000)
 }
 
 /** 系统通知类（撤回/拍一拍/入群退群等提示行）：不入管线（判定前先解包，见 SYSTEM_TYPES 用点） */
