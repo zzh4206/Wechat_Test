@@ -353,6 +353,10 @@ Accessibility Inspector 确认元素层级）。**实证结论回填此处：___
   - 审计可区分：抢前台放行的发送记 `result='take_focus_sent'`，普通模式记 `sent`；
 - **频控**：`maxSendsPerDay`（默认 20）超限的当日 pending 标 `skipped_quota`（样例同样占配额）；
 - **失败重试**：attempts 落盘，≥3 次转 `failed` 不再重试（防风暴）；
+- **熄屏/锁屏 = 环境等待（非失败）**：AX 读不到微信窗口（熄屏、锁屏、主窗口关闭）时本轮标记
+  `screen_locked_deferred`——**不计 attempts、状态保持 pending**，下轮消费周期自动重试，
+  无限等待直到环境恢复（解锁后自动恢复发送，无 attempts 损耗、不熔断）；
+  attempts≥3 熔断只针对"环境可读但发送/验证失败"的真实失败（如 DB 回读未命中）；
 - **状态机**：`pending → sent | dry_run | skipped_quota | skipped_channel | failed`；
 - **审计**：`audit/sender.jsonl` 只记元数据（id/kind/结果/attempts/method），绝不记正文；
 - **剪贴板**：发送前保存、发送后恢复；恢复失败只 warn；发送失败路径同样尝试恢复；

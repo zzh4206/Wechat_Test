@@ -117,8 +117,11 @@ export interface PrimitiveSendInput {
 
 export interface PrimitiveSendResult {
   ok: boolean
-  /** located = 已定位会话（dry_run 终点）；sent = 已发送；error = 失败 */
-  stage: 'located' | 'sent' | 'error'
+  /**
+   * located = 已定位会话（dry_run 终点）；sent = 已发送；error = 真实失败（计 attempts）；
+   * env_unavailable = 环境不可用（熄屏/锁屏/窗口读不到——不计 attempts，本轮挂起下轮重试）
+   */
+  stage: 'located' | 'sent' | 'error' | 'env_unavailable'
   detail: string
 }
 
@@ -286,19 +289,19 @@ export class KeyboardSender implements SendPrimitive {
     await this.run(OSC_KEY_ESC)
     // 4. AX 读窗口 position/size（动态计算搜索框点击坐标——窗口移动缩放自适应）
     const ax = await this.run(OSC_AX_WINDOW)
-    if (ax.code !== 0) return { ok: false, stage: 'error', detail: `AX 读微信窗口 position/size 失败 code=${ax.code}——放弃键序（坐标未知不盲点）` }
+    if (ax.code !== 0) return { ok: false, stage: 'env_unavailable', detail: `AX 读微信窗口 position/size 失败 code=${ax.code}——放弃键序（坐标未知不盲点）` }
     const nums = ax.stdout.split(',').map((v) => Number(v.trim())).filter((v) => Number.isFinite(v))
-    if (nums.length < 4) return { ok: false, stage: 'error', detail: `AX 窗口数据不可解析：${JSON.stringify(ax.stdout.slice(0, 80))}` }
+    if (nums.length < 4) return { ok: false, stage: 'env_unavailable', detail: `AX 窗口数据不可解析：${JSON.stringify(ax.stdout.slice(0, 80))}` }
     const [wx1, wy1, ww1, wh1] = nums
-    if (ww1 < AX_MIN_DIM_PX || wh1 < AX_MIN_DIM_PX) return { ok: false, stage: 'error', detail: `AX 窗口尺寸异常 ${ww1}x${wh1}（宽/高 <${AX_MIN_DIM_PX}px，疑似 Space 切换动画中间态）——fail-closed 放弃本轮不盲点` }
+    if (ww1 < AX_MIN_DIM_PX || wh1 < AX_MIN_DIM_PX) return { ok: false, stage: 'env_unavailable', detail: `AX 窗口尺寸异常 ${ww1}x${wh1}（宽/高 <${AX_MIN_DIM_PX}px，疑似 Space 切换动画中间态）——fail-closed 放弃本轮不盲点` }
     // 4.5 双读坐标：延迟后重读一次 position——两次不一致说明布局仍在变动，以第二次为准
     await this.sleep(KEY_DELAY_REREAD_MS)
     const ax2 = await this.run(OSC_AX_WINDOW)
-    if (ax2.code !== 0) return { ok: false, stage: 'error', detail: `AX 复读微信窗口 position 失败 code=${ax2.code}——放弃键序（坐标不稳定不盲点）` }
+    if (ax2.code !== 0) return { ok: false, stage: 'env_unavailable', detail: `AX 复读微信窗口 position 失败 code=${ax2.code}——放弃键序（坐标不稳定不盲点）` }
     const nums2 = ax2.stdout.split(',').map((v) => Number(v.trim())).filter((v) => Number.isFinite(v))
-    if (nums2.length < 4) return { ok: false, stage: 'error', detail: `AX 复读窗口数据不可解析：${JSON.stringify(ax2.stdout.slice(0, 80))}` }
+    if (nums2.length < 4) return { ok: false, stage: 'env_unavailable', detail: `AX 复读窗口数据不可解析：${JSON.stringify(ax2.stdout.slice(0, 80))}` }
     const [wx, wy, ww, wh] = nums2
-    if (ww < AX_MIN_DIM_PX || wh < AX_MIN_DIM_PX) return { ok: false, stage: 'error', detail: `AX 复读窗口尺寸异常 ${ww}x${wh}（疑似动画中间态）——fail-closed 放弃本轮不盲点` }
+    if (ww < AX_MIN_DIM_PX || wh < AX_MIN_DIM_PX) return { ok: false, stage: 'env_unavailable', detail: `AX 复读窗口尺寸异常 ${ww}x${wh}（疑似动画中间态）——fail-closed 放弃本轮不盲点` }
     const unstable = Math.abs(wx - wx1) > AX_POSITION_TOLERANCE_PX || Math.abs(wy - wy1) > AX_POSITION_TOLERANCE_PX
     if (unstable) this.warn?.(`sender[keyboard]: AX 双读坐标不一致（首读 ${wx1},${wy1} → 复读 ${wx},${wy}，布局变动中）——以第二次读取为准点击`)
     // 5. 点击左上角搜索框区域（实证：窗口 0,34 856x1007 时点 107,71 命中；坐标取自双读的第二次）
@@ -458,6 +461,12 @@ export class SenderService {
     if (this.dryRun) {
       if (this.method === 'keyboard') {
         const r = await this.primitive.transmit({ id, text, feature, dryRun: true })
+        if (!r.ok && r.stage === 'env_unavailable') {
+          // 熄屏/锁屏/窗口不可读 = 环境等待：不计 attempts、保持 pending，下轮自动重试（不熔断）
+          this.audit({ id, kind: entry.kind, result: 'screen_locked_deferred', attempts: entry.attempts ?? 0, deferred: true })
+          this.options.logger.info(`sender[dry_run] 环境不可用挂起 id=${id} (${r.detail}) — 不计 attempts，下轮重试`)
+          return { action: 'deferred' }
+        }
         if (!r.ok) {
           const status: OutboxEntry['status'] = attempts >= MAX_ATTEMPTS ? 'failed' : 'pending'
           this.options.outbox.updateSendState(id, { status, attempts })
@@ -482,6 +491,12 @@ export class SenderService {
     }
 
     const r = await this.primitive.transmit({ id, text, feature, dryRun: false })
+    if (!r.ok && r.stage === 'env_unavailable') {
+      // 熄屏/锁屏等环境不可用 = 等待而非失败：不计 attempts、保持 pending，解锁后自动恢复
+      this.audit({ id, kind: entry.kind, result: 'screen_locked_deferred', attempts: entry.attempts ?? 0, deferred: true, method: this.method })
+      this.options.logger.info(`sender: 环境不可用挂起 id=${id} (${r.detail}) — 不计 attempts，下轮重试`)
+      return { action: 'deferred' }
+    }
     let ok = r.ok && r.stage === 'sent'
     // keyboard 模式：DB 回读验证（替代 OCR/截图）——验证通过才算 sent
     if (ok && this.method === 'keyboard') {
@@ -641,12 +656,15 @@ export class SenderService {
 
     let sent = 0
     let failed = 0
+    let deferred = 0
     for (const entry of batch) {
       const r = await this.sendEntry(entry, gate.tookFocus)
       if (r.action === 'sent' || r.action === 'dry_run') sent += 1
+      else if (r.action === 'deferred') deferred += 1
       else failed += 1
     }
-    return { action: failed > 0 ? 'failed' : 'sent', processed: sent + failed }
+    if (deferred > 0 && failed === 0) return { action: 'deferred', processed: sent + deferred }
+    return { action: failed > 0 ? 'failed' : 'sent', processed: sent + failed + deferred }
   }
 
   /**

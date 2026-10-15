@@ -194,16 +194,47 @@ test('dry_run：键序到定位会话为止（不粘贴消息不回车），条�
 const savedClipboardPatches = {
   osascriptOk: (step) => true,
 }
-test('AX 窗口读取失败 → fail-closed：不点击不敲键，attempts 计数不回读', async () => {
+test('熄屏/锁屏（AX 窗口读取失败）→ 环境等待：fail-closed 不点击不敲键，attempts 不增、保持 pending、下轮可重试', async () => {
   const env = makeEnv({ osascriptOk: (step) => step !== 'ax:window' })
-  env.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
+  const e = env.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
   const r = await env.sender.processOnce()
-  assert.equal(r.action, 'failed')
+  assert.equal(r.action, 'deferred', '环境不可用 = 等待而非失败')
   const seq = env.steps.map((s) => (s.kind === 'sleep' ? `sleep:${s.ms}` : s.kind === 'spawn' ? 'spawn' : s.step))
   assert.ok(!seq.some((s) => String(s).startsWith('click')), '坐标未知绝不盲点')
   assert.ok(!seq.includes('key:cmd+v') && !seq.includes('key:return'), '后续键序全部中止')
   assert.equal(env.steps.filter((s) => s.kind === 'spawn').length, 0, '不回读')
+  const after = readOutbox(env.dir).find((x) => x.id === e.id)
+  assert.equal(after.status, 'pending', '保持 pending')
+  assert.equal(after.attempts ?? 0, 0, '不计 attempts')
+  // 审计行注明 deferred
+  const audit = readAudit(env.dir)
+  assert.equal(audit[0].result, 'screen_locked_deferred')
+  assert.equal(audit[0].deferred, true)
+  // 下轮环境恢复 → 正常发送（不熔断，无 attempts 损耗）
+  env.osascriptOk = () => true
+  env.lastFeature = `#l${e.id.replace(/[^0-9a-zA-Z]/g, '').slice(0, 8)}`
+  const r2 = await env.sender.processOnce()
+  assert.equal(r2.action, 'sent', '解锁后自动恢复')
+  assert.equal(readOutbox(env.dir).find((x) => x.id === e.id).status, 'sent')
   rmSync(env.dir, { recursive: true, force: true })
+})
+
+test('dry_run 熄屏同样挂起（deferred 不计 attempts 不转 dry_run）；环境可读但回读失败仍 attempts+1（既有语义）', async () => {
+  const env = makeEnv({ dryRun: true, osascriptOk: (step) => step !== 'ax:window' })
+  const e = env.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
+  const r = await env.sender.processOnce()
+  assert.equal(r.action, 'deferred')
+  assert.equal(readOutbox(env.dir).find((x) => x.id === e.id).status, 'pending')
+  assert.equal(readOutbox(env.dir).find((x) => x.id === e.id).attempts ?? 0, 0)
+  // 环境可读但 DB 回读未命中 → 真实失败，attempts+1（既有语义不变）
+  const env2 = makeEnv({ dbReadResult: { code: 0, stdout: '{"messages":[{"content":"别的消息"}]}', stderr: '' } })
+  const e2 = env2.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
+  await env2.sender.processOnce()
+  const after2 = readOutbox(env2.dir).find((x) => x.id === e2.id)
+  assert.equal(after2.status, 'pending')
+  assert.equal(after2.attempts, 1, '真实失败计 attempts')
+  rmSync(env.dir, { recursive: true, force: true })
+  rmSync(env2.dir, { recursive: true, force: true })
 })
 
 test('AX 双读坐标不一致（空间切换布局变动中）→ 以第二次读取为准点击', async () => {
@@ -221,18 +252,18 @@ test('AX 双读坐标不一致（空间切换布局变动中）→ 以第二次�
   rmSync(env.dir, { recursive: true, force: true })
 })
 
-test('AX 窗口尺寸异常（<200px 疑似动画中间态）→ fail-closed：不点击不敲键 attempts+1', async () => {
+test('AX 窗口尺寸异常（<200px 疑似动画中间态）→ 环境等待：不点击不敲键，deferred 不计 attempts', async () => {
   for (const bad of ['0, 34, 150, 1007', '0, 34, 856, 100']) {
     const env = makeEnv({ dryRun: true, axWindowOut: bad })
     const e = env.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
     const r = await env.sender.processOnce()
-    assert.equal(r.action, 'failed')
+    assert.equal(r.action, 'deferred', `${bad}：环境类异常挂起等待`)
     const seq = env.steps.map((s) => (s.kind === 'sleep' ? `sleep:${s.ms}` : s.kind === 'spawn' ? 'spawn' : s.step))
     assert.ok(!seq.some((s) => String(s).startsWith('click')), `${bad}：绝不盲点`)
     assert.ok(!seq.includes('key:cmd+v') && !seq.includes('key:return'), '后续键序全部中止')
     const after = readOutbox(env.dir).find((x) => x.id === e.id)
     assert.equal(after.status, 'pending')
-    assert.equal(after.attempts, 1, 'fail-closed 计 attempts，下轮再试')
+    assert.equal(after.attempts ?? 0, 0, '环境类 deferred 不计 attempts')
     rmSync(env.dir, { recursive: true, force: true })
   }
 })
