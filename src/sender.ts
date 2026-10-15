@@ -220,6 +220,49 @@ export function defaultSystemIdleSec(): Promise<number> {
   })
 }
 
+/** 秒级字符串时间戳 → ms（非法返回 null）；兼容 number / 数字字符串 / 'YYYY-MM-DD HH:MM:SS' 本地时间 */
+function parseCreateTimeMs(v: unknown): number | null {
+  if (typeof v === 'number' && Number.isFinite(v)) return v > 1e12 ? Math.round(v) : Math.round(v * 1000)
+  if (typeof v === 'string') {
+    const n = Number(v)
+    if (v.trim() !== '' && Number.isFinite(n)) return n > 1e12 ? Math.round(n) : Math.round(n * 1000)
+    const m = /(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/.exec(v)
+    if (m) return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]), Number(m[6])).getTime()
+  }
+  return null
+}
+
+/**
+ * 回读候选判定（抗干扰双重过滤）：签名（#l<id8>）+ 时间窗（create_time ≥ transmittedAt-60s）。
+ * - 宽窗口 --limit 30 下，用户随后的消息/文件不会挤出签名；
+ * - 用户更早的历史消息/文件（无签名或时间早于发送时刻）天然排除；
+ * - CLI 未返回可解析 create_time 时退化为纯签名匹配（旧版 CLI 兼容）。
+ * 返回命中消息的 server_id（缺失则 undefined），未命中返回 null。
+ */
+function matchVerifyCandidate(stdout: string, feature: string, transmittedAt: number): string | undefined | null {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(stdout)
+  } catch {
+    // 纯文本输出兜底：含签名即命中（无法做时间窗过滤）
+    return stdout.includes(feature) ? undefined : null
+  }
+  const msgs = (parsed as { messages?: unknown })?.messages
+  if (!Array.isArray(msgs)) return stdout.includes(feature) ? undefined : null
+  const floor = transmittedAt > 0 ? transmittedAt - 60_000 : 0
+  for (const m of msgs) {
+    if (typeof m !== 'object' || m === null) continue
+    const rec = m as Record<string, unknown>
+    const content = typeof rec.content === 'string' ? rec.content : typeof rec.text === 'string' ? rec.text : ''
+    if (!content.includes(feature)) continue
+    const ct = parseCreateTimeMs(rec.create_time ?? rec.createTime ?? rec.ts)
+    if (ct !== null && ct < floor) continue // 陈旧误配：签名在但消息早于发送时刻
+    const sid = rec.server_id ?? rec.serverId ?? rec.msgSvrId
+    return typeof sid === 'string' || typeof sid === 'number' ? String(sid) : undefined
+  }
+  return null
+}
+
 const OSC_ACTIVATE = 'tell application "WeChat" to activate'
 const OSC_KEY_CMD_V = 'tell application "System Events" to keystroke "v" using command down'
 const OSC_KEY_RETURN = 'tell application "System Events" to key code 36'
@@ -483,7 +526,7 @@ export class SenderService {
       this.audit({ id, kind: entry.kind, result: tookFocus ? 'take_focus_sent' : 'sent', attempts, method: this.method })
       return { action: 'sent' }
     }
-    return this.verifyTransmitted(entry, id, feature, attempts, tookFocus)
+    return this.verifyTransmitted(entry, id, feature, attempts, tookFocus, this.now())
   }
 
   /**
@@ -497,19 +540,22 @@ export class SenderService {
     feature: string,
     attempts: number,
     tookFocus = false,
+    transmittedAt = 0,
   ): Promise<{ action: 'sent' | 'failed' | 'deferred' }> {
     let verified = false
     let readBroken = false
+    let serverId: string | undefined
     for (let attempt = 1; attempt <= this.verifyRetries; attempt++) {
       await this.sleep(this.verifyDelayMs)
       const v = await this.runCommandFn(this.sourcePython, [
         join(this.sourceToolDir, 'wechat_db.py'),
         '--db-root', this.sourceDbRoot,
         '--key-file', join(this.sourceToolDir, '.wechat-local/keys.json'),
-        'read', '--chat-id', 'filehelper', '--limit', '3',
+        'read', '--chat-id', 'filehelper', '--limit', '30', // 宽窗口：用户随后的消息不会把签名挤出 top-3
       ])
       if (v.code !== 0) { readBroken = true; break }
-      if (v.stdout.includes(feature)) { verified = true; break }
+      const hit = matchVerifyCandidate(v.stdout, feature, transmittedAt)
+      if (hit !== null) { verified = true; serverId = hit; break }
     }
     if (readBroken) {
       // 回读 CLI 失败 = 验证环境问题：保持 sent_pending_verify 绝不重发，只累计验证轮数
@@ -524,9 +570,10 @@ export class SenderService {
       return { action: 'deferred' }
     }
     if (verified) {
-      this.options.outbox.updateSendState(id, { status: 'sent' })
-      this.audit({ id, kind: entry.kind, result: tookFocus ? 'take_focus_sent' : 'sent', attempts, method: this.method })
-      this.options.logger.info(`sender: sent id=${id} kind=${entry.kind}${tookFocus ? ' (take_focus)' : ''} (method=${this.method}, db_verified, content not logged)`)
+      // 证据链：#l<id8> 签名（自造）+ server_id（官方送达回执）+ transmittedAt + sentAt
+      this.options.outbox.updateSendState(id, { status: 'sent', serverId, sentAt: this.now() })
+      this.audit({ id, kind: entry.kind, result: tookFocus ? 'take_focus_sent' : 'sent', attempts, method: this.method, serverId })
+      this.options.logger.info(`sender: sent id=${id} kind=${entry.kind}${tookFocus ? ' (take_focus)' : ''} (method=${this.method}, db_verified${serverId ? ', server_id recorded' : ''}, content not logged)`)
       return { action: 'sent' }
     }
     // P0：回读穷尽未命中——消息可能发进了非 filehelper 会话。终态不再重试（重试可能再次误发）。

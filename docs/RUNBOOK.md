@@ -360,6 +360,10 @@ Accessibility Inspector 确认元素层级）。**实证结论回填此处：___
   保持 `sent_pending_verify` + `verifyAttempts` 累计（≥5 轮 error 级人工介入告警）。只有
   **发送前**失败（activate 失败/环境不可用等）才保持 pending 重试整条发送。状态机：
   `pending → sent_pending_verify → sent | failed_wrong_target`；`verify_read_deferred` 自环；
+  回读验证抗干扰：文件传输助手为**共享通道**（用户自己也会传文件/发消息），验证采用
+  「签名 + 时间窗」双重过滤——`--limit 30` 宽窗口 + 必须含 `#l<id8>` 特征串 + `create_time ≥
+  transmittedAt-60s`；命中时抓取 `server_id`（微信服务器消息 id）写入条目作送达回执，证据链 =
+  签名（自造）+ server_id（官方）+ transmittedAt + sentAt；
 - **熄屏/锁屏 = 环境等待（非失败）**：AX 读不到微信窗口（熄屏、锁屏、主窗口关闭）时本轮标记
   `screen_locked_deferred`——**不计 attempts、状态保持 pending**，下轮消费周期自动重试，
   无限等待直到环境恢复（解锁后自动恢复发送，无 attempts 损耗、不熔断）；

@@ -38,6 +38,10 @@ export interface OutboxEntry {
   transmittedAt?: number
   /** sent_pending_verify 状态下的回读验证轮数（CLI 报错累计；≥5 转人工告警） */
   verifyAttempts?: number
+  /** 送达回执：微信服务器消息 id（回读验证命中时抓取；比自造 uuid 更硬的送达证据） */
+  serverId?: string
+  /** 回读验证命中（置 sent）的时刻 */
+  sentAt?: number
 }
 
 /** 生命周期状态：pending → sent_pending_verify → sent 或 failed_wrong_target；dry_run、skipped、failed 为旁路终态（sender worker 推进） */
@@ -108,7 +112,7 @@ export class Outbox {
    * 发送 worker 专用：按 id 推进条目生命周期状态（pending → sent / dry_run / skipped / failed）。
    * 原地重写 outbox.jsonl（逐行 JSON，命中行打补丁）；找不到 id / 写失败返回 false。
    */
-  updateSendState(id: string, patch: { status: OutboxStatus; attempts?: number; transmittedAt?: number; verifyAttempts?: number }): boolean {
+  updateSendState(id: string, patch: { status: OutboxStatus; attempts?: number; transmittedAt?: number; verifyAttempts?: number; serverId?: string; sentAt?: number }): boolean {
     if (id === '') return false
     const raw = this.options.store.readText(OUTBOX_REL)
     if (!raw) return false

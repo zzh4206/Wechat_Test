@@ -153,7 +153,7 @@ test('键序正确性（真发）：简化键序（activate→粘贴→回车）
     join('/fake/macos-wechat-export', 'wechat_db.py'),
     '--db-root', '/fake/wechat-db-storage',
     '--key-file', join('/fake/macos-wechat-export', '.wechat-local/keys.json'),
-    'read', '--chat-id', 'filehelper', '--limit', '3',
+    'read', '--chat-id', 'filehelper', '--limit', '30', // 宽窗口：共享通道抗干扰
   ])
   // 验证延迟在回读前
   const sleepIdx = seq.indexOf(`sleep:${VERIFY_DELAY_MS}`)
@@ -463,5 +463,77 @@ test('审计零正文 + sendTestSample keyboard 路径 dry_run 占用审计（�
   assert.equal(r.action, 'dry_run')
   const raw = JSON.stringify(readAudit(env.dir))
   assert.ok(!raw.includes('测试样例') && !raw.includes('发送链路样例'))
+  rmSync(env.dir, { recursive: true, force: true })
+})
+
+// —— 回读验证抗干扰（签名 + 时间窗双重过滤）——
+
+const NOW_MS = new Date(2026, 9, 15, 12, 0).getTime()
+
+function dbMsg(content, createTimeSec, serverId) {
+  return { content, create_time: createTimeSec, server_id: serverId }
+}
+
+test('抗干扰①：签名被用户消息挤出 top-3 → 宽窗口 --limit 30 仍命中，且抓取 server_id', async () => {
+  const env = makeEnv({
+    // 用户随后发了 10 条消息；我们的签名在 resp 的最后一条（create_time = 发送时刻 +2s）
+    dbReadResult: {
+      code: 0,
+      stdout: JSON.stringify({
+        messages: [
+          ...Array.from({ length: 10 }, (_, i) => dbMsg(`用户闲聊 ${i}`, Math.floor(NOW_MS / 1000) + 5 + i, `u${i}`)),
+        ],
+      }),
+      stderr: '',
+    },
+  })
+  const e = env.outbox.appendOutbox({ kind: 'daily', title: '日报', body: 'b', evidence_ref: 'x' })
+  env.dbReadResult.stdout = JSON.stringify({
+    messages: [
+      ...Array.from({ length: 10 }, (_, i) => dbMsg(`用户闲聊 ${i}`, Math.floor(NOW_MS / 1000) + 5 + i, `u${i}`)),
+      dbMsg(`【lurker】日报 x #l${e.id.replace(/[^0-9a-zA-Z]/g, '').slice(0, 8)}`, Math.floor(NOW_MS / 1000) + 2, '987654321'),
+    ],
+  })
+  const r = await env.sender.processOnce()
+  assert.equal(r.action, 'sent', '签名在 top-3 之外仍命中')
+  const after = readOutbox(env.dir).find((x) => x.id === e.id)
+  assert.equal(after.status, 'sent')
+  assert.equal(after.serverId, '987654321', '送达回执 server_id 落盘')
+  assert.ok(after.sentAt > 0)
+  const audit = readAudit(env.dir).find((a) => a.result === 'sent')
+  assert.equal(audit.serverId, '987654321', '审计记 serverId（元数据）')
+  rmSync(env.dir, { recursive: true, force: true })
+})
+
+test('抗干扰②：窗口内用户自己的旧消息（无签名、时间早于 transmittedAt）→ 不误匹配', async () => {
+  const env = makeEnv({
+    dbReadResult: {
+      code: 0,
+      stdout: JSON.stringify({
+        messages: [
+          dbMsg('用户更早发的消息', Math.floor(NOW_MS / 1000) - 3600, 'old1'),
+          dbMsg('包含【lurker】但非本次签名', Math.floor(NOW_MS / 1000) - 60, 'old2'),
+        ],
+      }),
+      stderr: '',
+    },
+  })
+  const e = env.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
+  const r = await env.sender.processOnce()
+  assert.equal(r.action, 'failed', '无签名命中 → 穷尽后 failed')
+  assert.equal(readOutbox(env.dir).find((x) => x.id === e.id).status, 'failed_wrong_target')
+  rmSync(env.dir, { recursive: true, force: true })
+})
+
+test('抗干扰③：签名命中但 create_time 早于 transmittedAt-60s → 陈旧误配不算命中', async () => {
+  const env = makeEnv({})
+  const e = env.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
+  const stale = JSON.stringify({
+    messages: [dbMsg(`旧的同签名消息 #l${e.id.replace(/[^0-9a-zA-Z]/g, '').slice(0, 8)}`, Math.floor(NOW_MS / 1000) - 7200, 'stale1')],
+  })
+  env.dbReadResult = { code: 0, stdout: stale, stderr: '' }
+  const r = await env.sender.processOnce()
+  assert.equal(r.action, 'failed', '陈旧签名不作为验证通过')
+  assert.equal(readOutbox(env.dir).find((x) => x.id === e.id).status, 'failed_wrong_target')
   rmSync(env.dir, { recursive: true, force: true })
 })
