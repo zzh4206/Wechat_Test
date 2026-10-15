@@ -285,21 +285,24 @@ rm -rf /path/to/macos-wechat-export/.wechat-local
 > 验证从截图/OCR 换成 **wechat_db.py 只读回读**。发送原语抽为可替换接口 `SendPrimitive`：
 > `sendMethod: 'keyboard'`（默认）/ `'wechat-ui'`（旧实现保留在 `WechatUiSender`，可随时切回）。
 
-### 发送原语键序（KeyboardSender，13 步）
+### 发送原语键序（KeyboardSender，14 步——2026-10-15 08:03 人工目视实证通过）
 
 1. osascript 激活微信（`tell application "WeChat" to activate`）+ 确认前台（非前台直接放弃，防按键落到别的应用）；
 2. 保存当前剪贴板内容（发送后恢复——礼貌且防用户数据丢失）；
-3. 剪贴板设为 `文件传输助手`；
-4. System Events 按键：**Cmd+F**（微信搜索）；
-5. System Events 按键：**Cmd+V**（粘贴搜索词——中文走剪贴板，避开输入法）；
-6. 延迟 800ms（搜索结果渲染）；
-7. System Events 按键：**Return**（选中第一个结果 = 打开文件传输助手会话）；
-8. 延迟 500ms；
-9. 剪贴板设为消息文本（`【lurker】… + #l<id 前 8 位>` 特征串）；
-10. System Events 按键：**Cmd+V**（粘贴消息）；
-11. 延迟 300ms；
-12. System Events 按键：**Return**（发送）；
+3. System Events 按键：**Esc（key code 53）** 清残留弹层，延迟 300ms；
+4. **AX 读 window 1 的 position {wx,wy} 与 size {ww,wh}**（动态——窗口移动缩放自适应；读取失败 fail-closed 放弃键序，不盲点）；
+5. System Events：**click at {wx + ww div 8, wy + wh div 40 + 12}**（左上角搜索框区域；实证窗口 0,34 856x1007 时点 107,71 命中），延迟 500ms；
+6. 剪贴板设为 `文件传输助手`；
+7. System Events 按键：**Cmd+V**（粘贴搜索词——中文走剪贴板，避开输入法）；
+8. **延迟 1200ms**（下拉结果渲染——实证 0.8s 不够，Return 落空）；
+9. System Events 按键：**↓（key code 125）** 选中第一个结果（双保险），延迟 300ms；
+10. System Events 按键：**Return（key code 36）** 跳转会话，延迟 500ms；
+11. **【dry_run 到此为止】**；
+12. 剪贴板设为消息文本（`【lurker】… + #l<id 前 8 位>` 特征串）→ **Cmd+V** → 延迟 300ms → **Return**（发送）；
 13. 恢复剪贴板原内容（失败仅 warn，不阻塞）。
+
+> **Cmd+F 方案废除**（2026-10-15 实测）：Cmd+F 打开的是"搜一搜"网页面板而非聊天搜索框。
+> 旧 spike 脚本 `scripts/spike-search-shortcut.sh` 仅留档，键位以本节实证键序为准。
 
 ### 验证：DB 回读（替代 OCR/截图——TCC 收益）
 
@@ -316,9 +319,9 @@ rm -rf /path/to/macos-wechat-export/.wechat-local
 - **辅助功能**（System Events 按键 + osascript 激活/查询前台）——**唯一必需项**；
 - ~~屏幕录制~~（不再需要：验证走 DB 回读，无截图）。
 
-### 真实键位实证（待回填）
+### 真实键位实证（已回填 2026-10-15）
 
-微信 mac 4.x 搜索快捷键暂按 **Cmd+F** 设计（wechat-ui 时代参考 + Windows 版 Ctrl+F 的 mac 映射）。
+定位改用**点击搜索框 + ↓ 选中**实证键序（见上节）；早期 Cmd+F 假设已否决（wechat-ui 时代参考 + Windows 版 Ctrl+F 的 mac 映射）。
 spike 脚本：`scripts/spike-search-shortcut.sh`（会真实敲键，**由 PM/用户在终端代跑**，
 agent 不自主执行）——自动依次试 Cmd+F / Ctrl+F / Cmd+Ctrl+F，输出各段 AXFocusedUIElement，
 哪段焦点变为搜索框即为真实键位。若全不中，脚本尾附 AX 路径备选（免按键定位，需现场用
@@ -329,7 +332,7 @@ Accessibility Inspector 确认元素层级）。**实证结论回填此处：___
 1. TCC"辅助功能"授权 + 配置 `sourceToolDir`/`sourceDbRoot`（回读验证必需）；
 2. 配置保持 `senderEnabled: true`、`sendDryRun: true`（默认），重启插件；
 3. **第一段（干跑）**：触发消费（或调 `groupLurker.sender.sendTestSample()`）——keyboard 模式
-   dry_run **执行键序到第 8 步为止**（激活 → 搜索 → 选中第一个结果 → 停），**不粘贴消息不回车**。
+   dry_run **执行键序到第 11 步为止**（激活 → 点击搜索框 → 粘贴 → ↓ → Return 定位会话 → 停），**不粘贴消息不回车**。
    人工确认微信确实定位到"文件传输助手"会话（这是本方案最重要的安全特性：干跑即可验证搜索定位）；
 4. **第二段（真发）**：确认定位正确后配置 `sendDryRun: false` 重启，再跑一次——文件传输助手收到
    `【lurker】…` 消息，且 `audit/sender.jsonl` 出现 `result:'sent', method:'keyboard'` 行（DB 回读已验证）；

@@ -1,5 +1,5 @@
 // keyboard-sender.test.mjs —— 发送原语替换（2026-10-15）：wx-chatbot 式键盘模拟（全离线 mock）。
-// 覆盖：13 步键序正确性、dry_run 停在第 8 步（不粘贴消息不回车）、DB 回读验证成功/失败、
+// 覆盖：14 步实证键序正确性、dry_run 停在定位（不粘贴消息不回车）、DB 回读验证成功/失败、
 //       剪贴板保存恢复（含恢复失败不阻塞）、交互闸（用户空闲 <10s 跳过）、
 //       缺 sourceToolDir fail-closed、非 filehelper 拒发、wechat-ui 切回、频控/attempts/审计、特征串构造。
 import test from 'node:test'
@@ -8,7 +8,7 @@ import { mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
-const { SenderService, appendFeature, buildSendText, MAX_TEXT_CHARS, ALLOWED_CHANNELS, SENDER_AUDIT_REL, MAX_ATTEMPTS, KEY_DELAY_SEARCH_MS, KEY_DELAY_OPEN_MS, KEY_DELAY_PASTE_MS, VERIFY_DELAY_MS, IDLE_SKIP_BELOW_SEC } = await import('../lib/sender.js')
+const { SenderService, appendFeature, buildSendText, MAX_TEXT_CHARS, ALLOWED_CHANNELS, SENDER_AUDIT_REL, MAX_ATTEMPTS, KEY_DELAY_SEARCH_MS, KEY_DELAY_OPEN_MS, KEY_DELAY_PASTE_MS, KEY_DELAY_CLICK_MS, KEY_DELAY_DOWN_MS, VERIFY_DELAY_MS, IDLE_SKIP_BELOW_SEC } = await import('../lib/sender.js')
 const { Outbox, OUTBOX_REL } = await import('../lib/outbox.js')
 const { Store } = await import('../lib/store.js')
 
@@ -24,7 +24,10 @@ function stepOf(call) {
   if (s.includes('to activate')) return 'activate'
   if (s === 'the clipboard as «class UTF8»') return 'clipboard_save'
   if (s.startsWith('set the clipboard to')) return `clipboard_set:${JSON.parse(s.slice('set the clipboard to '.length))}`
-  if (s.includes('keystroke "f" using command down')) return 'key:cmd+f'
+  if (s.includes('key code 53')) return 'key:esc'
+  if (s.includes('key code 125')) return 'key:down'
+  if (s.includes('click at')) return `click:${s.match(/\{(\d+), (\d+)\}/)?.slice(1).join(',')}`
+  if (s.includes('get {position, size} of window 1')) return 'ax:window'
   if (s.includes('keystroke "v" using command down')) return 'key:cmd+v'
   if (s.includes('key code 36')) return 'key:return'
   return `other:${s}`
@@ -63,7 +66,8 @@ function makeEnv(overrides = {}) {
         steps.push({ kind: 'osascript', step })
         const ok = typeof env.osascriptOk === 'function' ? env.osascriptOk(step) : env.osascriptOk
         // clipboard_save 返回可解析的剪贴板快照（模拟剪贴板原有文本 "saved-content"）
-        const stdout = step === 'clipboard_save' ? '«class UTF8»"saved-content"' : 'ok'
+        // ax:window 返回实证窗口形态 position 0,34 + size 856x1007
+        const stdout = step === 'clipboard_save' ? '«class UTF8»"saved-content"' : step === 'ax:window' ? '0, 34, 856, 1007' : 'ok'
         return Promise.resolve(ok ? { code: 0, stdout, stderr: '' } : { code: 1, stdout: '', stderr: 'err' })
       }
       steps.push({ kind: 'spawn', file, args })
@@ -101,7 +105,7 @@ test('appendFeature：特征串永远在场且总长 ≤200', () => {
   assert.ok(long.text.length <= MAX_TEXT_CHARS)
 })
 
-test('键序正确性（真发）：13 步顺序 + 延迟 + DB 回读验证 → sent', async () => {
+test('键序正确性（真发）：14 步实证键序 + 延迟 + DB 回读验证 → sent', async () => {
   const env = makeEnv()
   const e = env.outbox.appendOutbox({ kind: 'daily', title: '日报', body: '关键判断', evidence_ref: 'r.md' })
   env.lastFeature = `#l${e.id.replace(/[^0-9a-zA-Z]/g, '').slice(0, 8)}`
@@ -111,17 +115,22 @@ test('键序正确性（真发）：13 步顺序 + 延迟 + DB 回读验证 → 
   assert.deepEqual(seq, [
     'activate',
     'clipboard_save',
+    'key:esc', // 3. Esc 清残留弹层
+    'ax:window', // 4. AX 读窗口 position/size
+    'click:107,71', // 5. 实证坐标：0+856/8=107, 34+1007/40+12=71
+    `sleep:${KEY_DELAY_CLICK_MS}`,
     'clipboard_set:文件传输助手',
-    'key:cmd+f',
     'key:cmd+v',
-    `sleep:${KEY_DELAY_SEARCH_MS}`,
-    'key:return',
+    `sleep:${KEY_DELAY_SEARCH_MS}`, // 实证 1.2s（0.8s 下拉未渲染完）
+    'key:down', // 9. ↓ 选中第一个结果
+    `sleep:${KEY_DELAY_DOWN_MS}`,
+    'key:return', // 11. 回车跳转会话
     `sleep:${KEY_DELAY_OPEN_MS}`,
     `clipboard_set:【lurker】日报 关键判断 ${env.lastFeature}`,
     'key:cmd+v',
     `sleep:${KEY_DELAY_PASTE_MS}`,
     'key:return',
-    'clipboard_set:saved-content', // 第 13 步：恢复剪贴板
+    'clipboard_set:saved-content', // 恢复剪贴板
     `sleep:${VERIFY_DELAY_MS}`,
     'spawn', // wechat_db.py read（DB 回读验证）
   ])
@@ -140,7 +149,7 @@ test('键序正确性（真发）：13 步顺序 + 延迟 + DB 回读验证 → 
   rmSync(env.dir, { recursive: true, force: true })
 })
 
-test('dry_run：键序到第 8 步为止（不粘贴消息不回车），条目转 dry_run，日志标"停在发送前"', async () => {
+test('dry_run：键序到定位会话为止（不粘贴消息不回车），条目转 dry_run，日志标"停在发送前"', async () => {
   const env = makeEnv({ dryRun: true, logger: recordingLogger() })
   const e = env.outbox.appendOutbox({ kind: 'daily', title: 't', body: '机密正文', evidence_ref: 'r.md' })
   const r = await env.sender.processOnce()
@@ -149,13 +158,18 @@ test('dry_run：键序到第 8 步为止（不粘贴消息不回车），条目�
   assert.deepEqual(seq, [
     'activate',
     'clipboard_save',
+    'key:esc',
+    'ax:window',
+    'click:107,71',
+    `sleep:${KEY_DELAY_CLICK_MS}`,
     'clipboard_set:文件传输助手',
-    'key:cmd+f',
     'key:cmd+v',
     `sleep:${KEY_DELAY_SEARCH_MS}`,
+    'key:down',
+    `sleep:${KEY_DELAY_DOWN_MS}`,
     'key:return',
     `sleep:${KEY_DELAY_OPEN_MS}`,
-    'clipboard_set:saved-content', // 第 13 步：恢复剪贴板
+    'clipboard_set:saved-content', // dry_run 尾部：恢复剪贴板
   ])
   assert.equal(readOutbox(env.dir).find((x) => x.id === e.id).status, 'dry_run')
   assert.ok(env.logger.logs.info.some((m) => m.includes('停在发送前')))
@@ -167,6 +181,18 @@ test('dry_run：键序到第 8 步为止（不粘贴消息不回车），条目�
 const savedClipboardPatches = {
   osascriptOk: (step) => true,
 }
+test('AX 窗口读取失败 → fail-closed：不点击不敲键，attempts 计数不回读', async () => {
+  const env = makeEnv({ osascriptOk: (step) => step !== 'ax:window' })
+  env.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
+  const r = await env.sender.processOnce()
+  assert.equal(r.action, 'failed')
+  const seq = env.steps.map((s) => (s.kind === 'sleep' ? `sleep:${s.ms}` : s.kind === 'spawn' ? 'spawn' : s.step))
+  assert.ok(!seq.some((s) => String(s).startsWith('click')), '坐标未知绝不盲点')
+  assert.ok(!seq.includes('key:cmd+v') && !seq.includes('key:return'), '后续键序全部中止')
+  assert.equal(env.steps.filter((s) => s.kind === 'spawn').length, 0, '不回读')
+  rmSync(env.dir, { recursive: true, force: true })
+})
+
 test('剪贴板保存恢复：真发后恢复原内容；保存失败不恢复也不报错', async () => {
   // 保存成功 → dry_run 尾部恢复
   const env = makeEnv({ dryRun: true })

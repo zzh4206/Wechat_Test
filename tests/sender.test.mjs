@@ -18,11 +18,13 @@ function recordingLogger() {
   return { logs, info: (m) => logs.info.push(m), warn: (m) => logs.warn.push(m), error: (m) => logs.error.push(m) }
 }
 
+const FIXED_NOW = () => new Date(2026, 9, 14, 12, 0).getTime()
 function makeEnv(overrides = {}) {
   const dir = resolve(mkdtempSync(join(tmpdir(), 'sender-')))
   const store = new Store(dir, { warn() {}, error() {} })
   store.ensureDir('.')
-  const outbox = new Outbox({ store, now: () => Date.now() })
+  // Outbox 与 SenderService 必须同一时钟，否则频控的"今日已发"永远对不上（时点不一致 = quota 永不触发）
+  const outbox = new Outbox({ store, now: overrides.now ?? FIXED_NOW })
   const spawnCalls = []
   const env = {
     dir, store, outbox, spawnCalls,
@@ -40,7 +42,7 @@ function makeEnv(overrides = {}) {
     maxSendsPerDay: overrides.maxSendsPerDay ?? 20,
     wechatUiPath: overrides.wechatUiPath ?? 'wechat-ui',
     composerTop: overrides.composerTop ?? 0.7,
-    now: overrides.now ?? (() => new Date(2026, 9, 14, 12, 0).getTime()),
+    now: overrides.now ?? FIXED_NOW,
     runCommand: (file, args) => {
       spawnCalls.push({ file, args })
       return Promise.resolve(overrides.spawnResult ?? { code: 0, stdout: 'sent_ui_verified', stderr: '' })

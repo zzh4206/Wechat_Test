@@ -3,9 +3,12 @@
  *
  * 2026-10-15 发送原语替换（用户否决 wechat-ui UI 校准方案——要求常驻聊天窗口太麻烦）：
  * - 发送原语抽为可替换接口 SendPrimitive；两实现：
- *   · KeyboardSender（默认）：wx-chatbot 式键盘模拟（macOS 键位）——激活微信 → 保存剪贴板 →
- *     剪贴板写"文件传输助手" → Cmd+F 搜索 → Cmd+V 粘贴搜索词 → Return 选中第一个结果 →
- *     剪贴板写消息 → Cmd+V → Return 发送 → 恢复剪贴板。中文全部走剪贴板，避开输入法；
+ *   · KeyboardSender（默认）：wx-chatbot 式键盘模拟（macOS 键位，14 步实证键序 2026-10-15
+ *     08:03 人工目视实证通过）——激活微信 → Esc 清弹层 → AX 读窗口 position/size 动态算
+ *     搜索框坐标 → 点击左上角搜索框 → 剪贴板写"文件传输助手" → Cmd+V 粘贴 → 延迟 1.2s
+ *     （下拉渲染，0.8s 实测不够）→ ↓ 选中第一个结果 → Return 跳转会话 →
+ *     剪贴板写消息 → Cmd+V → Return 发送 → 恢复剪贴板。Cmd+F 方案废除（实测打开的是
+ *     搜一搜网页面板而非聊天搜索）；中文全部走剪贴板，避开输入法；
  *     不要求常驻聊天窗口（搜索即定位），TCC 只需"辅助功能"（不再需要屏幕录制——验证改用 DB 回读）；
  *   · WechatUiSender：原 wechat-ui send 实现（Config sendMethod='wechat-ui' 可切回）。
  * - 验证（KeyboardSender 真发后）：延迟 2s 用 wechat_db.py read --chat-id filehelper --limit 3
@@ -15,7 +18,7 @@
  *   · 文本策略：单行 ≤200 字符 = `【lurker】<title>` + ≤160 字摘要 + 特征串，绝不发全文；
  * - 闸门（全部保留并强化）：
  *   ① 总闸：Config senderEnabled（默认 false）+ sendDryRun（默认 true）。
- *      keyboard 模式 dry_run 执行键序到第 8 步为止（不粘贴消息不回车）——人工确认搜索定位正确，
+ *      keyboard 模式 dry_run 执行键序到第 12 步为止（不粘贴消息不回车）——人工确认搜索定位正确，
  *      是本方案最重要的安全特性；wechat-ui 模式 dry_run 照旧只记日志；
  *   ② 通道闸：仅 ALLOWED_CHANNELS；
  *   ③ 交互闸：微信前台（osascript）+ 系统空闲秒数（ioreg IOHIDSystem），空闲 <10s 视为用户
@@ -46,10 +49,12 @@ export const SUMMARY_CHARS = 160
 export const MAX_ATTEMPTS = 3
 /** 发送审计落盘相对路径（只写元数据行） */
 export const SENDER_AUDIT_REL = 'audit/sender.jsonl'
-/** 键序渲染延迟（ms）：搜索结果 / 选中会话 / 粘贴消息 */
-export const KEY_DELAY_SEARCH_MS = 800
+/** 键序渲染延迟（ms）：搜索下拉渲染（实证 0.8s 不够，必须 1.2s）/ 选中会话 / 粘贴消息 / 点击搜索框后 / ↓ 选中前 */
+export const KEY_DELAY_SEARCH_MS = 1200
 export const KEY_DELAY_OPEN_MS = 500
 export const KEY_DELAY_PASTE_MS = 300
+export const KEY_DELAY_CLICK_MS = 500
+export const KEY_DELAY_DOWN_MS = 300
 /** 真发后 DB 回读验证前的延迟（ms） */
 export const VERIFY_DELAY_MS = 2000
 /** 系统空闲低于该秒数视为用户正在操作（跳过防按键串扰） */
@@ -206,12 +211,14 @@ export function defaultSystemIdleSec(): Promise<number> {
 }
 
 const OSC_ACTIVATE = 'tell application "WeChat" to activate'
-const OSC_KEY_CMD_F = 'tell application "System Events" to keystroke "f" using command down'
+const OSC_KEY_ESC = 'tell application "System Events" to key code 53'
+const OSC_KEY_DOWN = 'tell application "System Events" to key code 125'
+const OSC_AX_WINDOW = 'tell application "System Events" to tell process "WeChat" to get {position, size} of window 1'
 const OSC_KEY_CMD_V = 'tell application "System Events" to keystroke "v" using command down'
 const OSC_KEY_RETURN = 'tell application "System Events" to key code 36'
 
 /**
- * KeyboardSender：wx-chatbot 式键盘模拟原语（macOS 键位，13 步键序）。
+ * KeyboardSender：wx-chatbot 式键盘模拟原语（macOS 键位，14 步实证键序）。
  * 全部经 osascript/System Events；中文（搜索词与消息）一律走剪贴板，避开输入法。
  */
 export class KeyboardSender implements SendPrimitive {
@@ -265,31 +272,44 @@ export class KeyboardSender implements SendPrimitive {
     }
     // 2. 保存剪贴板（发送后恢复——礼貌且防用户数据丢失）
     const saved = await this.saveClipboard()
-    // 3. 剪贴板设为"文件传输助手"
+    // 3. Esc 清残留弹层
+    await this.run(OSC_KEY_ESC)
+    // 4. AX 读窗口 position/size（动态计算搜索框点击坐标——窗口移动缩放自适应）
+    const ax = await this.run(OSC_AX_WINDOW)
+    if (ax.code !== 0) return { ok: false, stage: 'error', detail: `AX 读微信窗口 position/size 失败 code=${ax.code}——放弃键序（坐标未知不盲点）` }
+    const nums = ax.stdout.split(',').map((v) => Number(v.trim())).filter((v) => Number.isFinite(v))
+    if (nums.length < 4) return { ok: false, stage: 'error', detail: `AX 窗口数据不可解析：${JSON.stringify(ax.stdout.slice(0, 80))}` }
+    const [wx, wy, ww, wh] = nums
+    // 5. 点击左上角搜索框区域（实证：窗口 0,34 856x1007 时点 107,71 命中）
+    const cx = wx + Math.floor(ww / 8)
+    const cy = wy + Math.floor(wh / 40) + 12
+    const click = await this.run(`tell application "System Events" to click at {${cx}, ${cy}}`)
+    if (click.code !== 0) return { ok: false, stage: 'error', detail: `点击搜索框失败 code=${click.code}` }
+    // 6. 延迟 500ms
+    await this.sleep(KEY_DELAY_CLICK_MS)
+    // 7. 剪贴板设为"文件传输助手" → Cmd+V 粘贴（中文走剪贴板，避开输入法）
     await this.setClipboard(FILEHELPER_CHAT)
-    // 4. Cmd+F（微信搜索）
-    await this.run(OSC_KEY_CMD_F)
-    // 5. Cmd+V（粘贴搜索词——中文走剪贴板，避开输入法）
     await this.run(OSC_KEY_CMD_V)
-    // 6. 延迟 800ms（搜索结果渲染）
+    // 8. 延迟 1200ms（实证：0.8s 时下拉结果未渲染完，Return 落空）
     await this.sleep(KEY_DELAY_SEARCH_MS)
-    // 7. Return（选中第一个结果 = 打开文件传输助手会话）
+    // 9. ↓ 选中第一个结果（双保险）
+    await this.run(OSC_KEY_DOWN)
+    // 10. 延迟 300ms
+    await this.sleep(KEY_DELAY_DOWN_MS)
+    // 11. 回车跳转会话
     await this.run(OSC_KEY_RETURN)
-    // 8. 延迟 500ms
+    // 12. 延迟 500ms（会话打开渲染）
     await this.sleep(KEY_DELAY_OPEN_MS)
     if (input.dryRun) {
       await this.restoreClipboard(saved)
       return { ok: true, stage: 'located', detail: 'dry_run 已定位会话，停在发送前（未粘贴消息未回车）' }
     }
-    // 9. 剪贴板设为消息文本
+    // 13. 剪贴板设为消息文本 → Cmd+V → 延迟 → Return 发送
     await this.setClipboard(input.text)
-    // 10. Cmd+V（粘贴消息）
     await this.run(OSC_KEY_CMD_V)
-    // 11. 延迟 300ms
     await this.sleep(KEY_DELAY_PASTE_MS)
-    // 12. Return（发送）
     await this.run(OSC_KEY_RETURN)
-    // 13. 恢复剪贴板（失败不阻塞，warn）
+    // 14. 恢复剪贴板（失败不阻塞，warn）
     await this.restoreClipboard(saved)
     return { ok: true, stage: 'sent', detail: '键盘序列发送完成（待 DB 回读验证）' }
   }
@@ -412,7 +432,7 @@ export class SenderService {
     const { text, feature } = appendFeature(base, id)
     const attempts = (entry.attempts ?? 0) + 1
 
-    // dry_run：keyboard 模式执行键序到第 8 步（定位会话）即停——人工确认搜索定位正确；
+    // dry_run：keyboard 模式执行键序到第 12 步（定位会话）即停——人工确认搜索定位正确；
     //          wechat-ui 模式照旧只记日志/审计，不调工具。条目标 dry_run 消费掉，避免反复扫描。
     if (this.dryRun) {
       if (this.method === 'keyboard') {
