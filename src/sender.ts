@@ -55,6 +55,14 @@ export const KEY_DELAY_OPEN_MS = 500
 export const KEY_DELAY_PASTE_MS = 300
 export const KEY_DELAY_CLICK_MS = 500
 export const KEY_DELAY_DOWN_MS = 300
+/** activate 后等待（ms）：跨 Space 切换动画约 1s，等 1.5s 再读窗口坐标（实测全屏应用占一空间+微信非前台时，动画未完成读到旧空间坐标点错） */
+export const KEY_DELAY_ACTIVATE_MS = 1500
+/** AX 首读后、点击前的布局稳定等待（ms），随后重读一次 position 比对 */
+export const KEY_DELAY_REREAD_MS = 300
+/** 两次 AX position 读取差超过该像素视为布局仍在变动（以第二次为准） */
+export const AX_POSITION_TOLERANCE_PX = 5
+/** AX 读到的窗口宽/高低于该像素视为动画中间态，fail-closed 绝不盲点 */
+export const AX_MIN_DIM_PX = 200
 /** 真发后 DB 回读验证前的延迟（ms） */
 export const VERIFY_DELAY_MS = 2000
 /** 系统空闲低于该秒数视为用户正在操作（跳过防按键串扰） */
@@ -265,6 +273,8 @@ export class KeyboardSender implements SendPrimitive {
   async transmit(input: PrimitiveSendInput): Promise<PrimitiveSendResult> {
     // 1. 激活微信 + 确认前台（抢前台模式跳过确认——activate 本就是抢前台动作）
     await this.run(OSC_ACTIVATE)
+    // 1.5 等待空间切换动画完成（跨 Space ~1s，动画未完成时 AX 读到旧空间/未布局坐标 → 点错）
+    await this.sleep(KEY_DELAY_ACTIVATE_MS)
     if (!this.allowTakeFocus) {
       let front = false
       try { front = await this.isFrontmostFn() } catch { front = false }
@@ -279,8 +289,19 @@ export class KeyboardSender implements SendPrimitive {
     if (ax.code !== 0) return { ok: false, stage: 'error', detail: `AX 读微信窗口 position/size 失败 code=${ax.code}——放弃键序（坐标未知不盲点）` }
     const nums = ax.stdout.split(',').map((v) => Number(v.trim())).filter((v) => Number.isFinite(v))
     if (nums.length < 4) return { ok: false, stage: 'error', detail: `AX 窗口数据不可解析：${JSON.stringify(ax.stdout.slice(0, 80))}` }
-    const [wx, wy, ww, wh] = nums
-    // 5. 点击左上角搜索框区域（实证：窗口 0,34 856x1007 时点 107,71 命中）
+    const [wx1, wy1, ww1, wh1] = nums
+    if (ww1 < AX_MIN_DIM_PX || wh1 < AX_MIN_DIM_PX) return { ok: false, stage: 'error', detail: `AX 窗口尺寸异常 ${ww1}x${wh1}（宽/高 <${AX_MIN_DIM_PX}px，疑似 Space 切换动画中间态）——fail-closed 放弃本轮不盲点` }
+    // 4.5 双读坐标：延迟后重读一次 position——两次不一致说明布局仍在变动，以第二次为准
+    await this.sleep(KEY_DELAY_REREAD_MS)
+    const ax2 = await this.run(OSC_AX_WINDOW)
+    if (ax2.code !== 0) return { ok: false, stage: 'error', detail: `AX 复读微信窗口 position 失败 code=${ax2.code}——放弃键序（坐标不稳定不盲点）` }
+    const nums2 = ax2.stdout.split(',').map((v) => Number(v.trim())).filter((v) => Number.isFinite(v))
+    if (nums2.length < 4) return { ok: false, stage: 'error', detail: `AX 复读窗口数据不可解析：${JSON.stringify(ax2.stdout.slice(0, 80))}` }
+    const [wx, wy, ww, wh] = nums2
+    if (ww < AX_MIN_DIM_PX || wh < AX_MIN_DIM_PX) return { ok: false, stage: 'error', detail: `AX 复读窗口尺寸异常 ${ww}x${wh}（疑似动画中间态）——fail-closed 放弃本轮不盲点` }
+    const unstable = Math.abs(wx - wx1) > AX_POSITION_TOLERANCE_PX || Math.abs(wy - wy1) > AX_POSITION_TOLERANCE_PX
+    if (unstable) this.warn?.(`sender[keyboard]: AX 双读坐标不一致（首读 ${wx1},${wy1} → 复读 ${wx},${wy}，布局变动中）——以第二次读取为准点击`)
+    // 5. 点击左上角搜索框区域（实证：窗口 0,34 856x1007 时点 107,71 命中；坐标取自双读的第二次）
     const cx = wx + Math.floor(ww / 8)
     const cy = wy + Math.floor(wh / 40) + 12
     const click = await this.run(`tell application "System Events" to click at {${cx}, ${cy}}`)

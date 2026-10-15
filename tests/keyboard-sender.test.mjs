@@ -8,7 +8,7 @@ import { mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
-const { SenderService, appendFeature, buildSendText, MAX_TEXT_CHARS, ALLOWED_CHANNELS, SENDER_AUDIT_REL, MAX_ATTEMPTS, KEY_DELAY_SEARCH_MS, KEY_DELAY_OPEN_MS, KEY_DELAY_PASTE_MS, KEY_DELAY_CLICK_MS, KEY_DELAY_DOWN_MS, VERIFY_DELAY_MS, IDLE_SKIP_BELOW_SEC } = await import('../lib/sender.js')
+const { SenderService, appendFeature, buildSendText, MAX_TEXT_CHARS, ALLOWED_CHANNELS, SENDER_AUDIT_REL, MAX_ATTEMPTS, KEY_DELAY_SEARCH_MS, KEY_DELAY_OPEN_MS, KEY_DELAY_PASTE_MS, KEY_DELAY_CLICK_MS, KEY_DELAY_DOWN_MS, KEY_DELAY_ACTIVATE_MS, KEY_DELAY_REREAD_MS, VERIFY_DELAY_MS, IDLE_SKIP_BELOW_SEC } = await import('../lib/sender.js')
 const { Outbox, OUTBOX_REL } = await import('../lib/outbox.js')
 const { Store } = await import('../lib/store.js')
 
@@ -49,6 +49,7 @@ function makeEnv(overrides = {}) {
     dbReadResult: overrides.dbReadResult ?? { code: 0, stdout: 'MATCH_FEATURE', stderr: '' },
     ...overrides,
   }
+  let axCalls = 0 // ax:window 调用序（首读=1，复读=2）
   env.sender = new SenderService({
     outbox,
     store,
@@ -66,8 +67,14 @@ function makeEnv(overrides = {}) {
         steps.push({ kind: 'osascript', step })
         const ok = typeof env.osascriptOk === 'function' ? env.osascriptOk(step) : env.osascriptOk
         // clipboard_save 返回可解析的剪贴板快照（模拟剪贴板原有文本 "saved-content"）
-        // ax:window 返回实证窗口形态 position 0,34 + size 856x1007
-        const stdout = step === 'clipboard_save' ? '«class UTF8»"saved-content"' : step === 'ax:window' ? '0, 34, 856, 1007' : 'ok'
+        // ax:window 返回实证窗口形态 position 0,34 + size 856x1007；env.axWindowOut 可覆盖
+        //（函数形态按调用序返回：首次/复读两次读取，可模拟双读坐标不一致）
+        const axOut = () => {
+          const v = env.axWindowOut
+          const out = typeof v === 'function' ? v(++axCalls) : v
+          return out ?? '0, 34, 856, 1007'
+        }
+        const stdout = step === 'clipboard_save' ? '«class UTF8»"saved-content"' : step === 'ax:window' ? axOut() : 'ok'
         return Promise.resolve(ok ? { code: 0, stdout, stderr: '' } : { code: 1, stdout: '', stderr: 'err' })
       }
       steps.push({ kind: 'spawn', file, args })
@@ -114,9 +121,12 @@ test('键序正确性（真发）：14 步实证键序 + 延迟 + DB 回读验�
   const seq = env.steps.map((s) => (s.kind === 'sleep' ? `sleep:${s.ms}` : s.kind === 'spawn' ? 'spawn' : s.step))
   assert.deepEqual(seq, [
     'activate',
+    `sleep:${KEY_DELAY_ACTIVATE_MS}`, // 空间切换动画 ~1s，等 1.5s 再读窗口坐标（实测全屏点错热修）
     'clipboard_save',
     'key:esc', // 3. Esc 清残留弹层
-    'ax:window', // 4. AX 读窗口 position/size
+    'ax:window', // 4. AX 读窗口 position/size（首读）
+    `sleep:${KEY_DELAY_REREAD_MS}`, // 4.5 布局稳定等待
+    'ax:window', // 复读 position（双读比对，两次一致才认为布局稳定）
     'click:107,71', // 5. 实证坐标：0+856/8=107, 34+1007/40+12=71
     `sleep:${KEY_DELAY_CLICK_MS}`,
     'clipboard_set:文件传输助手',
@@ -157,8 +167,11 @@ test('dry_run：键序到定位会话为止（不粘贴消息不回车），条�
   const seq = env.steps.map((s) => (s.kind === 'sleep' ? `sleep:${s.ms}` : s.kind === 'spawn' ? 'spawn' : s.step))
   assert.deepEqual(seq, [
     'activate',
+    `sleep:${KEY_DELAY_ACTIVATE_MS}`,
     'clipboard_save',
     'key:esc',
+    'ax:window',
+    `sleep:${KEY_DELAY_REREAD_MS}`,
     'ax:window',
     'click:107,71',
     `sleep:${KEY_DELAY_CLICK_MS}`,
@@ -191,6 +204,37 @@ test('AX 窗口读取失败 → fail-closed：不点击不敲键，attempts 计�
   assert.ok(!seq.includes('key:cmd+v') && !seq.includes('key:return'), '后续键序全部中止')
   assert.equal(env.steps.filter((s) => s.kind === 'spawn').length, 0, '不回读')
   rmSync(env.dir, { recursive: true, force: true })
+})
+
+test('AX 双读坐标不一致（空间切换布局变动中）→ 以第二次读取为准点击', async () => {
+  const env = makeEnv({
+    dryRun: true,
+    // 首读旧空间坐标 1000,34；复读稳定后的新空间 0,34（856x1007 不变）
+    axWindowOut: (call) => (call === 1 ? '1000, 34, 856, 1007' : '0, 34, 856, 1007'),
+  })
+  env.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
+  const r = await env.sender.processOnce()
+  assert.equal(r.action, 'sent')
+  const click = env.steps.find((s) => s.kind === 'osascript' && String(s.step).startsWith('click'))
+  assert.equal(click.step, 'click:107,71', '点击坐标用第二次（复读）读取计算，而非首读')
+  assert.equal(env.steps.filter((s) => s.kind === 'osascript' && s.step === 'ax:window').length, 2, 'AX 恰好读两次（首读+复读）')
+  rmSync(env.dir, { recursive: true, force: true })
+})
+
+test('AX 窗口尺寸异常（<200px 疑似动画中间态）→ fail-closed：不点击不敲键 attempts+1', async () => {
+  for (const bad of ['0, 34, 150, 1007', '0, 34, 856, 100']) {
+    const env = makeEnv({ dryRun: true, axWindowOut: bad })
+    const e = env.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
+    const r = await env.sender.processOnce()
+    assert.equal(r.action, 'failed')
+    const seq = env.steps.map((s) => (s.kind === 'sleep' ? `sleep:${s.ms}` : s.kind === 'spawn' ? 'spawn' : s.step))
+    assert.ok(!seq.some((s) => String(s).startsWith('click')), `${bad}：绝不盲点`)
+    assert.ok(!seq.includes('key:cmd+v') && !seq.includes('key:return'), '后续键序全部中止')
+    const after = readOutbox(env.dir).find((x) => x.id === e.id)
+    assert.equal(after.status, 'pending')
+    assert.equal(after.attempts, 1, 'fail-closed 计 attempts，下轮再试')
+    rmSync(env.dir, { recursive: true, force: true })
+  }
 })
 
 test('剪贴板保存恢复：真发后恢复原内容；保存失败不恢复也不报错', async () => {
