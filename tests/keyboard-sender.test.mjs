@@ -8,7 +8,7 @@ import { mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
-const { SenderService, appendFeature, buildSendText, MAX_TEXT_CHARS, ALLOWED_CHANNELS, SENDER_AUDIT_REL, MAX_ATTEMPTS, KEY_DELAY_SEARCH_MS, KEY_DELAY_OPEN_MS, KEY_DELAY_PASTE_MS, KEY_DELAY_CLICK_MS, KEY_DELAY_DOWN_MS, KEY_DELAY_ACTIVATE_MS, KEY_DELAY_REREAD_MS, VERIFY_DELAY_MS, IDLE_SKIP_BELOW_SEC } = await import('../lib/sender.js')
+const { SenderService, appendFeature, buildSendText, MAX_TEXT_CHARS, ALLOWED_CHANNELS, SENDER_AUDIT_REL, MAX_ATTEMPTS, KEY_DELAY_PASTE_MS, VERIFY_DELAY_MS, VERIFY_RETRIES, IDLE_SKIP_BELOW_SEC } = await import('../lib/sender.js')
 const { Outbox, OUTBOX_REL } = await import('../lib/outbox.js')
 const { Store } = await import('../lib/store.js')
 
@@ -78,9 +78,17 @@ function makeEnv(overrides = {}) {
         return Promise.resolve(ok ? { code: 0, stdout, stderr: '' } : { code: 1, stdout: '', stderr: 'err' })
       }
       steps.push({ kind: 'spawn', file, args })
-      const out = typeof env.dbReadResult === 'object' && 'stdout' in env.dbReadResult && env.dbReadResult.stdout === 'MATCH_FEATURE'
-        ? { ...env.dbReadResult, stdout: `{"messages":[{"content":"【lurker】x ${env.lastFeature ?? ''}"}]}` }
-        : env.dbReadResult
+      let out
+      if (env.dbReadSeq) {
+        // 回读结果按序弹出（重试窗口竞态模拟：首次空、第二次命中…）
+        // MATCH_FEATURE 占位同样替换成含当前特征串的命中响应（与默认分支一致）
+        out = env.dbReadSeq.length > 0 ? env.dbReadSeq.shift() : { code: 0, stdout: '', stderr: '' }
+        if (out.stdout === 'MATCH_FEATURE') out = { ...out, stdout: `{"messages":[{"content":"【lurker】x ${env.lastFeature ?? ''}"}]}` }
+      } else {
+        out = typeof env.dbReadResult === 'object' && 'stdout' in env.dbReadResult && env.dbReadResult.stdout === 'MATCH_FEATURE'
+          ? { ...env.dbReadResult, stdout: `{"messages":[{"content":"【lurker】x ${env.lastFeature ?? ''}"}]}` }
+          : env.dbReadResult
+      }
       return Promise.resolve(out)
     },
     isFrontmost: () => Promise.resolve(env.frontmost),
@@ -222,10 +230,83 @@ test('回读未命中（可能发错会话）→ P0：标 failed_wrong_target �
   assert.equal(audit[0].result, 'failed_wrong_target')
   assert.equal(audit[0].p0, true, '审计行醒目标 P0')
   assert.ok(env.logger.logs.warn.some((m) => m.includes('P0') && m.includes('failed_wrong_target')), '立即 warn')
+  // 重试窗口：4 次尝试（每次前 sleep VERIFY_DELAY_MS），穷尽后才终判
+  assert.equal(env.steps.filter((x) => x.kind === 'spawn').length, VERIFY_RETRIES, '穷尽 verifyRetries 次回读')
+  assert.equal(env.steps.filter((x) => x.kind === 'sleep' && x.ms === VERIFY_DELAY_MS).length, VERIFY_RETRIES, '每次尝试前等 verifyDelaySec')
   // 终态：后续周期不再消费
   const spawns = env.steps.filter((x) => x.kind === 'spawn').length
   await env.sender.processOnce()
   assert.equal(env.steps.filter((x) => x.kind === 'spawn').length, spawns, 'failed_wrong_target 不再回读')
+  rmSync(env.dir, { recursive: true, force: true })
+})
+
+test('回读重试窗口（异步写入竞态修复）：首次回读空、第二次命中 → sent', async () => {
+  const env = makeEnv({
+    // 首次：微信尚未异步写入；第二次：写入提交，命中特征串
+    dbReadSeq: [
+      { code: 0, stdout: '{"messages":[]}', stderr: '' },
+      { code: 0, stdout: 'MATCH_FEATURE', stderr: '' },
+    ],
+  })
+  const e = env.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
+  env.lastFeature = `#l${e.id.replace(/[^0-9a-zA-Z]/g, '').slice(0, 8)}` // 让 MATCH_FEATURE 占位替换命中本条特征串
+  const r = await env.sender.processOnce()
+  assert.equal(r.action, 'sent', '竞态窗口内第二次回读命中 → sent（不误判 wrong_target）')
+  assert.equal(env.steps.filter((x) => x.kind === 'spawn').length, 2, '只回读 2 次即命中')
+  assert.equal(readOutbox(env.dir).find((x) => x.id === e.id).status, 'sent')
+  const audit = readAudit(env.dir)
+  assert.equal(audit[0].result, 'sent')
+  assert.ok(!audit[0].p0, '无 P0')
+  rmSync(env.dir, { recursive: true, force: true })
+})
+
+test('回读重试窗口可配：verifyRetries=2 / verifyDelaySec=1（1s × 2 次）', async () => {
+  const env = makeEnv({
+    dbReadSeq: [
+      { code: 0, stdout: '{"messages":[]}', stderr: '' },
+      { code: 0, stdout: 'MATCH_FEATURE', stderr: '' },
+    ],
+  })
+  // 用最小改动覆盖配置：直接构造带 override 的 sender
+  const e = env.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
+  const r = await new SenderService({
+    outbox: env.outbox, store: env.store, logger: silentLogger, enabled: true, dryRun: false,
+    sendMethod: 'keyboard', sourceToolDir: '/fake/macos-wechat-export', sourcePython: 'python3',
+    verifyDelaySec: 1, verifyRetries: 2,
+    runCommand: (file, args) => {
+      if (file === 'osascript') return Promise.resolve({ code: 0, stdout: '«class UTF8»"saved-content"', stderr: '' })
+      const out = env.dbReadSeq.length > 0 ? env.dbReadSeq.shift() : { code: 0, stdout: '', stderr: '' }
+      const resolved = out.stdout === 'MATCH_FEATURE' ? { ...out, stdout: `{"messages":[{"content":"【lurker】x #l${e.id.replace(/[^0-9a-zA-Z]/g, '').slice(0, 8)}"}]}` } : out
+      env.steps.push({ kind: 'spawn', file, args })
+      return Promise.resolve(resolved)
+    },
+    isFrontmost: () => Promise.resolve(true),
+    systemIdleSec: () => Promise.resolve(999),
+    sleepMs: (ms) => { env.steps.push({ kind: 'sleep', ms }); return Promise.resolve() },
+  }).processOnce()
+  assert.equal(r.action, 'sent')
+  assert.equal(env.steps.filter((x) => x.kind === 'spawn').length, 2)
+  assert.deepEqual(env.steps.filter((x) => x.kind === 'sleep').map((x) => x.ms), [KEY_DELAY_PASTE_MS, 1000, 1000])
+  assert.equal(readOutbox(env.dir).find((x) => x.id === e.id).status, 'sent')
+  rmSync(env.dir, { recursive: true, force: true })
+})
+
+test('回读本身失败（CLI 报错/库不可读）→ deferred 环境等待语义：attempts 不增、保持 pending、不误判 wrong_target', async () => {
+  const env = makeEnv({
+    logger: recordingLogger(),
+    dbReadResult: { code: 1, stdout: '', stderr: 'db locked' },
+  })
+  const e = env.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
+  const r = await env.sender.processOnce()
+  assert.equal(r.action, 'deferred', '回读失败 = 环境等待，不是 wrong_target')
+  const after = readOutbox(env.dir).find((x) => x.id === e.id)
+  assert.equal(after.status, 'pending', '保持 pending，下轮重试验证')
+  assert.equal(after.attempts, 0, 'attempts 不增')
+  const audit = readAudit(env.dir)
+  assert.equal(audit[0].result, 'verify_read_deferred')
+  assert.equal(audit[0].deferred, true)
+  assert.ok(!audit[0].p0, '绝不误判 P0')
+  assert.ok(env.logger.logs.warn.some((m) => m.includes('回读本身失败') && m.includes('不判 wrong_target')))
   rmSync(env.dir, { recursive: true, force: true })
 })
 

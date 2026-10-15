@@ -50,8 +50,10 @@ export const MAX_ATTEMPTS = 3
 export const SENDER_AUDIT_REL = 'audit/sender.jsonl'
 /** 粘贴消息后、回车发送前的缓冲（ms） */
 export const KEY_DELAY_PASTE_MS = 300
-/** 真发后 DB 回读验证前的延迟（ms） */
-export const VERIFY_DELAY_MS = 2000
+/** 真发后 DB 回读验证每次尝试前的延迟（ms；Config.verifyDelaySec 可配，默认 3000） */
+export const VERIFY_DELAY_MS = 3000
+/** DB 回读验证默认尝试次数（Config.verifyRetries 可配；4 次 × 3s ≈ 12s 总重试窗口） */
+export const VERIFY_RETRIES = 4
 /** 系统空闲低于该秒数视为用户正在操作（跳过防按键串扰） */
 export const IDLE_SKIP_BELOW_SEC = 10
 
@@ -140,6 +142,10 @@ export interface SenderOptions {
   sourceToolDir?: string
   /** Config.sourcePython（默认 'python3'） */
   sourcePython?: string
+  /** Config.verifyDelaySec：回读验证每次尝试前的等待秒数（默认 3） */
+  verifyDelaySec?: number
+  /** Config.verifyRetries：回读验证尝试次数（默认 4；总窗口 ≈ verifyDelaySec × verifyRetries） */
+  verifyRetries?: number
   /** Config.sendIntervalSec（默认 300） */
   intervalSec?: number
   /** Config.allowTakeFocus：抢前台模式（默认 false = 微信非前台跳过本轮）。true = 跳过前台闸（仍保留用户空闲检测） */
@@ -337,6 +343,8 @@ export class SenderService {
   private readonly isFrontmostFn: () => Promise<boolean>
   private readonly idleSecFn: () => Promise<number>
   private readonly sleep: (ms: number) => Promise<void>
+  private readonly verifyDelayMs: number
+  private readonly verifyRetries: number
   private readonly primitive: SendPrimitive
   /** 交互闸：连续非前台轮数（发送成功/前台重置） */
   private consecutiveNotFront = 0
@@ -350,6 +358,8 @@ export class SenderService {
     this.maxSendsPerDay = Math.max(0, Math.floor(options.maxSendsPerDay ?? 20))
     this.frontmostWarnAfter = Math.max(1, Math.floor(options.frontmostWarnAfter ?? 3))
     this.intervalSec = Math.max(1, Math.floor(options.intervalSec ?? 300))
+    this.verifyDelayMs = Math.max(0, Math.floor((options.verifyDelaySec ?? 3) * 1000))
+    this.verifyRetries = Math.max(1, Math.floor(options.verifyRetries ?? VERIFY_RETRIES))
     this.now = options.now ?? (() => Date.now())
     this.setIntervalFn = options.setInterval ?? setInterval
     this.clearIntervalFn = options.clearInterval ?? clearInterval
@@ -446,14 +456,31 @@ export class SenderService {
     let ok = r.ok && r.stage === 'sent'
     let wrongTarget = false
     // keyboard 模式：DB 回读验证（替代 OCR/截图）——验证通过才算 sent。
-    // 无搜索定位（目标会话 = 用户当前打开的会话）后，回读是**唯一的目标兜底闸**：
-    // 未命中 = 内容可能落进了别的会话（P0 级异常），终态 failed_wrong_target 不重试。
+    // 无搜索定位（目标会话 = 用户当前打开的会话）后，回读是**唯一的目标兜底闸**。
+    // 线上实测：微信把已发消息**异步写入**本地库，单次立即回读会跑在写入提交前面（时序竞态）
+    // → 误判 failed_wrong_target。因此改为**重试窗口**：verifyRetries 次尝试、每次前等
+    // verifyDelaySec 秒（默认 4 次 × 3s ≈ 12s 总窗口）；任一次命中特征串 → sent。
+    // 4 次穷尽仍未命中 → 才判 failed_wrong_target（终态 + P0 审计 + warn，语义不变）；
+    // 回读本身失败（CLI 报错/库不可读）→ 按环境等待语义 deferred 处理（attempts 不增，
+    // 下轮重试验证），绝不误判 wrong_target。
     if (ok && this.method === 'keyboard') {
-      await this.sleep(VERIFY_DELAY_MS)
-      const v = await this.runCommandFn(this.sourcePython, [
-        join(this.sourceToolDir, 'wechat_db.py'), 'read', '--chat-id', 'filehelper', '--limit', '3',
-      ])
-      const verified = v.code === 0 && v.stdout.includes(feature)
+      let verified = false
+      let readBroken = false
+      for (let attempt = 1; attempt <= this.verifyRetries; attempt++) {
+        await this.sleep(this.verifyDelayMs)
+        const v = await this.runCommandFn(this.sourcePython, [
+          join(this.sourceToolDir, 'wechat_db.py'), 'read', '--chat-id', 'filehelper', '--limit', '3',
+        ])
+        if (v.code !== 0) { readBroken = true; break }
+        if (v.stdout.includes(feature)) { verified = true; break }
+      }
+      if (readBroken) {
+        // 保持 pending + attempts 不增（落 0 占位），下轮重试验证
+        this.options.outbox.updateSendState(id, { status: 'pending', attempts: entry.attempts ?? 0 })
+        this.audit({ id, kind: entry.kind, result: 'verify_read_deferred', attempts: entry.attempts ?? 0, deferred: true, method: this.method })
+        this.options.logger.warn(`sender: DB 回读本身失败 id=${id} — 按环境等待处理（attempts 不增，下轮重试验证），不判 wrong_target`)
+        return { action: 'deferred' }
+      }
       if (!verified) {
         ok = false
         wrongTarget = true
@@ -472,13 +499,6 @@ export class SenderService {
       this.audit({ id, kind: entry.kind, result: 'failed_wrong_target', attempts, method: this.method, p0: true })
       this.options.logger.warn(`sender: [P0] DB 回读未命中特征串 id=${id}——消息可能发进了非 filehelper 会话，已标 failed_wrong_target 终态（不重试），请立即人工检查微信当前会话与已发内容`)
       return { action: 'failed' }
-    }
-    if (ok) {
-      this.options.outbox.updateSendState(id, { status: 'sent', attempts })
-      // 抢前台模式放行的发送单独记 result，审计可区分两种模式
-      this.audit({ id, kind: entry.kind, result: tookFocus ? 'take_focus_sent' : 'sent', attempts, method: this.method })
-      this.options.logger.info(`sender: sent id=${id} kind=${entry.kind}${tookFocus ? ' (take_focus)' : ''} (method=${this.method}, db_verified, content not logged)`)
-      return { action: 'sent' }
     }
     const status: OutboxEntry['status'] = attempts >= MAX_ATTEMPTS ? 'failed' : 'pending'
     this.options.outbox.updateSendState(id, { status, attempts })
