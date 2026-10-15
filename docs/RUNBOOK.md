@@ -302,20 +302,44 @@ rm -rf /path/to/macos-wechat-export/.wechat-local
 了别的会话（P0 异常），该条标 `failed_wrong_target` 终态 + 醒目审计 + 立即 warn，**绝不重试**
 （重试可能再次误发），需人工检查微信当前会话与已发内容。
 
-### 验证：DB 回读（替代 OCR/截图——TCC 收益）
+### 验证：DB 回读（替代 OCR/截图——发送后兜底）
 
 真发后延迟 2s，只读调用 `wechat_db.py read --chat-id filehelper --limit 3`，确认文件传输助手
 最新消息包含本次文本特征串 `#l<outbox id 前 8 位>`——**验证通过才置 sent**，否则按失败计数
-（≥3 次转 failed）。因此 **TCC 只需"辅助功能"**（System Events 按键），**不再需要屏幕录制**——
-这是相对 wechat-ui 方案的额外收益。keyboard 模式下 `sourceToolDir` 未配置（无 wechat_db.py
+（≥3 次转 failed）。keyboard 模式下 `sourceToolDir` 未配置（无 wechat_db.py
 可回读）= **fail-closed 不发送**。
+
+### 发送前合规闸（路线 A，2026-10-15：防误发核心）
+
+在"剪贴板粘贴 + Return"**之前**，spawn `wechat-ui read --chat '文件传输助手'`（**只读**：
+截取微信窗口 + OCR 读当前聊天标题 + 与参数核对，工具内置 WeChat 4.x 空白截图修复）——
+退出码 0 = 当前会话确为文件传输助手 → 放行键序。原因：微信 4.1.13 AX 树不暴露聊天 UI
+（双载体实证，见 docs/REPORT-ax-tree-research.md），OCR 标题核验是唯一成熟可行的发送前检测。
+`--chat` 参数与发送目标同源同常量 `FILEHELPER_CHAT`（filehelper 硬编码不变）。
+
+- **dry_run 照常执行合规闸**（只读核验——正好用于上线前验证 TCC 授权与当前会话定位），
+  但后续键序照旧跳过；
+- OCR 误读抖动防御：失败重试 `chatVerifyRetries` 次（默认 2 = 共 3 次，间隔 1s）；
+- 全失败 → **deferred**：审计 `result='wrong_chat_open'` + `reason` 字段，**attempts 不增**
+  （用户环境状态不是发送失败），条目保持 pending 下轮自动重试，并 warn 人工介入。
+
+**审计 reason 三枚举**（排障看 reason 即可区分三类失败）：
+
+| reason | 含义 | 处置 |
+|---|---|---|
+| `wrong_chat_open` | OCR 核验 3 次全失败（当前会话不是文件传输助手 / 读不到标题） | warn「请将微信当前会话切换到文件传输助手」，人工切回后下轮自动恢复 |
+| `ui_tool_missing` | wechat-ui 二进制缺失 / 无法执行（spawn ENOENT/EACCES） | 检查 `wechatUiPath` 配置；确定性失败不空转重试 |
+| `tcc_denied` | DSH 宿主缺「屏幕录制」权限（截图被 TCC 拦截） | 系统设置 → 隐私与安全性 → 屏幕录制 授权 DSH 宿主 |
 
 ### TCC 前置（首次必做）
 
 系统设置 → 隐私与安全性 → 给 **DSH 宿主应用**（运行本插件的进程）开启：
 
-- **辅助功能**（System Events 按键 + osascript 激活/查询前台）——**唯一必需项**；
-- ~~屏幕录制~~（不再需要：验证走 DB 回读，无截图）。
+- **辅助功能**（System Events 按键 + osascript 激活/查询前台）——键序必需；
+- **屏幕录制**（**2026-10-15 恢复必需**：发送前合规闸的 `wechat-ui read` 要截取微信窗口做
+  OCR 标题核验）。**未授权 = 合规闸每次 deferred（审计 reason='tcc_denied'），永不发送**
+  ——fail-closed：缺权限比发错会话安全。上线前用 sendDryRun=true 干跑即可验证该权限是否
+  就绪（dry_run 合规闸照常执行；审计/日志出现 `tcc_denied` 即权限未授权）。
 
 ### 真实键位实证（已回填 2026-10-15）
 
@@ -327,7 +351,7 @@ Accessibility Inspector 确认元素层级）。**实证结论回填此处：___
 
 ### 首次启用步骤（两段式：dry_run 人工确认定位 → 真发）
 
-1. TCC"辅助功能"授权 + 配置 `sourceToolDir`/`sourceDbRoot`（回读验证必需）；
+1. TCC"辅助功能"+"屏幕录制"授权（合规闸必需，缺屏幕录制 = 恒 deferred，reason='tcc_denied'）+ 配置 `sourceToolDir`/`sourceDbRoot`（回读验证必需）；
 2. 配置保持 `senderEnabled: true`、`sendDryRun: true`（默认），重启插件；
 3. **第一段（干跑）**：触发消费（或调 `groupLurker.sender.sendTestSample()`）——keyboard 模式
    dry_run **确认前台后直接结束**（不碰输入框不回车）——人工确认微信在前台且当前会话是文件传输助手，**不粘贴消息不回车**。

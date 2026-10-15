@@ -47,6 +47,9 @@ function makeEnv(overrides = {}) {
     // osascript 默认全成功；spawn（wechat_db.py 回读）默认成功且含任意特征串
     osascriptOk: overrides.osascriptOk ?? (() => true),
     dbReadResult: overrides.dbReadResult ?? { code: 0, stdout: 'MATCH_FEATURE', stderr: '' },
+    // 发送前合规闸（wechat-ui read）默认通过；chatReadSeq/chatReadResult 可覆盖
+    chatReadSeq: overrides.chatReadSeq ?? null,
+    chatReadResult: overrides.chatReadResult ?? { code: 0, stdout: 'chat matched: 文件传输助手', stderr: '' },
     ...overrides,
   }
   let axCalls = 0 // ax:window 调用序（首读=1，复读=2）
@@ -81,6 +84,14 @@ function makeEnv(overrides = {}) {
         return Promise.resolve(ok ? { code: 0, stdout, stderr: '' } : { code: 1, stdout: '', stderr: 'err' })
       }
       steps.push({ kind: 'spawn', file, args })
+      // 发送前合规闸 spawn（wechat-ui read --chat 文件传输助手）独立注入：chatReadSeq 按序弹出 / chatReadResult 固定
+      if (args[0] === 'read' && args.includes('--chat')) {
+        if (env.chatReadSeq) {
+          const seqOut = env.chatReadSeq.length > 0 ? env.chatReadSeq.shift() : env.chatReadResult
+          return Promise.resolve(seqOut)
+        }
+        return Promise.resolve(env.chatReadResult)
+      }
       let out
       if (env.dbReadSeq) {
         // 回读结果按序弹出（重试窗口竞态模拟：首次空、第二次命中…）
@@ -131,6 +142,7 @@ test('键序正确性（真发）：简化键序（activate→粘贴→回车）
   assert.equal(r.action, 'sent')
   const seq = env.steps.map((s) => (s.kind === 'sleep' ? `sleep:${s.ms}` : s.kind === 'spawn' ? 'spawn' : s.step))
   assert.deepEqual(seq, [
+    'spawn', // 发送前合规闸：wechat-ui read 标题核验（防误发）
     'activate',
     'clipboard_save',
     `clipboard_set:【lurker】日报 关键判断 ${env.lastFeature}`,
@@ -145,8 +157,8 @@ test('键序正确性（真发）：简化键序（activate→粘贴→回车）
   for (const banned of ['key:esc', 'ax:window', 'key:down']) assert.ok(!seq.includes(banned), `不应出现 ${banned}`)
   assert.ok(!seq.some((x) => String(x).startsWith('click')), '不应点击搜索框')
   assert.ok(!seq.includes('clipboard_set:文件传输助手'), '不应粘贴搜索词')
-  // 回读参数形态：只读、filehelper、limit 3
-  const spawn = env.steps.find((s) => s.kind === 'spawn')
+  // 回读参数形态：只读、filehelper、limit 3（合规闸 spawn 是 wechat-ui read，回读 spawn 是 python3）
+  const spawn = env.steps.filter((s) => s.kind === 'spawn').find((s) => s.file === 'python3')
   assert.equal(spawn.file, 'python3')
   // --db-root/--key-file 是 CLI 全局参数，必须在子命令 read 之前（实测放后面报 unrecognized arguments）
   assert.deepEqual(spawn.args, [
@@ -173,6 +185,7 @@ test('dry_run：确认前台后直接结束（不碰输入框不回车），条�
   assert.equal(r.action, 'sent') // 消费完成，走 dry_run 路径
   const seq = env.steps.map((s) => (s.kind === 'sleep' ? `sleep:${s.ms}` : s.kind === 'spawn' ? 'spawn' : s.step))
   assert.deepEqual(seq, [
+    'spawn', // dry_run 合规闸照常执行（只读核验，验证 TCC 与定位）
     'activate',
     'clipboard_save',
     'clipboard_set:saved-content', // dry_run 尾部：恢复剪贴板
@@ -241,7 +254,7 @@ test('回读未命中（可能发错会话）→ P0：标 failed_wrong_target �
   assert.equal(p0.p0, true, '审计行醒目标 P0')
   assert.ok(env.logger.logs.warn.some((m) => m.includes('P0') && m.includes('failed_wrong_target')), '立即 warn')
   // 重试窗口：4 次尝试（每次前 sleep VERIFY_DELAY_MS），穷尽后才终判
-  assert.equal(env.steps.filter((x) => x.kind === 'spawn').length, VERIFY_RETRIES, '穷尽 verifyRetries 次回读')
+  assert.equal(env.steps.filter((x) => x.kind === 'spawn').length, VERIFY_RETRIES + 1, '穷尽 verifyRetries 次回读（+1 次发送前合规闸核验）')
   assert.equal(env.steps.filter((x) => x.kind === 'sleep' && x.ms === VERIFY_DELAY_MS).length, VERIFY_RETRIES, '每次尝试前等 verifyDelaySec')
   // 终态：后续周期不再消费
   const spawns = env.steps.filter((x) => x.kind === 'spawn').length
@@ -262,7 +275,7 @@ test('回读重试窗口（异步写入竞态修复）：首次回读空、第�
   env.lastFeature = `#l${e.id.replace(/[^0-9a-zA-Z]/g, '').slice(0, 8)}` // 让 MATCH_FEATURE 占位替换命中本条特征串
   const r = await env.sender.processOnce()
   assert.equal(r.action, 'sent', '竞态窗口内第二次回读命中 → sent（不误判 wrong_target）')
-  assert.equal(env.steps.filter((x) => x.kind === 'spawn').length, 2, '只回读 2 次即命中')
+  assert.equal(env.steps.filter((x) => x.kind === 'spawn').length, 3, '只回读 2 次即命中（+1 次发送前合规闸）')
   assert.equal(readOutbox(env.dir).find((x) => x.id === e.id).status, 'sent')
   const audit = readAudit(env.dir)
   assert.deepEqual(audit.map((a) => a.result), ['transmitted', 'sent'])
@@ -285,6 +298,10 @@ test('回读重试窗口可配：verifyRetries=2 / verifyDelaySec=1（1s × 2 �
     verifyDelaySec: 1, verifyRetries: 2,
     runCommand: (file, args) => {
       if (file === 'osascript') return Promise.resolve({ code: 0, stdout: '«class UTF8»"saved-content"', stderr: '' })
+      if (args[0] === 'read' && args.includes('--chat')) { // 发送前合规闸
+        env.steps.push({ kind: 'spawn', file, args })
+        return Promise.resolve({ code: 0, stdout: 'chat matched: 文件传输助手', stderr: '' })
+      }
       const out = env.dbReadSeq.length > 0 ? env.dbReadSeq.shift() : { code: 0, stdout: '', stderr: '' }
       const resolved = out.stdout === 'MATCH_FEATURE' ? { ...out, stdout: `{"messages":[{"content":"【lurker】x #l${e.id.replace(/[^0-9a-zA-Z]/g, '').slice(0, 8)}"}]}` } : out
       env.steps.push({ kind: 'spawn', file, args })
@@ -295,7 +312,7 @@ test('回读重试窗口可配：verifyRetries=2 / verifyDelaySec=1（1s × 2 �
     sleepMs: (ms) => { env.steps.push({ kind: 'sleep', ms }); return Promise.resolve() },
   }).processOnce()
   assert.equal(r.action, 'sent')
-  assert.equal(env.steps.filter((x) => x.kind === 'spawn').length, 2)
+  assert.equal(env.steps.filter((x) => x.kind === 'spawn').length, 3, '回读 2 次（+1 次发送前合规闸）')
   assert.deepEqual(env.steps.filter((x) => x.kind === 'sleep').map((x) => x.ms), [KEY_DELAY_PASTE_MS, 1000, 1000])
   assert.equal(readOutbox(env.dir).find((x) => x.id === e.id).status, 'sent')
   rmSync(env.dir, { recursive: true, force: true })
