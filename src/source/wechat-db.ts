@@ -12,13 +12,13 @@
  *   不读取/不拷贝 keys.json、绝不动 WeChat 进程/窗口；
  * - 子进程带超时，连续失败按指数退避；
  * - 定时器经 start() 返回清理函数（clearInterval），由宿主包进 ctx.effect()（沿用 distiller 约定）；
- * - 单实例：stateDir 下独占创建锁文件（fs.open 'wx' 简化 flock），重复启动拒绝；
+ * - 单实例：stateDir 下 pidfile + 存活检测锁（Node 无内置 flock，见 acquireLock），重复启动拒绝；
  * - 消息结构对齐管线：{chatId, sender(=sender_id), senderName(=sender_id，W3 映射昵称),
  *   text, messageId(=server_id), ts(=create_time)}，经 onMessages 交给 bus 同款下游
  *   （sanitize → 令牌桶 → buffer → distiller）。
  */
 import { spawn } from 'node:child_process'
-import { closeSync, openSync, unlinkSync } from 'node:fs'
+import { readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { Store } from '../store.js'
 import { redactHexRuns } from '../guard.js'
@@ -413,6 +413,22 @@ export function createCliRunner(options: {
     })
 }
 
+/**
+ * 进程存活检测：process.kill(pid, 0)。
+ * - 正常返回 = 进程存在（含僵尸），视为存活；
+ * - EPERM = 进程存在但无信号权限，仍视为存活；
+ * - ESRCH = 进程不存在 → 死锁（pidfile 残留可被安全接管）。
+ */
+export function isPidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
 export class WechatDbSource {
   private readonly whitelist: Set<string>
   private readonly dbRoot: string
@@ -431,8 +447,8 @@ export class WechatDbSource {
 
   /** W4：持久化增量游标（每群已读 id 尾部窗口，防重启重投递；见 cursor.ts） */
   private readonly cursor: GroupCursor
-  /** 单实例锁文件 fd（start 时获取，stop 释放） */
-  private lockFd: number | null = null
+  /** 单实例锁持有标记（start 时获取，stop 释放） */
+  private lockHeld = false
   private _running = false
   private consecutiveFailures = 0
   private lastPollAt: number | null = null
@@ -825,14 +841,49 @@ export class WechatDbSource {
     }
   }
 
-  /** 单实例锁：stateDir 下独占创建；已存在则拒绝启动 */
+  /**
+   * 单实例锁（pidfile + 存活检测，替代原 fs.open 'wx' 独占创建）。
+   *
+   * 原实现用 openSync(lockPath, 'wx')（O_EXCL）——进程被强杀/崩溃时 unlink 不执行，
+   * wechat-db.lock 永久残留，之后每次启动都误判"another instance holds"拒绝启动，
+   * 读取层静默死掉。Node 24 实测无内置 flock（fs.flockSync/flock/fcntl 均为 undefined），
+   * 故采用 pidfile 方案：锁文件写入本进程 PID。启动时：
+   * 1. 独占创建（'wx'）成功 → 正常获取（无残留时的无竞争路径）；
+   * 2. 已存在 → 读 PID + process.kill(pid,0) 存活检测；存活 → 拒绝启动，
+   *    不存活（崩溃/强杀残留）→ 删旧并独占重写（安全接管）。
+   * 进程死亡不依赖 unlink，残留文件下次启动可被接管，根治"强杀后锁文件永久残留"。
+   * 接管路径存在极窄竞态（两进程同时对同一死锁接管），重建 EEXIST 时按另一活实例拒绝。
+   */
   private acquireLock(): void {
     const lockPath = join(this.stateDir, 'wechat-db.lock')
+    const pid = String(process.pid)
+    // 1) 正常路径：原子独占创建 + 写入 PID
     try {
-      this.lockFd = openSync(lockPath, 'wx')
+      writeFileSync(lockPath, pid, { flag: 'wx' })
+      this.lockHeld = true
+      return
     } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code
-      if (code === 'EEXIST') {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+    }
+    // 2) 文件已存在 → 读 PID 存活检测
+    const existing = this.readLockPid(lockPath)
+    if (existing !== null && isPidAlive(existing)) {
+      throw new Error(
+        `wechat-db source: another instance holds ${lockPath} — refusing to start`,
+      )
+    }
+    // 3) 残留死锁（文件在但无活进程/内容非法）→ 安全接管：删旧 + 独占重写
+    try {
+      unlinkSync(lockPath)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    }
+    try {
+      writeFileSync(lockPath, pid, { flag: 'wx' })
+      this.lockHeld = true
+    } catch (error) {
+      // 接管竞态：另一进程已抢先接管 → 按另一活实例拒绝
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
         throw new Error(
           `wechat-db source: another instance holds ${lockPath} — refusing to start`,
         )
@@ -841,15 +892,27 @@ export class WechatDbSource {
     }
   }
 
-  private releaseLock(): void {
-    if (this.lockFd === null) return
+  /** 读取锁文件内的 PID；文件不存在或内容非法返回 null（非法 = 死锁/损坏，可接管） */
+  private readLockPid(lockPath: string): number | null {
     try {
-      closeSync(this.lockFd)
+      const raw = readFileSync(lockPath, 'utf8').trim()
+      if (!/^\d{1,10}$/.test(raw)) return null
+      const pid = Number(raw)
+      return pid > 0 ? pid : null
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+      throw error
+    }
+  }
+
+  private releaseLock(): void {
+    if (!this.lockHeld) return
+    try {
       unlinkSync(join(this.stateDir, 'wechat-db.lock'))
     } catch (error) {
       this.logger.warn(`wechat-db release lock failed: ${String(error)}`)
     } finally {
-      this.lockFd = null
+      this.lockHeld = false
     }
   }
 

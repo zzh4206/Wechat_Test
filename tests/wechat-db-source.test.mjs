@@ -1,7 +1,8 @@
 // wechat-db-source.test.mjs —— W2 受监管读取适配器测试（全部 mock 子进程，零真实库访问）
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs'
+import { mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Store } from '../lib/store.js'
@@ -125,6 +126,43 @@ test('单实例锁：同 stateDir 二次 start 拒绝；清理后可重启', () 
   c()
   rmSync(a.base, { recursive: true, force: true })
   rmSync(b.base, { recursive: true, force: true })
+})
+
+test('锁文件残留但 PID 已死 → 安全接管并正常启动（修复崩溃残留死锁）', () => {
+  const { source, base } = setup()
+  const lockPath = join(base, 'wechat-db.lock')
+  // 取一个刚退出的死 PID：spawnSync 跑完即死，其 PID 不再存活
+  const deadPid = spawnSync(process.execPath, ['-e', '']).pid
+  writeFileSync(lockPath, String(deadPid))
+  const cleanup = source.start() // 应检测到死锁并接管，正常启动
+  assert.equal(source.status().running, true)
+  assert.equal(readFileSync(lockPath, 'utf8').trim(), String(process.pid), '接管后锁文件写入本进程 PID')
+  cleanup()
+  assert.equal(existsSync(lockPath), false, '停止应释放锁文件')
+  rmSync(base, { recursive: true, force: true })
+})
+
+test('锁被另一活进程持有 → 拒绝启动', () => {
+  const { source, base } = setup()
+  const lockPath = join(base, 'wechat-db.lock')
+  // 用当前测试进程 PID 模拟"另一活进程"：kill(pid, 0) 对自己必定存活
+  writeFileSync(lockPath, String(process.pid))
+  assert.throws(() => source.start(), /another instance holds/)
+  assert.equal(source.status().running, false)
+  rmSync(base, { recursive: true, force: true })
+})
+
+test('本进程 stop → 再次 start → 正常获取锁', () => {
+  const { source, base } = setup()
+  const c1 = source.start()
+  assert.equal(source.status().running, true)
+  c1() // stop：释放锁（unlink）
+  assert.equal(source.status().running, false)
+  assert.equal(existsSync(join(base, 'wechat-db.lock')), false)
+  const c2 = source.start() // 锁已释放，可再次启动
+  assert.equal(source.status().running, true)
+  c2()
+  rmSync(base, { recursive: true, force: true })
 })
 
 test('pollOnce 在退避窗口内整轮跳过（不产生子进程调用）', async () => {
