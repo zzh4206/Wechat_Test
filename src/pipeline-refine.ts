@@ -33,6 +33,7 @@ import { backoffDelayMs } from './report.js'
 import { splitByRate } from './split-by-rate.js'
 import { LlmCallRecorder, errKindOf, monotonicMs } from './llm-observe.js'
 import type { BatchStats } from './llm-observe.js'
+import { twoStageCall } from './two-stage.js'
 import { redactSecretLike } from './guard.js'
 
 // —————————————————— σ 状态 schema（固定 JSON，技术文档 §4.2） ——————————————————
@@ -324,6 +325,11 @@ export interface RefinePipelineDeps {
   parseDraft: (raw: string, maxN: number) => ReportDraft | null
   /** 段长上限 = 当前生效 safeBatch（自适应开）或 batchThreshold（调用方决定） */
   maxSeg: number
+  /**
+   * T8 两段式生成实验开关（默认 false = 单段式零变化）：true 时每个段调用
+   * （含末段出稿）拆「自由文本归纳 → 独立格式化为既有 schema」两步（同 phase='refine'）。
+   */
+  schemaTwoStage?: boolean
   /** 段长下限（缺省 20，对齐 splitByRate） */
   minSeg?: number
   /** 重叠带条数（缺省 8） */
@@ -391,7 +397,10 @@ export async function runRefinePipeline(
       let raw: string
       try {
         // T7 观测：B 路径全部调用 phase='refine'，batch=段号（末段出稿也是一次段调用）
-        raw = await deps.rec.call(deps.chatId, deps.kind, 'refine', i + 1, msgs.length, prompt, () => deps.llm.complete(prompt))
+        // T8：schemaTwoStage=true 时拆两步（自由文本→格式化，均记 phase='refine'）
+        raw = deps.schemaTwoStage
+          ? await twoStageCall({ chatId: deps.chatId, kind: deps.kind, phase: 'refine', batch: i + 1, msgs: msgs.length, prompt, llm: deps.llm, rec: deps.rec })
+          : await deps.rec.call(deps.chatId, deps.kind, 'refine', i + 1, msgs.length, prompt, () => deps.llm.complete(prompt))
       } catch (error) {
         const redacted = redactSecretLike(String(error).slice(0, 160))
         if (errKindOf(error) === 'timeout') {

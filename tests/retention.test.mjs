@@ -163,3 +163,59 @@ test('保留期：start/stop 心跳干净（dispose 无定时器残留）', asyn
     env.cleanup()
   }
 })
+
+// —— T8 挂账项：llm-calls.jsonl 接入 +7 天滚动保留 ——
+const { llmCallRelPath } = await import('../lib/llm-observe.js')
+
+test('T8 llm-calls.jsonl：8 天前的行被清、今天的行保留（审计行结构不变）', async () => {
+  const env = makeEnv()
+  try {
+    const oldTs = NOW - 8 * DAY
+    const rows = [
+      { ev: 'llm_call', chat: CHAT, kind: 'daily', phase: 'map', ts: oldTs, ok: true, model: 'glm-5.3' },
+      { ev: 'llm_call', chat: CHAT, kind: 'daily', phase: 'merge', ts: NOW - 10_000, ok: true, model: 'glm-5.3' },
+      { ev: 'llm_call', chat: CHAT, kind: 'distill', phase: 'distill', ts: NOW, ok: false, errKind: 'timeout', model: 'glm-5.3' },
+    ]
+    env.store.ensureDir(join('groups', CHAT))
+    env.store.writeText(llmCallRelPath(CHAT), rows.map((r) => JSON.stringify(r)).join('\n') + '\n')
+    // messages 无行可删（空库）——run 仍应完成 jsonl 清理
+    const res = await mkRetention(env).run()
+    assert.equal(res.ran, true)
+    assert.equal(res.llmCallsPruned[CHAT], 1, '只清掉 8 天前那一行')
+    const kept = readFileSync(join(env.base, llmCallRelPath(CHAT)), 'utf8').trim().split('\n').map((l) => JSON.parse(l))
+    assert.deepEqual(kept.map((r) => r.phase), ['merge', 'distill'], '今天的行保留、旧行被清')
+    assert.ok(!kept.some((r) => r.ts === oldTs))
+    // 审计行仍只含元数据四字段（messages 清理口径不被 jsonl 清理污染）
+    const audit = readFileSync(join(env.base, RETENTION_AUDIT_REL), 'utf8').trim().split('\n').map((l) => JSON.parse(l))
+    for (const row of audit) {
+      assert.deepEqual(Object.keys(row).sort(), ['beforeTs', 'chatId', 'deleted', 'ts'])
+    }
+  } finally {
+    env.cleanup()
+  }
+})
+
+test('T8 llm-calls.jsonl：损坏行/缺 ts 行保守保留；无过期行不重写', async () => {
+  const env = makeEnv()
+  try {
+    const content = [
+      '{ 这是损坏行（不是 JSON）',
+      JSON.stringify({ ev: 'llm_call', ts: NOW }), // 有 ts 且新鲜
+      JSON.stringify({ ev: 'llm_call' }), // 缺 ts → 保守保留
+    ].join('\n') + '\n'
+    env.store.ensureDir(join('groups', CHAT))
+    env.store.writeText(llmCallRelPath(CHAT), content)
+    const res = await mkRetention(env).run()
+    assert.equal(res.llmCallsPruned[CHAT], undefined, '无过期行 → 零清理')
+    const after = readFileSync(join(env.base, llmCallRelPath(CHAT)), 'utf8')
+    assert.ok(after.includes('损坏行') && after.includes('"ev":"llm_call"'), '保守保留未动文件')
+    // 再写入一行 30 天前的 → 只清它
+    env.store.appendText(llmCallRelPath(CHAT), JSON.stringify({ ev: 'llm_call', ts: NOW - 30 * DAY }) + '\n')
+    const res2 = await mkRetention(env).run()
+    assert.equal(res2.llmCallsPruned[CHAT], 1)
+    const kept = readFileSync(join(env.base, llmCallRelPath(CHAT)), 'utf8').trim().split('\n')
+    assert.equal(kept.length, 3, '损坏行 + 新鲜行 + 缺 ts 行全部保留')
+  } finally {
+    env.cleanup()
+  }
+})

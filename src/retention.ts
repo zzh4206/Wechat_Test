@@ -10,6 +10,7 @@
  */
 import type { GroupStoreService } from './group-store.js'
 import type { Store } from './store.js'
+import { llmCallRelPath } from './llm-observe.js'
 
 export interface RetentionLogger {
   info(message: string): unknown
@@ -39,9 +40,18 @@ export interface RetentionRunResult {
   ran: boolean
   /** chatId → 本次删除条数（仅成功群计入） */
   deleted: Record<string, number>
+  /** T8：chatId → 本次清理的 llm-calls.jsonl 行数（+7 天滚动；无文件/无过期行为空） */
+  llmCallsPruned?: Record<string, number>
 }
 
 const DAY_MS = 86_400_000
+
+/**
+ * T8 挂账项：llm-calls.jsonl 滚动保留期（+7 天，与报告检查点 ckpt TTL 对齐——
+ * 技术文档 §5「窗口成功后随 retention 清理（+7 天）」同口径）。观测行 7 天足够
+ * 驱动标定/评审，超期清理防 jsonl 无界增长。
+ */
+export const LLM_CALLS_TTL_MS = 7 * DAY_MS
 
 export class RetentionService {
   private readonly now: () => number
@@ -64,6 +74,7 @@ export class RetentionService {
     const cutoff = this.now() - this.retentionMs
     this.options.store.ensureDir('retention') // 审计目录（appendJsonl 不建父目录）
     const deleted: Record<string, number> = {}
+    const llmCallsPruned: Record<string, number> = {}
     for (const chatId of this.options.groups) {
       try {
         deleted[chatId] = await this.options.groupStore.deleteMessagesBefore(chatId, cutoff)
@@ -76,8 +87,47 @@ export class RetentionService {
       } catch (error) {
         this.options.logger.warn(`retention cleanup failed for ${chatId}: ${String(error)}`)
       }
+      // T8：llm-calls.jsonl +7 天滚动清理（独立 try——单文件失败不影响 messages 清理）
+      try {
+        const pruned = this.pruneLlmCalls(chatId)
+        if (pruned > 0) llmCallsPruned[chatId] = pruned
+      } catch (error) {
+        this.options.logger.warn(`retention llm-calls prune failed for ${chatId}: ${String(error)}`)
+      }
     }
-    return { ran: true, deleted }
+    return { ran: true, deleted, llmCallsPruned }
+  }
+
+  /**
+   * T8：清理某群 llm-calls.jsonl 里 ts 早于 +7 天截止的行。jsonl 是追加型——
+   * 按行过滤后整文件重写（经 Store.writeText 现有机制落盘，先读后写、写失败只
+   * warn 不抛错）。单行解析失败/缺 ts 字段 → 保守保留该行（绝不误删）。
+   * 返回清理行数（0 = 无需重写）。
+   */
+  private pruneLlmCalls(chatId: string): number {
+    const rel = llmCallRelPath(chatId)
+    const raw = this.options.store.readText(rel)
+    if (raw === null || raw === '') return 0
+    const cutoff = this.now() - LLM_CALLS_TTL_MS
+    const kept: string[] = []
+    let pruned = 0
+    for (const line of raw.split('\n')) {
+      if (line === '') continue // 追加型 jsonl 的行尾/末尾空行，重写时自然归一
+      let drop = false
+      try {
+        const row = JSON.parse(line) as { ts?: unknown }
+        // 只有「能解析且 ts 为过期数字」的行才删；其余（无 ts/损坏行）保守保留
+        if (typeof row?.ts === 'number' && Number.isFinite(row.ts) && row.ts < cutoff) drop = true
+      } catch {
+        drop = false
+      }
+      if (drop) pruned++
+      else kept.push(line)
+    }
+    if (pruned === 0) return 0
+    // 整文件重写（Store 现有写入机制：先过路径围栏，失败只记日志不抛错）
+    this.options.store.writeText(rel, kept.length > 0 ? kept.map((l) => `${l}\n`).join('') : '')
+    return pruned
   }
 
   /** 启动：先立即跑一轮，再按 intervalMs 心跳（默认每日一次）。返回清理函数。 */

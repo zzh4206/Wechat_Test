@@ -34,6 +34,8 @@ import { LlmCallRecorder, monotonicMs, renderBatchStatsLine, errKindOf, DEFAULT_
 import type { BatchStats, LlmPricingTable } from './llm-observe.js'
 import { runRefinePipeline } from './pipeline-refine.js'
 import type { RefinePipelineResult } from './pipeline-refine.js'
+import { twoStageCall } from './two-stage.js'
+import type { LlmCallPhase } from './llm-observe.js'
 
 // T3：errKindOf 已迁至 llm-observe.ts（与 LlmCallRecorder 同处，report/distiller 共用）；
 // 此处再导出保持旧导入路径（tests/report-timeout-split.test.mjs 等）不变。
@@ -515,6 +517,13 @@ export interface ReportServiceOptions {
    * reports/<chatId>/<dateKey>.refine.json sidecar（draft + σ + 批统计），供人工三维度评审。
    */
   reportPipeline?: 'map-reduce' | 'refine' | 'ab'
+  /**
+   * T8 两段式生成实验开关（Config.schemaTwoStage，默认 false = 零变化）：true 时
+   * 仅 report 生成路径（map 批 / merge 合并 / refine 段）的每次 LLM 调用拆两步——
+   * 第一步自由文本归纳（无 schema 约束），第二步独立格式化为既有 schema（小输入），
+   * 再走既有断言。依据技术文档 §6 风险表（EMNLP 2024：格式约束抑制推理）。
+   */
+  schemaTwoStage?: boolean
   /** 白名单群（聚合遍历范围） */
   groups?: readonly string[]
   /** 聚合排序与选取注入（测试用；缺省 defaultRankGroups） */
@@ -541,6 +550,8 @@ export class ReportService {
   private readonly adaptiveBatch: boolean
   /** T7：报告归纳管线（默认 'map-reduce'；非法值一律回退安全默认） */
   private readonly pipeline: 'map-reduce' | 'refine' | 'ab'
+  /** T8：两段式生成实验开关（默认 false = 单段式零变化） */
+  private readonly twoStage: boolean
   private readonly mono: () => number
   private readonly groups: readonly string[]
   private readonly rankFn: (stats: readonly GroupStats[]) => string[]
@@ -553,6 +564,7 @@ export class ReportService {
     this.batchThreshold = Math.max(10, Math.floor(options.batchThreshold ?? BATCH_THRESHOLD_DEFAULT))
     this.adaptiveBatch = options.adaptiveBatch ?? true
     this.pipeline = options.reportPipeline === 'refine' || options.reportPipeline === 'ab' ? options.reportPipeline : 'map-reduce'
+    this.twoStage = options.schemaTwoStage ?? false
     this.mono = options.monotonicMs ?? monotonicMs
     this.groups = options.groups ?? []
     this.rankFn = options.rankGroups ?? defaultRankGroups
@@ -636,8 +648,9 @@ export class ReportService {
       for (let attempt = 0; attempt < 2 && draft === null; attempt++) {
         try {
           // T3：单次调用路径也走 llm_call 记录（phase='map'，单批显示 1 批）
+          // T8：schemaTwoStage=true 时此调用拆两步（自由文本→格式化，均记 phase='map'）
           const prompt = this.buildPrompt(chatId, kind, win, messages, persons)
-          const raw = await rec.call(chatId, kind, 'map', 1, messages.length, prompt, () => this.options.llm.complete(prompt))
+          const raw = await this.gen(chatId, kind, 'map', 1, messages.length, prompt, rec)
           draft = parseReportDraft(raw, messages.length)
           if (draft === null) assertionFails++
         } catch (error) {
@@ -781,6 +794,26 @@ export class ReportService {
   }
 
   // —— 内部 ——
+
+  /**
+   * T8 两段式生成统一调用点：schemaTwoStage=true 时每次生成调用拆成
+   * 「自由文本归纳 → 独立格式化为既有 schema」两次 LLM 调用（同 phase 记录，
+   * 成本天然累计）；false = 原单段式调用，零行为差异。
+   */
+  private async gen(
+    chatId: string,
+    kind: ReportKind,
+    phase: LlmCallPhase,
+    batch: number,
+    msgs: number,
+    prompt: string,
+    rec: LlmCallRecorder,
+  ): Promise<string> {
+    if (this.twoStage) {
+      return twoStageCall({ chatId, kind, phase, batch, msgs, prompt, llm: this.options.llm, rec })
+    }
+    return rec.call(chatId, kind, phase, batch, msgs, prompt, () => this.options.llm.complete(prompt))
+  }
 
   private async recordMeta(
     chatId: string,
@@ -1031,7 +1064,8 @@ export class ReportService {
     for (let attempt = 0; attempt < 2 && draft === null; attempt++) {
       try {
         // T3：合并调用也落 llm_call（phase='merge'，batch=0 表示非批归纳调用）
-        const raw = await rec.call(chatId, kind, 'merge', 0, messages.length, mergePrompt, () => this.options.llm.complete(mergePrompt))
+        // T8：schemaTwoStage=true 时合并调用同样拆两步（自由文本→格式化，均记 phase='merge'）
+        const raw = await this.gen(chatId, kind, 'merge', 0, messages.length, mergePrompt, rec)
         draft = parseReportDraft(raw, messages.length)
         if (draft === null) assertionFails++
       } catch (error) {
@@ -1088,8 +1122,9 @@ export class ReportService {
       let raw: string
       try {
         // T3：批归纳调用走 llm_call 记录（对半子批 batch 号沿用原批号解析后的数字位）
+        // T8：schemaTwoStage=true 时批调用拆两步（自由文本→格式化，均记 phase='map'）
         const prompt = this.buildPrompt(chatId, kind, win, msgs, persons, start)
-        raw = await rec.call(chatId, kind, 'map', Number(batchKey.split('-')[0]) || 1, msgs.length, prompt, () => this.options.llm.complete(prompt))
+        raw = await this.gen(chatId, kind, 'map', Number(batchKey.split('-')[0]) || 1, msgs.length, prompt, rec)
       } catch (error) {
         const redacted = redactSecretLike(String(error).slice(0, 160))
         if (errKindOf(error) === 'timeout') {
@@ -1182,6 +1217,8 @@ export class ReportService {
       rec,
       parseDraft: parseReportDraft,
       maxSeg: this.effectiveMaxSeg(chatId, kind),
+      // T8：两段式实验开关透传到 refine 段调用（B 路径同样只在实验开关开时拆两步）
+      schemaTwoStage: this.twoStage,
       sleep: this.sleepFn,
       now: this.now,
     })

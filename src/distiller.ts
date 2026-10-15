@@ -21,6 +21,7 @@ import type { BufferPool } from './buffer.js'
 import type { PersonaService } from './persona.js'
 import type { StoreLogger } from './store.js'
 import type { LlmCallRecorder } from './llm-observe.js'
+import { errKindOf } from './llm-observe.js'
 
 export const INSIGHT_TYPES = ['topic', 'viewpoint', 'quote', 'opportunity'] as const
 export type InsightType = (typeof INSIGHT_TYPES)[number]
@@ -254,6 +255,17 @@ export interface DistillerOptions {
    * 注入时每次提炼调用落一行 {ev:'llm_call', phase:'distill'}；缺省保持零观测（旧测试不变）。
    */
   llmCallRecorder?: LlmCallRecorder
+  /**
+   * T8：读该群 safe-batch 状态（只读不写——distiller 不污染报告管线的 safeBatch
+   * 反馈环）。返回该群当前生效批上限；无状态/非法返回 null（调用方回退静态上限）。
+   */
+  readSafeBatch?: (chatId: string) => number | null
+  /**
+   * T8：Config.batchThreshold——无 safe-batch 状态时的静态上限来源之一
+   * （与 distillEveryMessages 取 min；缺省只按 distillEveryMessages）。
+   * distiller 侧不做 ×0.7/×1.2 自适应反馈环（报告管线已有，避免双环互相干扰）。
+   */
+  batchThreshold?: number
 }
 
 /** prompt 两段之间的固定分隔标记（测试用它断言指令区与数据区分离） */
@@ -313,28 +325,62 @@ export class Distiller {
     }
   }
 
-  /** 手动/自动触发提炼；同群串行（_distilling 防重入） */
+  /**
+   * T8：本次提炼的生效批上限——读该群 safe-batch 状态（只读不写），无状态则回退
+   * min(distillEveryMessages, batchThreshold) 静态上限。distiller 不做自适应反馈环。
+   */
+  private batchLimit(chatId: string): number {
+    const every = Math.max(1, Math.floor(this.options.distillEveryMessages))
+    const threshold = this.options.batchThreshold
+    const fallback = Math.max(1, Math.min(every, threshold !== undefined ? Math.max(1, Math.floor(threshold)) : every))
+    const sb = this.options.readSafeBatch?.(chatId)
+    return typeof sb === 'number' && Number.isFinite(sb) && sb >= 1 ? Math.max(1, Math.floor(sb)) : fallback
+  }
+
+  /**
+   * 手动/自动触发提炼；同群串行（_distilling 防重入）。
+   *
+   * T8 积压治理：snapshot 条数 > 生效批上限时，按时间序切 ≤ 上限的批，逐批调 LLM
+   * 提炼，insights 合并去重（按条目内容精确去重，覆盖 quote.text 场景）后走既有
+   * onInsights；单批失败只跳过该批（warn 含批号），其余照常；全部批失败返回 false
+   * （与旧单次调用失败语义一致）。≤ 上限时单批路径零变化。
+   */
   async tryDistill(chatId: string, reason: 'message-threshold' | 'interval' | 'manual'): Promise<boolean> {
     if (this._distilling) return false
     const messages = this.options.buffer.snapshot(chatId)
     if (messages.length === 0) return false
     this._distilling = true
     try {
-      const prompt = this.buildPrompt(chatId, messages)
-      // T3：提炼调用也落 llm_call（phase='distill'；kind='distill'，batch 固定 1）
-      const call = () => this.options.llm.complete(prompt)
-      const raw = this.options.llmCallRecorder
-        ? await this.options.llmCallRecorder.call(chatId, 'distill', 'distill', 1, messages.length, prompt, call)
-        : await call()
-      const insights = parseInsights(raw)
-      if (insights === null) {
-        this.options.logger.warn(
-          `distill[${chatId}](${reason}): invalid LLM output, batch dropped`,
-        )
+      const limit = this.batchLimit(chatId)
+      const batches: typeof messages[] = []
+      for (let i = 0; i < messages.length; i += limit) batches.push(messages.slice(i, i + limit))
+      const merged: Insight[] = []
+      const seen = new Set<string>()
+      let okBatches = 0
+      for (let b = 0; b < batches.length; b++) {
+        const got = await this.distillOneBatch(chatId, reason, batches[b]!, b + 1, batches.length)
+        if (got === null) continue
+        okBatches++
+        // 精确去重：批间可能对同一话题/引用重复产出——按条目全部字段（不含事后
+        // 补的 ts/group）序列化比对，quote.text 相同即同一 key（任务卡 T8 约定）。
+        for (const it of got) {
+          const key = JSON.stringify(it)
+          if (seen.has(key)) continue
+          seen.add(key)
+          merged.push(it)
+        }
+      }
+      if (okBatches === 0) {
+        // 多批场景补一行汇总（单批已有 per-batch warn，保持旧路径 warn 数不变）
+        if (batches.length > 1) {
+          this.options.logger.warn(
+            `distill[${chatId}](${reason}): all ${batches.length} batch(es) failed, no insights produced`,
+          )
+        }
         return false
       }
       const ts = new Date(this.now()).toISOString()
-      const stamped = insights.map((it) => ({ ...it, ts, group: chatId }))
+      const stamped = merged.map((it) => ({ ...it, ts, group: chatId }))
       this.lastDistill.set(chatId, this.now())
       this.counters.set(chatId, 0)
       this.bumpToday(chatId, stamped.length)
@@ -346,6 +392,69 @@ export class Distiller {
     } finally {
       this._distilling = false
     }
+  }
+
+  /**
+   * 单批提炼（T8）：返回该批 insights（空数组合法）；返回 null = 该批失败已跳过。
+   * - LLM 调用异常（非 timeout）→ 重试一次，仍失败 → 跳过该批（warn 含批号）；
+   * - timeout → 对半切分递归（与 report.ts distillBatch 同治：改变参数重试，
+   *   技术文档 §3.3 依据 E2）；叶子批（<5 条）仍 timeout → 跳过该批；
+   * - 输出解析失败（非法 JSON/未知 type/超长）→ 沿用既有"整批丢弃"语义
+   *   （warn 一次，不重试——保持与旧单批路径完全一致，存量测试不动）。
+   */
+  private async distillOneBatch(
+    chatId: string,
+    reason: 'message-threshold' | 'interval' | 'manual',
+    msgs: ReturnType<BufferPool['snapshot']>,
+    batchNo: number,
+    batchCount: number,
+  ): Promise<Insight[] | null> {
+    const prompt = this.buildPrompt(chatId, msgs)
+    const call = () => {
+      // T3：提炼调用也落 llm_call（phase='distill'；kind='distill'；子批沿用原批号）
+      const fn = () => this.options.llm.complete(prompt)
+      return this.options.llmCallRecorder
+        ? this.options.llmCallRecorder.call(chatId, 'distill', 'distill', batchNo, msgs.length, prompt, fn)
+        : fn()
+    }
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let raw: string
+      try {
+        raw = await call()
+      } catch (error) {
+        const desc = String(error)
+        if (errKindOf(error) === 'timeout') {
+          // 容量型故障：对半切分（改变参数重试）；叶子批（<5 条）禁止再切 → 跳过
+          if (msgs.length < 5) {
+            this.options.logger.warn(
+              `distill[${chatId}](${reason}) batch ${batchNo}/${batchCount} timeout at leaf (${msgs.length} msgs), batch skipped: ${desc}`,
+            )
+            return null
+          }
+          const mid = Math.floor(msgs.length / 2)
+          const left = await this.distillOneBatch(chatId, reason, msgs.slice(0, mid), batchNo, batchCount)
+          const right = await this.distillOneBatch(chatId, reason, msgs.slice(mid), batchNo, batchCount)
+          if (left === null && right === null) return null
+          return [...(left ?? []), ...(right ?? [])]
+        }
+        if (attempt === 1) {
+          this.options.logger.warn(
+            `distill[${chatId}](${reason}) batch ${batchNo}/${batchCount} failed after retry, batch skipped: ${desc}`,
+          )
+          return null
+        }
+        this.options.logger.warn(`distill[${chatId}](${reason}) batch ${batchNo}/${batchCount} llm failed, retry once: ${desc}`)
+        continue
+      }
+      const insights = parseInsights(raw)
+      if (insights !== null) return insights
+      // 解析失败：沿用既有"整批丢弃"语义（与旧路径 warn 文案一致，不重试）
+      this.options.logger.warn(
+        `distill[${chatId}](${reason}): invalid LLM output, batch dropped`,
+      )
+      return null
+    }
+    return null
   }
 
   /**
