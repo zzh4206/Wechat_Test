@@ -30,6 +30,12 @@ import { assertInsideState, redactSecretLike } from './guard.js'
 import type { GroupStoreService, StoredMessage, ReportMetaRow } from './group-store.js'
 import type { LlmClient } from './distiller.js'
 import { localDayKey } from './person-digest.js'
+import { LlmCallRecorder, monotonicMs, sinceMs, renderBatchStatsLine, errKindOf } from './llm-observe.js'
+import type { BatchStats } from './llm-observe.js'
+
+// T3：errKindOf 已迁至 llm-observe.ts（与 LlmCallRecorder 同处，report/distiller 共用）；
+// 此处再导出保持旧导入路径（tests/report-timeout-split.test.mjs 等）不变。
+export { errKindOf } from './llm-observe.js'
 
 export type ReportKind = 'daily' | 'weekly' | 'monthly'
 export const REPORT_KINDS: readonly ReportKind[] = ['daily', 'weekly', 'monthly']
@@ -182,16 +188,7 @@ export const BATCH_THRESHOLD_DEFAULT = 120
 
 // —————————————————— T1：timeout 分类 + 批间退避 ——————————————————
 
-/**
- * 错误分类（T1，技术文档 §3.3）：timeout 类故障对半切分重试（改变参数重试），
- * 非 timeout（断言/解析失败、其他异常）保持"重试一次"。
- * 匹配 distiller 抛出的 `llm stream finished with error: Request timed out.`
- * 用 `/timed?\s?out|timeout/i` 容错匹配（覆盖 timeout / timed out / timedout 等变体）。
- */
-export function errKindOf(error: unknown): 'timeout' | 'other' {
-  const msg = error instanceof Error ? error.message : String(error ?? '')
-  return /timed?\s?out|timeout/i.test(msg) ? 'timeout' : 'other'
-}
+// errKindOf 定义已迁至 llm-observe.ts（见文件头再导出；行为与 T1 完全一致）
 
 /** 批间退避基数（2s 起，指数增长） */
 export const BACKOFF_BASE_MS = 2_000
@@ -268,6 +265,11 @@ export interface RenderInput {
   board?: { mineOwed: readonly string[]; owedMe: readonly string[] }
   /** L3「本期文件索引」（M5-T5.4 接真数据源）：新文件行（星标/最新版/摘要）。缺省时保留占位行。 */
   fileLines?: readonly string[]
+  /**
+   * T3 batch_stats：本次生成的批统计（批数/失败批/最大批耗时/缓存命中/总调用/总耗时）。
+   * 提供时在报告末尾追加一行统计（degraded/empty 也应有合理输出——empty 传全 0）。
+   */
+  batchStats?: Readonly<BatchStats>
 }
 
 /** 三层金字塔 Markdown 渲染（纯函数） */
@@ -284,6 +286,8 @@ export function renderReport(input: RenderInput): string {
   }
   if (status === 'empty') {
     lines.push('本期窗口内无消息，无内容可归纳。', '')
+    // T3：empty 路径也输出 batch_stats 行（全 0——零 LLM 调用可见化）
+    if (input.batchStats) lines.push(renderBatchStatsLine(input.batchStats), '')
     return lines.join('\n')
   }
   // —— L1 一分钟层 ——
@@ -363,6 +367,8 @@ export function renderReport(input: RenderInput): string {
   }
   lines.push('')
   lines.push('### 条目变更记录', '', '-（M4 事件/任务/承诺变更记录接入后回填）', '')
+  // T3：报告末尾追加 batch_stats 统计行（技术文档 §7）
+  if (input.batchStats) lines.push(renderBatchStatsLine(input.batchStats), '')
   return lines.join('\n')
 }
 
@@ -438,6 +444,11 @@ export interface ReportServiceOptions {
   /** T1：批间退避 sleep 注入（缺省 setTimeout 封装；测试注入 spy/零延迟） */
   sleep?: (ms: number) => Promise<void>
   now?: () => number
+  /**
+   * T3 告警通道（技术文档 §7）：同群同 kind 连续 2 个窗口 degraded → notify 推送。
+   * 可注入 SystemNotifier（dry_run 语义由其内部保持）；缺省不告警（仍持久化计数）。
+   */
+  notifier?: { notify(kind: string, title: string, body: string): Promise<unknown> }
 }
 
 export class ReportService {
@@ -486,10 +497,15 @@ export class ReportService {
     }
     const messages = this.options.groupStore.getMessages(chatId, { afterTs: win.start - 1, beforeTs: win.end, limit: 2000 })
     const messageCount = messages.length
+    // T3：每次 run 新建一个记录器——其累计统计恰为本次的 LLM 调用数/总耗时（batch_stats 来源）
+    const rec = new LlmCallRecorder(this.options.store, this.now)
     if (messageCount === 0) {
-      const md = renderReport({ kind, chatId, window: win, draft: null, status: 'empty', messageCount: 0, quotes: [], persons: [], actions: this.collectActions(chatId, win), board: this.collectBoard(chatId, win), fileLines: this.collectFileLines(chatId, win) })
+      // T3：empty 路径 batch_stats 全 0（零 LLM 调用可见化）
+      const batchStats: BatchStats = { batches: 0, failedBatches: 0, maxBatchMs: 0, ckptHits: 0, totalCalls: 0, totalMs: 0 }
+      const md = renderReport({ kind, chatId, window: win, draft: null, status: 'empty', messageCount: 0, quotes: [], persons: [], actions: this.collectActions(chatId, win), board: this.collectBoard(chatId, win), fileLines: this.collectFileLines(chatId, win), batchStats })
       this.options.store.writeText(rel, md)
-      await this.recordMeta(chatId, kind, win, 'empty', rel, 0, 0, 0, '')
+      await this.recordMeta(chatId, kind, win, 'empty', rel, 0, 0, 0, '', batchStats)
+      await this.trackDegradedStreak(chatId, kind, 'empty')
       return { status: 'empty', path: rel, judgmentCount: 0, topicCount: 0, messageCount: 0 }
     }
     const persons = this.collectPersons(chatId, win.dateKey)
@@ -499,17 +515,22 @@ export class ReportService {
     let llmError: string | null = null
     let assertionFails = 0
     let partialNote = ''
+    // T3：批统计骨架（批数/失败批/最大批耗时/检查点命中由各路径回填；总调用/总耗时来自 rec）
+    let bs: BatchStats = { batches: 1, failedBatches: 0, maxBatchMs: 0, ckptHits: 0, totalCalls: 0, totalMs: 0 }
     if (messages.length > this.batchThreshold) {
       // 大窗口分批归纳+合并（线上实测 181 条单次调用 Request timed out）
-      const res = await this.runBatched(chatId, kind, win, messages, persons)
+      const res = await this.runBatched(chatId, kind, win, messages, persons, rec)
       draft = res.draft
       llmError = res.llmError
       assertionFails = res.assertionFails
       partialNote = res.partialNote
+      bs = res.stats
     } else {
       for (let attempt = 0; attempt < 2 && draft === null; attempt++) {
         try {
-          const raw = await this.options.llm.complete(this.buildPrompt(chatId, kind, win, messages, persons)) // eslint-disable-line
+          // T3：单次调用路径也走 llm_call 记录（phase='map'，单批显示 1 批）
+          const prompt = this.buildPrompt(chatId, kind, win, messages, persons)
+          const raw = await rec.call(chatId, kind, 'map', 1, messages.length, prompt, () => this.options.llm.complete(prompt))
           draft = parseReportDraft(raw, messages.length)
           if (draft === null) assertionFails++
         } catch (error) {
@@ -539,12 +560,21 @@ export class ReportService {
     }
 
     const quotes = this.pickQuotes(draft, messages)
-    const md = renderReport({ kind, chatId, window: win, draft, status, messageCount, degradedReason, partialNote, quotes, persons, actions: this.collectActions(chatId, win), board: this.collectBoard(chatId, win), fileLines: this.collectFileLines(chatId, win) })
+    // T3：回填 batch_stats 终值——单次调用路径失败批随最终 status 定（degraded=1 批全失败）；
+    // 分批路径 failedBatches 已由 runBatched 按批回填（部分失败不整体降级时更真实）
+    const batchStats: BatchStats = {
+      ...bs,
+      failedBatches: messages.length > this.batchThreshold ? bs.failedBatches : status === 'degraded' ? 1 : 0,
+      totalCalls: rec.getStats().calls,
+      totalMs: rec.getStats().totalMs,
+    }
+    const md = renderReport({ kind, chatId, window: win, draft, status, messageCount, degradedReason, partialNote, quotes, persons, actions: this.collectActions(chatId, win), board: this.collectBoard(chatId, win), fileLines: this.collectFileLines(chatId, win), batchStats })
     const written = this.options.store.writeText(rel, md)
     const path = written ? rel : null
     const judgmentCount = draft?.judgments.length ?? 0
     const topicCount = draft?.topics.length ?? 0
-    await this.recordMeta(chatId, kind, win, status, rel, judgmentCount, topicCount, messageCount, status === 'degraded' ? degradedReason : partialNote)
+    await this.recordMeta(chatId, kind, win, status, rel, judgmentCount, topicCount, messageCount, status === 'degraded' ? degradedReason : partialNote, batchStats)
+    await this.trackDegradedStreak(chatId, kind, status)
     return { status, path, judgmentCount, topicCount, messageCount }
   }
 
@@ -628,6 +658,8 @@ export class ReportService {
     topicCount: number,
     messageCount: number,
     note: string,
+    /** T3 batch_stats（向后兼容：新增可选字段，不删旧字段；缺省不写该列） */
+    batchStats?: Readonly<BatchStats>,
   ): Promise<void> {
     const row: ReportMetaRow = {
       kind,
@@ -641,6 +673,7 @@ export class ReportService {
       messageCount,
       generatedAt: this.now(),
       note,
+      batchStats: batchStats ? { ...batchStats } : undefined,
     }
     const ok = await this.options.groupStore.appendReportMeta(chatId, row)
     if (!ok) this.options.logger.warn(`report[${chatId}]: appendReportMeta failed for ${win.dateKey}`)
@@ -805,7 +838,8 @@ export class ReportService {
     win: ReportWindow,
     messages: readonly StoredMessage[],
     persons: ReadonlyArray<{ name: string; line: string }>,
-  ): Promise<{ draft: ReportDraft | null; llmError: string | null; assertionFails: number; partialNote: string }> {
+    rec: LlmCallRecorder,
+  ): Promise<{ draft: ReportDraft | null; llmError: string | null; assertionFails: number; partialNote: string; stats: BatchStats }> {
     const tag = `report[${chatId}/${kind}/${win.dateKey}]`
     const size = this.batchThreshold
     const batches: Array<{ start: number; msgs: StoredMessage[] }> = []
@@ -814,22 +848,27 @@ export class ReportService {
     const bo: BackoffState = { streak: 0, sleep: this.sleepFn }
     const parts: Array<{ batch: number; degraded: boolean; draft: ReportDraft | null }> = []
     const failedBatches: number[] = []
+    // T3 batch_stats 骨架：批数/失败批/最大批耗时（不含批间退避 sleep）/检查点命中
+    const bs: BatchStats = { batches: batches.length, failedBatches: 0, maxBatchMs: 0, ckptHits: 0, totalCalls: 0, totalMs: 0 }
     for (let b = 0; b < batches.length; b++) {
       // 批间退避：上一批失败（连续失败 streak>0）→ 与下一批之间 sleep（指数+抖动）
       if (bo.streak > 0) await bo.sleep(backoffDelayMs(bo.streak))
       const { start, msgs } = batches[b]
-      const res = await this.distillBatch(chatId, kind, win, messages, persons, msgs, start, String(b + 1), ckpt, bo, tag, `${b + 1}/${batches.length}`)
+      const bt0 = monotonicMs()
+      const res = await this.distillBatch(chatId, kind, win, messages, persons, msgs, start, String(b + 1), ckpt, bo, tag, `${b + 1}/${batches.length}`, bs, rec)
+      bs.maxBatchMs = Math.max(bs.maxBatchMs, sinceMs(bt0))
       if (res.drafts.length > 0) {
         bo.streak = 0
         for (const d of res.drafts) parts.push({ batch: b + 1, degraded: false, draft: d })
       }
       if (res.degraded) {
+        bs.failedBatches++
         failedBatches.push(b + 1)
         parts.push({ batch: b + 1, degraded: true, draft: null })
       }
     }
     if (failedBatches.length === batches.length) {
-      return { draft: null, llmError: '分批归纳全部批次失败（含对半切分与重试）', assertionFails: 0, partialNote: '' }
+      return { draft: null, llmError: '分批归纳全部批次失败（含对半切分与重试）', assertionFails: 0, partialNote: '', stats: bs }
     }
     // 合并调用（输入=各批摘要，输出=最终 schema；不缓存）
     let draft: ReportDraft | null = null
@@ -838,7 +877,8 @@ export class ReportService {
     const mergePrompt = this.buildMergePrompt(chatId, kind, win, parts, failedBatches, messages.length)
     for (let attempt = 0; attempt < 2 && draft === null; attempt++) {
       try {
-        const raw = await this.options.llm.complete(mergePrompt)
+        // T3：合并调用也落 llm_call（phase='merge'，batch=0 表示非批归纳调用）
+        const raw = await rec.call(chatId, kind, 'merge', 0, messages.length, mergePrompt, () => this.options.llm.complete(mergePrompt))
         draft = parseReportDraft(raw, messages.length)
         if (draft === null) assertionFails++
       } catch (error) {
@@ -852,7 +892,7 @@ export class ReportService {
     const partialNote = failedBatches.length > 0
       ? `部分素材归纳失败：第 ${failedBatches.join('、')} 批 LLM 调用失败（含对半切分与重试），已跳过该批素材`
       : ''
-    return { draft, llmError, assertionFails, partialNote }
+    return { draft, llmError, assertionFails, partialNote, stats: bs }
   }
 
   /**
@@ -875,14 +915,23 @@ export class ReportService {
     bo: BackoffState,
     tag: string,
     label: string,
+    /** T3 batch_stats 累计器（检查点命中在此累加；批耗时由 runBatched 外层计时） */
+    bs: BatchStats,
+    /** T3 llm_call 记录器（每次批调用落一行 phase='map'） */
+    rec: LlmCallRecorder,
   ): Promise<{ drafts: ReportDraft[]; degraded: boolean }> {
     const ckptKey = reportCkptKey(chatId, kind, win, batchKey, start, msgs.length)
     const hit = ckpt.get(ckptKey)
-    if (hit) return { drafts: [hit.draft], degraded: false }
+    if (hit) {
+      bs.ckptHits++
+      return { drafts: [hit.draft], degraded: false }
+    }
     for (let attempt = 0; attempt < 2; attempt++) {
       let raw: string
       try {
-        raw = await this.options.llm.complete(this.buildPrompt(chatId, kind, win, msgs, persons, start))
+        // T3：批归纳调用走 llm_call 记录（对半子批 batch 号沿用原批号解析后的数字位）
+        const prompt = this.buildPrompt(chatId, kind, win, msgs, persons, start)
+        raw = await rec.call(chatId, kind, 'map', Number(batchKey.split('-')[0]) || 1, msgs.length, prompt, () => this.options.llm.complete(prompt))
       } catch (error) {
         const redacted = redactSecretLike(String(error).slice(0, 160))
         if (errKindOf(error) === 'timeout') {
@@ -892,8 +941,8 @@ export class ReportService {
           if (msgs.length < 5) return { drafts: [], degraded: true }
           await bo.sleep(backoffDelayMs(bo.streak))
           const mid = Math.floor(msgs.length / 2)
-          const left = await this.distillBatch(chatId, kind, win, messages, persons, msgs.slice(0, mid), start, `${batchKey}-1`, ckpt, bo, tag, `${label}左半`)
-          const right = await this.distillBatch(chatId, kind, win, messages, persons, msgs.slice(mid), start + mid, `${batchKey}-2`, ckpt, bo, tag, `${label}右半`)
+          const left = await this.distillBatch(chatId, kind, win, messages, persons, msgs.slice(0, mid), start, `${batchKey}-1`, ckpt, bo, tag, `${label}左半`, bs, rec)
+          const right = await this.distillBatch(chatId, kind, win, messages, persons, msgs.slice(mid), start + mid, `${batchKey}-2`, ckpt, bo, tag, `${label}右半`, bs, rec)
           return { drafts: [...left.drafts, ...right.drafts], degraded: left.degraded || right.degraded }
         }
         this.options.logger.warn(`${tag} batch ${label} llm failed: ${redacted}`)
@@ -939,6 +988,53 @@ export class ReportService {
   /** 持久化检查点（整文件覆写；每批成功即落盘，中断后可续跑） */
   private saveCkpt(chatId: string, ckpt: Map<string, { draft: ReportDraft; ts: number }>): void {
     this.options.store.writeText(reportCkptRelPath(chatId), JSON.stringify(Object.fromEntries(ckpt)))
+  }
+
+  // —————————————— T3：degraded 连续窗口告警（技术文档 §7） ——————————————
+
+  /**
+   * 告警状态文件（与 ckpt.json 同级）：`{ "<kind>": 连续 degraded 窗口数 }`。
+   * 按 (chatId, kind) 分别记（文件每群一个，kind 为键）；成功/empty 即清零。
+   */
+  private alertStateRelPath(chatId: string): string {
+    return ['reports', chatId, 'alert-state.json'].join('/')
+  }
+
+  /**
+   * 窗口结束状态入账：degraded → 连续计数 +1；ok/empty → 清零。
+   * 连续恰第 2 个 degraded 窗口时经 notify 通道告警一次（第 3 个起不重复刷屏；
+   * dry_run 语义由注入的 SystemNotifier 内部保持）。持久化与告警解耦——
+   * 未注入 notifier 也照常计数（后续接通通道即可生效）。
+   */
+  private async trackDegradedStreak(chatId: string, kind: ReportKind, status: 'ok' | 'degraded' | 'empty'): Promise<void> {
+    const rel = this.alertStateRelPath(chatId)
+    let state: Record<string, number> = {}
+    try {
+      const raw = this.options.store.readText(rel)
+      const parsed = raw === null ? {} : (JSON.parse(raw) as Record<string, unknown>)
+      if (parsed && typeof parsed === 'object') {
+        for (const [k, v] of Object.entries(parsed)) if (typeof v === 'number') state[k] = v
+      }
+    } catch (error) {
+      this.options.logger.warn(`report[${chatId}]: 告警状态文件损坏，作废重来：${String(error).slice(0, 120)}`)
+      state = {}
+    }
+    const prev = state[kind] ?? 0
+    const streak = status === 'degraded' ? prev + 1 : 0
+    state[kind] = streak
+    this.options.store.writeText(rel, JSON.stringify(state))
+    if (streak !== 2) return
+    const notifier = this.options.notifier
+    if (!notifier) return
+    try {
+      await notifier.notify(
+        'report-degraded',
+        `报告连续降级：${chatId}`,
+        `${kind} 报告连续 2 个窗口 degraded，请检查 LLM 服务状态与近期报告`,
+      )
+    } catch (error) {
+      this.options.logger.warn(`report[${chatId}]: degraded 告警 notify 失败：${String(error).slice(0, 120)}`)
+    }
   }
 
   /** 合并调用 prompt：指令区=同一 schema 的最终报告；数据区=各批摘要 JSON（degraded 批带标注） */

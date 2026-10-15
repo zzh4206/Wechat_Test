@@ -30,6 +30,7 @@ import type { WatchListEntry } from './persona-track.js'
 import { PersonDigestService } from './person-digest.js'
 // M3：三层金字塔报告引擎 + 发件箱日志替身（新增行，不动他人行）
 import { ReportService } from './report.js'
+import { LlmCallRecorder } from './llm-observe.js'
 import type { ReportKind } from './report.js'
 import { localDayKey } from './person-digest.js'
 import { Outbox } from './outbox.js'
@@ -308,6 +309,9 @@ export function apply(ctx: Context, config: PluginConfig): void {
   // 初始化即建目录；失败只记日志，不阻断宿主。
   store.ensureDir('.')
 
+  // —— T3：LLM 调用结构化观测（report/distiller 共用同一记录器；JSONL 落 groups/<chatId>/） ——
+  const llmCallRecorder = new LlmCallRecorder(store)
+
   const personas = new PersonaService({ stateDir, logger })
 
   // —— WP3 接线：限流 → 缓冲 → 提炼 → 事件总线 ——
@@ -455,6 +459,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
       aggregationMaxGroups: config.aggregationMaxGroups,
       batchThreshold: config.batchThreshold,
       groups: config.groups,
+      notifier, // T3：同群连续 2 个窗口 degraded → notify 告警（dry_run 语义在 SystemNotifier 内保持）
     })
   }
 
@@ -590,6 +595,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
     logger: logger as unknown as StoreLogger,
     distillEveryMessages: config.distillEveryMessages,
     distillIntervalMin: config.distillIntervalMin,
+    llmCallRecorder, // T3：提炼调用也落 llm_call（phase='distill'）
     onInsights,
   })
 

@@ -18,6 +18,7 @@ import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { assertInsideState } from './guard.js'
 import type { StoreLogger } from './store.js'
+import type { BatchStats } from './llm-observe.js'
 
 /** messages.kind 允许值（D2 §3 + 热修扩展：video/link/other 非文本归类，见 v5 迁移） */
 export const MESSAGE_KINDS = [
@@ -402,6 +403,26 @@ export interface ReportMetaRow {
   generatedAt: number
   /** degraded 真实原因（可见化：LLM 调用异常 vs 断言两次失败）；ok/empty 为空串 */
   note?: string
+  /** T3 batch_stats（本次生成批统计：批数/失败批/最大批耗时/缓存命中/总调用/总耗时）；
+   *  以 JSON 文本入库（batch_stats 列，幂等迁移），读取时解析还原；旧库/旧行为不变 */
+  batchStats?: BatchStats
+}
+
+/** T3：batch_stats 列 JSON 文本 → BatchStats（空串/非法 = undefined；字段齐全才算数） */
+function parseBatchStats(raw: unknown): BatchStats | undefined {
+  if (typeof raw !== 'string' || raw === '') return undefined
+  try {
+    const v = JSON.parse(raw) as Partial<BatchStats>
+    if (
+      typeof v.batches === 'number' && typeof v.failedBatches === 'number' && typeof v.maxBatchMs === 'number' &&
+      typeof v.ckptHits === 'number' && typeof v.totalCalls === 'number' && typeof v.totalMs === 'number'
+    ) {
+      return v as BatchStats
+    }
+    return undefined
+  } catch {
+    return undefined
+  }
 }
 
 /** tasks 表单行（M4-T4.1 追加：任务识别写入/查询） */
@@ -955,15 +976,19 @@ export class GroupStore {
           note          TEXT NOT NULL DEFAULT ''
         );
         `)
-      // 旧库迁移：report_meta 已存在时补 note 列（幂等）
+      // 旧库迁移：report_meta 已存在时补 note / batch_stats 列（幂等）
       const cols = db.prepare(`PRAGMA table_info(report_meta)`).all() as Array<{ name: string }>
       if (!cols.some((c) => c.name === 'note')) {
         db.exec(`ALTER TABLE report_meta ADD COLUMN note TEXT NOT NULL DEFAULT ''`)
       }
+      // T3：batch_stats 列（JSON 文本；缺省空串 = 未统计，向后兼容旧行/旧调用方）
+      if (!cols.some((c) => c.name === 'batch_stats')) {
+        db.exec(`ALTER TABLE report_meta ADD COLUMN batch_stats TEXT NOT NULL DEFAULT ''`)
+      }
       db.prepare(`
         INSERT INTO report_meta
-          (kind, date, window_start, window_end, status, path, judgment_count, topic_count, message_count, generated_at, note)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          (kind, date, window_start, window_end, status, path, judgment_count, topic_count, message_count, generated_at, note, batch_stats)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         row.kind,
         row.date,
@@ -976,6 +1001,7 @@ export class GroupStore {
         Math.floor(row.messageCount ?? 0),
         Math.floor(row.generatedAt),
         String(row.note ?? ''),
+        row.batchStats ? JSON.stringify(row.batchStats) : '',
       )
       return true
     })
@@ -1008,6 +1034,8 @@ export class GroupStore {
         messageCount: Number(r.message_count),
         generatedAt: Number(r.generated_at),
         note: r.note === undefined || r.note === null ? '' : String(r.note),
+        // T3：batch_stats JSON 文本解析还原（空串/损坏 = undefined，旧行为不变）
+        batchStats: parseBatchStats(r.batch_stats),
       }))
     } catch (error) {
       this.logger.error(`group-store[${this.chatId}] getReportMetas failed: ${String(error)}`)

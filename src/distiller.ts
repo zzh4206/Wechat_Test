@@ -20,6 +20,7 @@
 import type { BufferPool } from './buffer.js'
 import type { PersonaService } from './persona.js'
 import type { StoreLogger } from './store.js'
+import type { LlmCallRecorder } from './llm-observe.js'
 
 export const INSIGHT_TYPES = ['topic', 'viewpoint', 'quote', 'opportunity'] as const
 export type InsightType = (typeof INSIGHT_TYPES)[number]
@@ -241,6 +242,11 @@ export interface DistillerOptions {
   clearInterval?: typeof clearInterval
   /** 心跳间隔毫秒（默认 30s；测试可调小） */
   tickMs?: number
+  /**
+   * T3 llm_call 结构化观测记录器（与 report 共用同一实现，不各抄一份）：
+   * 注入时每次提炼调用落一行 {ev:'llm_call', phase:'distill'}；缺省保持零观测（旧测试不变）。
+   */
+  llmCallRecorder?: LlmCallRecorder
 }
 
 /** prompt 两段之间的固定分隔标记（测试用它断言指令区与数据区分离） */
@@ -308,7 +314,11 @@ export class Distiller {
     this._distilling = true
     try {
       const prompt = this.buildPrompt(chatId, messages)
-      const raw = await this.options.llm.complete(prompt)
+      // T3：提炼调用也落 llm_call（phase='distill'；kind='distill'，batch 固定 1）
+      const call = () => this.options.llm.complete(prompt)
+      const raw = this.options.llmCallRecorder
+        ? await this.options.llmCallRecorder.call(chatId, 'distill', 'distill', 1, messages.length, prompt, call)
+        : await call()
       const insights = parseInsights(raw)
       if (insights === null) {
         this.options.logger.warn(

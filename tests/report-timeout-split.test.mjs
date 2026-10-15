@@ -248,7 +248,9 @@ test('T2-⑥ 检查点全命中（重跑）的最终 md 与全量路径完全一
   await b.report.generateReport(CHAT, 'daily', T(20, 30))
   assert.equal(b.llm.calls.length, 1, '检查点全命中：仅合并调用（合并不缓存）')
   const md2 = readFileSync(join(dir, 'reports', CHAT, '2026-06-10.md'), 'utf8')
-  assert.equal(md2, md1, '命中路径最终 draft/md 与全量路径一致')
+  // T3 后报告尾新增 batch_stats 行（缓存命中/耗时逐次必然不同）——剥离后再比对正文等价性
+  const strip = (md) => md.split('\n').filter((l) => !l.startsWith('> 统计：批 ')).join('\n')
+  assert.equal(strip(md2), strip(md1), '命中路径最终 draft/md 与全量路径一致（不含 T3 batch_stats 统计行）')
   rmSync(dir, { recursive: true, force: true })
 })
 
