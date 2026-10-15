@@ -3,13 +3,12 @@
  *
  * 2026-10-15 发送原语替换（用户否决 wechat-ui UI 校准方案——要求常驻聊天窗口太麻烦）：
  * - 发送原语抽为可替换接口 SendPrimitive；两实现：
- *   · KeyboardSender（默认）：wx-chatbot 式键盘模拟（macOS 键位，14 步实证键序 2026-10-15
- *     08:03 人工目视实证通过）——激活微信 → Esc 清弹层 → AX 读窗口 position/size 动态算
- *     搜索框坐标 → 点击左上角搜索框 → 剪贴板写"文件传输助手" → Cmd+V 粘贴 → 延迟 1.2s
- *     （下拉渲染，0.8s 实测不够）→ ↓ 选中第一个结果 → Return 跳转会话 →
- *     剪贴板写消息 → Cmd+V → Return 发送 → 恢复剪贴板。Cmd+F 方案废除（实测打开的是
- *     搜一搜网页面板而非聊天搜索）；中文全部走剪贴板，避开输入法；
- *     不要求常驻聊天窗口（搜索即定位），TCC 只需"辅助功能"（不再需要屏幕录制——验证改用 DB 回读）；
+ *   · KeyboardSender（默认）：wx-chatbot 式键盘模拟（2026-10-15 二次实测简化）——
+ *     **搜索定位整段删除**（实测：Cmd+F 开的是搜一搜面板；点击搜索框时灵时不灵；而
+ *     "前台 + 粘贴 + 回车"直接把文本发进当前会话一次成功）。键序 = activate + 前台确认 →
+ *     剪贴板写消息 → Cmd+V → Return 发送 → 恢复剪贴板。目标会话由"用户当前打开的会话"
+ *     决定（运行前提：文件传输助手是当前会话，发送期间勿切换）；中文走剪贴板避开输入法；
+ *     TCC 只需"辅助功能"；
  *   · WechatUiSender：原 wechat-ui send 实现（Config sendMethod='wechat-ui' 可切回）。
  * - 验证（KeyboardSender 真发后）：延迟 2s 用 wechat_db.py read --chat-id filehelper --limit 3
  *   （只读）确认文件传输助手最新消息包含本次文本特征串（#l<id 前 8 位），验证通过才置 sent；
@@ -18,8 +17,8 @@
  *   · 文本策略：单行 ≤200 字符 = `【lurker】<title>` + ≤160 字摘要 + 特征串，绝不发全文；
  * - 闸门（全部保留并强化）：
  *   ① 总闸：Config senderEnabled（默认 false）+ sendDryRun（默认 true）。
- *      keyboard 模式 dry_run 执行键序到第 12 步为止（不粘贴消息不回车）——人工确认搜索定位正确，
- *      是本方案最重要的安全特性；wechat-ui 模式 dry_run 照旧只记日志；
+ *      keyboard 模式 dry_run = activate + 前台确认后直接结束（不碰输入框不回车——实测教训：
+ *      干跑时的粘贴也可能落进当前会话输入框被误发）；wechat-ui 模式 dry_run 照旧只记日志；
  *   ② 通道闸：仅 ALLOWED_CHANNELS；
  *   ③ 交互闸：微信前台（osascript）+ 系统空闲秒数（ioreg IOHIDSystem），空闲 <10s 视为用户
  *      正在操作 → 跳过本轮防按键串扰；连续 N 次非前台 warn；
@@ -49,20 +48,8 @@ export const SUMMARY_CHARS = 160
 export const MAX_ATTEMPTS = 3
 /** 发送审计落盘相对路径（只写元数据行） */
 export const SENDER_AUDIT_REL = 'audit/sender.jsonl'
-/** 键序渲染延迟（ms）：搜索下拉渲染（实证 0.8s 不够，必须 1.2s）/ 选中会话 / 粘贴消息 / 点击搜索框后 / ↓ 选中前 */
-export const KEY_DELAY_SEARCH_MS = 1200
-export const KEY_DELAY_OPEN_MS = 500
+/** 粘贴消息后、回车发送前的缓冲（ms） */
 export const KEY_DELAY_PASTE_MS = 300
-export const KEY_DELAY_CLICK_MS = 500
-export const KEY_DELAY_DOWN_MS = 300
-/** activate 后等待（ms）：跨 Space 切换动画约 1s，等 1.5s 再读窗口坐标（实测全屏应用占一空间+微信非前台时，动画未完成读到旧空间坐标点错） */
-export const KEY_DELAY_ACTIVATE_MS = 1500
-/** AX 首读后、点击前的布局稳定等待（ms），随后重读一次 position 比对 */
-export const KEY_DELAY_REREAD_MS = 300
-/** 两次 AX position 读取差超过该像素视为布局仍在变动（以第二次为准） */
-export const AX_POSITION_TOLERANCE_PX = 5
-/** AX 读到的窗口宽/高低于该像素视为动画中间态，fail-closed 绝不盲点 */
-export const AX_MIN_DIM_PX = 200
 /** 真发后 DB 回读验证前的延迟（ms） */
 export const VERIFY_DELAY_MS = 2000
 /** 系统空闲低于该秒数视为用户正在操作（跳过防按键串扰） */
@@ -222,15 +209,14 @@ export function defaultSystemIdleSec(): Promise<number> {
 }
 
 const OSC_ACTIVATE = 'tell application "WeChat" to activate'
-const OSC_KEY_ESC = 'tell application "System Events" to key code 53'
-const OSC_KEY_DOWN = 'tell application "System Events" to key code 125'
-const OSC_AX_WINDOW = 'tell application "System Events" to tell process "WeChat" to get {position, size} of window 1'
 const OSC_KEY_CMD_V = 'tell application "System Events" to keystroke "v" using command down'
 const OSC_KEY_RETURN = 'tell application "System Events" to key code 36'
 
 /**
- * KeyboardSender：wx-chatbot 式键盘模拟原语（macOS 键位，14 步实证键序）。
- * 全部经 osascript/System Events；中文（搜索词与消息）一律走剪贴板，避开输入法。
+ * KeyboardSender：wx-chatbot 式键盘模拟原语（macOS 键位，实测简化版键序——无搜索定位）。
+ * 全部经 osascript/System Events；消息文本一律走剪贴板，避开输入法。
+ * 目标会话 = 用户当前打开的会话（前提：文件传输助手是当前会话）；发送正确性由发送后
+ * DB 回读验证兜底（未命中 → failed_wrong_target 终态 + P0 warn）。
  */
 export class KeyboardSender implements SendPrimitive {
   readonly method: SendMethod = 'keyboard'
@@ -276,8 +262,6 @@ export class KeyboardSender implements SendPrimitive {
   async transmit(input: PrimitiveSendInput): Promise<PrimitiveSendResult> {
     // 1. 激活微信 + 确认前台（抢前台模式跳过确认——activate 本就是抢前台动作）
     await this.run(OSC_ACTIVATE)
-    // 1.5 等待空间切换动画完成（跨 Space ~1s，动画未完成时 AX 读到旧空间/未布局坐标 → 点错）
-    await this.sleep(KEY_DELAY_ACTIVATE_MS)
     if (!this.allowTakeFocus) {
       let front = false
       try { front = await this.isFrontmostFn() } catch { front = false }
@@ -285,57 +269,19 @@ export class KeyboardSender implements SendPrimitive {
     }
     // 2. 保存剪贴板（发送后恢复——礼貌且防用户数据丢失）
     const saved = await this.saveClipboard()
-    // 3. Esc 清残留弹层
-    await this.run(OSC_KEY_ESC)
-    // 4. AX 读窗口 position/size（动态计算搜索框点击坐标——窗口移动缩放自适应）
-    const ax = await this.run(OSC_AX_WINDOW)
-    if (ax.code !== 0) return { ok: false, stage: 'env_unavailable', detail: `AX 读微信窗口 position/size 失败 code=${ax.code}——放弃键序（坐标未知不盲点）` }
-    const nums = ax.stdout.split(',').map((v) => Number(v.trim())).filter((v) => Number.isFinite(v))
-    if (nums.length < 4) return { ok: false, stage: 'env_unavailable', detail: `AX 窗口数据不可解析：${JSON.stringify(ax.stdout.slice(0, 80))}` }
-    const [wx1, wy1, ww1, wh1] = nums
-    if (ww1 < AX_MIN_DIM_PX || wh1 < AX_MIN_DIM_PX) return { ok: false, stage: 'env_unavailable', detail: `AX 窗口尺寸异常 ${ww1}x${wh1}（宽/高 <${AX_MIN_DIM_PX}px，疑似 Space 切换动画中间态）——fail-closed 放弃本轮不盲点` }
-    // 4.5 双读坐标：延迟后重读一次 position——两次不一致说明布局仍在变动，以第二次为准
-    await this.sleep(KEY_DELAY_REREAD_MS)
-    const ax2 = await this.run(OSC_AX_WINDOW)
-    if (ax2.code !== 0) return { ok: false, stage: 'env_unavailable', detail: `AX 复读微信窗口 position 失败 code=${ax2.code}——放弃键序（坐标不稳定不盲点）` }
-    const nums2 = ax2.stdout.split(',').map((v) => Number(v.trim())).filter((v) => Number.isFinite(v))
-    if (nums2.length < 4) return { ok: false, stage: 'env_unavailable', detail: `AX 复读窗口数据不可解析：${JSON.stringify(ax2.stdout.slice(0, 80))}` }
-    const [wx, wy, ww, wh] = nums2
-    if (ww < AX_MIN_DIM_PX || wh < AX_MIN_DIM_PX) return { ok: false, stage: 'env_unavailable', detail: `AX 复读窗口尺寸异常 ${ww}x${wh}（疑似动画中间态）——fail-closed 放弃本轮不盲点` }
-    const unstable = Math.abs(wx - wx1) > AX_POSITION_TOLERANCE_PX || Math.abs(wy - wy1) > AX_POSITION_TOLERANCE_PX
-    if (unstable) this.warn?.(`sender[keyboard]: AX 双读坐标不一致（首读 ${wx1},${wy1} → 复读 ${wx},${wy}，布局变动中）——以第二次读取为准点击`)
-    // 5. 点击左上角搜索框区域（实证：窗口 0,34 856x1007 时点 107,71 命中；坐标取自双读的第二次）
-    const cx = wx + Math.floor(ww / 8)
-    const cy = wy + Math.floor(wh / 40) + 12
-    const click = await this.run(`tell application "System Events" to click at {${cx}, ${cy}}`)
-    if (click.code !== 0) return { ok: false, stage: 'error', detail: `点击搜索框失败 code=${click.code}` }
-    // 6. 延迟 500ms
-    await this.sleep(KEY_DELAY_CLICK_MS)
-    // 7. 剪贴板设为"文件传输助手" → Cmd+V 粘贴（中文走剪贴板，避开输入法）
-    await this.setClipboard(FILEHELPER_CHAT)
-    await this.run(OSC_KEY_CMD_V)
-    // 8. 延迟 1200ms（实证：0.8s 时下拉结果未渲染完，Return 落空）
-    await this.sleep(KEY_DELAY_SEARCH_MS)
-    // 9. ↓ 选中第一个结果（双保险）
-    await this.run(OSC_KEY_DOWN)
-    // 10. 延迟 300ms
-    await this.sleep(KEY_DELAY_DOWN_MS)
-    // 11. 回车跳转会话
-    await this.run(OSC_KEY_RETURN)
-    // 12. 延迟 500ms（会话打开渲染）
-    await this.sleep(KEY_DELAY_OPEN_MS)
+    // 3. dry_run：确认前台后直接结束——绝不碰输入框不回车（实测教训：干跑时的粘贴也可能落进当前会话输入框被误发）
     if (input.dryRun) {
       await this.restoreClipboard(saved)
-      return { ok: true, stage: 'located', detail: 'dry_run 已定位会话，停在发送前（未粘贴消息未回车）' }
+      return { ok: true, stage: 'located', detail: 'dry_run 已确认微信前台，跳过输入（不粘贴不回车）——目标会话由"当前打开的会话"决定，请人工确认是文件传输助手' }
     }
-    // 13. 剪贴板设为消息文本 → Cmd+V → 延迟 → Return 发送
+    // 4. 剪贴板设为消息文本 → Cmd+V → 延迟 → Return 发送（无搜索定位——目标会话 = 用户当前打开的会话）
     await this.setClipboard(input.text)
     await this.run(OSC_KEY_CMD_V)
     await this.sleep(KEY_DELAY_PASTE_MS)
     await this.run(OSC_KEY_RETURN)
-    // 14. 恢复剪贴板（失败不阻塞，warn）
+    // 5. 恢复剪贴板（失败不阻塞，warn）
     await this.restoreClipboard(saved)
-    return { ok: true, stage: 'sent', detail: '键盘序列发送完成（待 DB 回读验证）' }
+    return { ok: true, stage: 'sent', detail: '键盘序列发送完成（目标=当前会话；待 DB 回读验证兜底）' }
   }
 
   private async restoreClipboard(saved: string | null): Promise<void> {
@@ -456,7 +402,7 @@ export class SenderService {
     const { text, feature } = appendFeature(base, id)
     const attempts = (entry.attempts ?? 0) + 1
 
-    // dry_run：keyboard 模式执行键序到第 12 步（定位会话）即停——人工确认搜索定位正确；
+    // dry_run：keyboard 模式 activate + 前台确认后即停——不碰输入框不回车（防干跑误发）；
     //          wechat-ui 模式照旧只记日志/审计，不调工具。条目标 dry_run 消费掉，避免反复扫描。
     if (this.dryRun) {
       if (this.method === 'keyboard') {
@@ -498,7 +444,10 @@ export class SenderService {
       return { action: 'deferred' }
     }
     let ok = r.ok && r.stage === 'sent'
-    // keyboard 模式：DB 回读验证（替代 OCR/截图）——验证通过才算 sent
+    let wrongTarget = false
+    // keyboard 模式：DB 回读验证（替代 OCR/截图）——验证通过才算 sent。
+    // 无搜索定位（目标会话 = 用户当前打开的会话）后，回读是**唯一的目标兜底闸**：
+    // 未命中 = 内容可能落进了别的会话（P0 级异常），终态 failed_wrong_target 不重试。
     if (ok && this.method === 'keyboard') {
       await this.sleep(VERIFY_DELAY_MS)
       const v = await this.runCommandFn(this.sourcePython, [
@@ -507,8 +456,22 @@ export class SenderService {
       const verified = v.code === 0 && v.stdout.includes(feature)
       if (!verified) {
         ok = false
-        this.options.logger.error(`sender: DB 回读验证未命中特征串 id=${id}（消息可能未送达）——按失败计`)
+        wrongTarget = true
       }
+    }
+    if (ok) {
+      this.options.outbox.updateSendState(id, { status: 'sent', attempts })
+      // 抢前台模式放行的发送单独记 result，审计可区分两种模式
+      this.audit({ id, kind: entry.kind, result: tookFocus ? 'take_focus_sent' : 'sent', attempts, method: this.method })
+      this.options.logger.info(`sender: sent id=${id} kind=${entry.kind}${tookFocus ? ' (take_focus)' : ''} (method=${this.method}, db_verified, content not logged)`)
+      return { action: 'sent' }
+    }
+    if (wrongTarget) {
+      // P0：回读未命中——消息可能发进了非 filehelper 会话。终态不再重试（重试可能再次误发）。
+      this.options.outbox.updateSendState(id, { status: 'failed_wrong_target', attempts })
+      this.audit({ id, kind: entry.kind, result: 'failed_wrong_target', attempts, method: this.method, p0: true })
+      this.options.logger.warn(`sender: [P0] DB 回读未命中特征串 id=${id}——消息可能发进了非 filehelper 会话，已标 failed_wrong_target 终态（不重试），请立即人工检查微信当前会话与已发内容`)
+      return { action: 'failed' }
     }
     if (ok) {
       this.options.outbox.updateSendState(id, { status: 'sent', attempts })

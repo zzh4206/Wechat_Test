@@ -112,7 +112,7 @@ test('appendFeature：特征串永远在场且总长 ≤200', () => {
   assert.ok(long.text.length <= MAX_TEXT_CHARS)
 })
 
-test('键序正确性（真发）：14 步实证键序 + 延迟 + DB 回读验证 → sent', async () => {
+test('键序正确性（真发）：简化键序（activate→粘贴→回车）+ DB 回读验证兜底 → sent', async () => {
   const env = makeEnv()
   const e = env.outbox.appendOutbox({ kind: 'daily', title: '日报', body: '关键判断', evidence_ref: 'r.md' })
   env.lastFeature = `#l${e.id.replace(/[^0-9a-zA-Z]/g, '').slice(0, 8)}`
@@ -121,29 +121,19 @@ test('键序正确性（真发）：14 步实证键序 + 延迟 + DB 回读验�
   const seq = env.steps.map((s) => (s.kind === 'sleep' ? `sleep:${s.ms}` : s.kind === 'spawn' ? 'spawn' : s.step))
   assert.deepEqual(seq, [
     'activate',
-    `sleep:${KEY_DELAY_ACTIVATE_MS}`, // 空间切换动画 ~1s，等 1.5s 再读窗口坐标（实测全屏点错热修）
     'clipboard_save',
-    'key:esc', // 3. Esc 清残留弹层
-    'ax:window', // 4. AX 读窗口 position/size（首读）
-    `sleep:${KEY_DELAY_REREAD_MS}`, // 4.5 布局稳定等待
-    'ax:window', // 复读 position（双读比对，两次一致才认为布局稳定）
-    'click:107,71', // 5. 实证坐标：0+856/8=107, 34+1007/40+12=71
-    `sleep:${KEY_DELAY_CLICK_MS}`,
-    'clipboard_set:文件传输助手',
-    'key:cmd+v',
-    `sleep:${KEY_DELAY_SEARCH_MS}`, // 实证 1.2s（0.8s 下拉未渲染完）
-    'key:down', // 9. ↓ 选中第一个结果
-    `sleep:${KEY_DELAY_DOWN_MS}`,
-    'key:return', // 11. 回车跳转会话
-    `sleep:${KEY_DELAY_OPEN_MS}`,
     `clipboard_set:【lurker】日报 关键判断 ${env.lastFeature}`,
     'key:cmd+v',
     `sleep:${KEY_DELAY_PASTE_MS}`,
     'key:return',
     'clipboard_set:saved-content', // 恢复剪贴板
     `sleep:${VERIFY_DELAY_MS}`,
-    'spawn', // wechat_db.py read（DB 回读验证）
+    'spawn', // wechat_db.py read（DB 回读验证兜底——唯一目标闸）
   ])
+  // 无搜索定位：绝不出现 Esc/AX/点击/↓/搜索词粘贴
+  for (const banned of ['key:esc', 'ax:window', 'key:down']) assert.ok(!seq.includes(banned), `不应出现 ${banned}`)
+  assert.ok(!seq.some((x) => String(x).startsWith('click')), '不应点击搜索框')
+  assert.ok(!seq.includes('clipboard_set:文件传输助手'), '不应粘贴搜索词')
   // 回读参数形态：只读、filehelper、limit 3
   const spawn = env.steps.find((s) => s.kind === 'spawn')
   assert.equal(spawn.file, 'python3')
@@ -159,7 +149,7 @@ test('键序正确性（真发）：14 步实证键序 + 延迟 + DB 回读验�
   rmSync(env.dir, { recursive: true, force: true })
 })
 
-test('dry_run：键序到定位会话为止（不粘贴消息不回车），条目转 dry_run，日志标"停在发送前"', async () => {
+test('dry_run：确认前台后直接结束（不碰输入框不回车），条目转 dry_run', async () => {
   const env = makeEnv({ dryRun: true, logger: recordingLogger() })
   const e = env.outbox.appendOutbox({ kind: 'daily', title: 't', body: '机密正文', evidence_ref: 'r.md' })
   const r = await env.sender.processOnce()
@@ -167,25 +157,14 @@ test('dry_run：键序到定位会话为止（不粘贴消息不回车），条�
   const seq = env.steps.map((s) => (s.kind === 'sleep' ? `sleep:${s.ms}` : s.kind === 'spawn' ? 'spawn' : s.step))
   assert.deepEqual(seq, [
     'activate',
-    `sleep:${KEY_DELAY_ACTIVATE_MS}`,
     'clipboard_save',
-    'key:esc',
-    'ax:window',
-    `sleep:${KEY_DELAY_REREAD_MS}`,
-    'ax:window',
-    'click:107,71',
-    `sleep:${KEY_DELAY_CLICK_MS}`,
-    'clipboard_set:文件传输助手',
-    'key:cmd+v',
-    `sleep:${KEY_DELAY_SEARCH_MS}`,
-    'key:down',
-    `sleep:${KEY_DELAY_DOWN_MS}`,
-    'key:return',
-    `sleep:${KEY_DELAY_OPEN_MS}`,
     'clipboard_set:saved-content', // dry_run 尾部：恢复剪贴板
   ])
+  // 实测教训：干跑时的粘贴也可能落进输入框——dry_run 绝不 Cmd+V、绝不回车、绝不写消息剪贴板
+  assert.ok(!seq.includes('key:cmd+v') && !seq.includes('key:return'), 'dry_run 不触发任何输入')
+  assert.ok(!JSON.stringify(seq).includes('机密正文') && !seq.some((x) => String(x).includes('【lurker】')), '消息文本不进键序')
   assert.equal(readOutbox(env.dir).find((x) => x.id === e.id).status, 'dry_run')
-  assert.ok(env.logger.logs.info.some((m) => m.includes('停在发送前')))
+  assert.ok(env.logger.logs.info.some((m) => m.includes('dry_run')), '日志注明 dry_run')
   assert.ok(!JSON.stringify(readAudit(env.dir)).includes('机密正文'), '审计零正文')
   rmSync(env.dir, { recursive: true, force: true })
 })
@@ -194,80 +173,6 @@ test('dry_run：键序到定位会话为止（不粘贴消息不回车），条�
 const savedClipboardPatches = {
   osascriptOk: (step) => true,
 }
-test('熄屏/锁屏（AX 窗口读取失败）→ 环境等待：fail-closed 不点击不敲键，attempts 不增、保持 pending、下轮可重试', async () => {
-  const env = makeEnv({ osascriptOk: (step) => step !== 'ax:window' })
-  const e = env.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
-  const r = await env.sender.processOnce()
-  assert.equal(r.action, 'deferred', '环境不可用 = 等待而非失败')
-  const seq = env.steps.map((s) => (s.kind === 'sleep' ? `sleep:${s.ms}` : s.kind === 'spawn' ? 'spawn' : s.step))
-  assert.ok(!seq.some((s) => String(s).startsWith('click')), '坐标未知绝不盲点')
-  assert.ok(!seq.includes('key:cmd+v') && !seq.includes('key:return'), '后续键序全部中止')
-  assert.equal(env.steps.filter((s) => s.kind === 'spawn').length, 0, '不回读')
-  const after = readOutbox(env.dir).find((x) => x.id === e.id)
-  assert.equal(after.status, 'pending', '保持 pending')
-  assert.equal(after.attempts ?? 0, 0, '不计 attempts')
-  // 审计行注明 deferred
-  const audit = readAudit(env.dir)
-  assert.equal(audit[0].result, 'screen_locked_deferred')
-  assert.equal(audit[0].deferred, true)
-  // 下轮环境恢复 → 正常发送（不熔断，无 attempts 损耗）
-  env.osascriptOk = () => true
-  env.lastFeature = `#l${e.id.replace(/[^0-9a-zA-Z]/g, '').slice(0, 8)}`
-  const r2 = await env.sender.processOnce()
-  assert.equal(r2.action, 'sent', '解锁后自动恢复')
-  assert.equal(readOutbox(env.dir).find((x) => x.id === e.id).status, 'sent')
-  rmSync(env.dir, { recursive: true, force: true })
-})
-
-test('dry_run 熄屏同样挂起（deferred 不计 attempts 不转 dry_run）；环境可读但回读失败仍 attempts+1（既有语义）', async () => {
-  const env = makeEnv({ dryRun: true, osascriptOk: (step) => step !== 'ax:window' })
-  const e = env.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
-  const r = await env.sender.processOnce()
-  assert.equal(r.action, 'deferred')
-  assert.equal(readOutbox(env.dir).find((x) => x.id === e.id).status, 'pending')
-  assert.equal(readOutbox(env.dir).find((x) => x.id === e.id).attempts ?? 0, 0)
-  // 环境可读但 DB 回读未命中 → 真实失败，attempts+1（既有语义不变）
-  const env2 = makeEnv({ dbReadResult: { code: 0, stdout: '{"messages":[{"content":"别的消息"}]}', stderr: '' } })
-  const e2 = env2.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
-  await env2.sender.processOnce()
-  const after2 = readOutbox(env2.dir).find((x) => x.id === e2.id)
-  assert.equal(after2.status, 'pending')
-  assert.equal(after2.attempts, 1, '真实失败计 attempts')
-  rmSync(env.dir, { recursive: true, force: true })
-  rmSync(env2.dir, { recursive: true, force: true })
-})
-
-test('AX 双读坐标不一致（空间切换布局变动中）→ 以第二次读取为准点击', async () => {
-  const env = makeEnv({
-    dryRun: true,
-    // 首读旧空间坐标 1000,34；复读稳定后的新空间 0,34（856x1007 不变）
-    axWindowOut: (call) => (call === 1 ? '1000, 34, 856, 1007' : '0, 34, 856, 1007'),
-  })
-  env.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
-  const r = await env.sender.processOnce()
-  assert.equal(r.action, 'sent')
-  const click = env.steps.find((s) => s.kind === 'osascript' && String(s.step).startsWith('click'))
-  assert.equal(click.step, 'click:107,71', '点击坐标用第二次（复读）读取计算，而非首读')
-  assert.equal(env.steps.filter((s) => s.kind === 'osascript' && s.step === 'ax:window').length, 2, 'AX 恰好读两次（首读+复读）')
-  rmSync(env.dir, { recursive: true, force: true })
-})
-
-test('AX 窗口尺寸异常（<200px 疑似动画中间态）→ 环境等待：不点击不敲键，deferred 不计 attempts', async () => {
-  for (const bad of ['0, 34, 150, 1007', '0, 34, 856, 100']) {
-    const env = makeEnv({ dryRun: true, axWindowOut: bad })
-    const e = env.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
-    const r = await env.sender.processOnce()
-    assert.equal(r.action, 'deferred', `${bad}：环境类异常挂起等待`)
-    const seq = env.steps.map((s) => (s.kind === 'sleep' ? `sleep:${s.ms}` : s.kind === 'spawn' ? 'spawn' : s.step))
-    assert.ok(!seq.some((s) => String(s).startsWith('click')), `${bad}：绝不盲点`)
-    assert.ok(!seq.includes('key:cmd+v') && !seq.includes('key:return'), '后续键序全部中止')
-    const after = readOutbox(env.dir).find((x) => x.id === e.id)
-    assert.equal(after.status, 'pending')
-    assert.equal(after.attempts ?? 0, 0, '环境类 deferred 不计 attempts')
-    rmSync(env.dir, { recursive: true, force: true })
-  }
-})
-
 test('剪贴板保存恢复：真发后恢复原内容；保存失败不恢复也不报错', async () => {
   // 保存成功 → dry_run 尾部恢复
   const env = makeEnv({ dryRun: true })
@@ -276,7 +181,6 @@ test('剪贴板保存恢复：真发后恢复原内容；保存失败不恢复�
   env.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
   await env.sender.processOnce()
   const sets = env.steps.filter((s) => s.kind === 'osascript' && s.step.startsWith('clipboard_set'))
-  assert.ok(sets.some((s) => s.step === 'clipboard_set:文件传输助手'))
   assert.equal(sets[sets.length - 1].step, 'clipboard_set:saved-content', '最后一步恢复剪贴板原内容')
   rmSync(env.dir, { recursive: true, force: true })
 
@@ -307,19 +211,21 @@ test('剪贴板恢复失败：warn 但不阻塞发送（sent）', async () => {
   rmSync(env.dir, { recursive: true, force: true })
 })
 
-test('DB 回读验证失败 → attempts+1 保持 pending；连续 3 次 → failed 不再重试', async () => {
-  const env = makeEnv({ dbReadResult: { code: 0, stdout: '{"messages":[{"content":"别的消息"}]}', stderr: '' } })
+test('回读未命中（可能发错会话）→ P0：标 failed_wrong_target 终态 + error 审计 + warn，不再重试', async () => {
+  const env = makeEnv({ logger: recordingLogger(), dbReadResult: { code: 0, stdout: '{"messages":[{"content":"别的消息"}]}', stderr: '' } })
   const e = env.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
-  for (let i = 1; i <= MAX_ATTEMPTS; i++) {
-    const r = await env.sender.processOnce()
-    assert.equal(r.action, 'failed')
-  }
+  const r = await env.sender.processOnce()
+  assert.equal(r.action, 'failed')
   const after = readOutbox(env.dir).find((x) => x.id === e.id)
-  assert.equal(after.status, 'failed')
-  assert.equal(after.attempts, MAX_ATTEMPTS)
-  const spawns = env.steps.filter((s) => s.kind === 'spawn').length
+  assert.equal(after.status, 'failed_wrong_target', '终态：不重试（重试可能再次误发）')
+  const audit = readAudit(env.dir)
+  assert.equal(audit[0].result, 'failed_wrong_target')
+  assert.equal(audit[0].p0, true, '审计行醒目标 P0')
+  assert.ok(env.logger.logs.warn.some((m) => m.includes('P0') && m.includes('failed_wrong_target')), '立即 warn')
+  // 终态：后续周期不再消费
+  const spawns = env.steps.filter((x) => x.kind === 'spawn').length
   await env.sender.processOnce()
-  assert.equal(env.steps.filter((s) => s.kind === 'spawn').length, spawns, 'failed 不再消费/不再回读')
+  assert.equal(env.steps.filter((x) => x.kind === 'spawn').length, spawns, 'failed_wrong_target 不再回读')
   rmSync(env.dir, { recursive: true, force: true })
 })
 

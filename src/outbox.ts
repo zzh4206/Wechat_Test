@@ -37,7 +37,7 @@ export interface OutboxEntry {
 }
 
 /** 生命周期状态：pending → sent | dry_run | skipped_quota | skipped_channel | failed（sender worker 推进） */
-export type OutboxStatus = 'pending' | 'sent' | 'dry_run' | 'skipped_quota' | 'skipped_channel' | 'failed'
+export type OutboxStatus = 'pending' | 'sent' | 'dry_run' | 'skipped_quota' | 'skipped_channel' | 'failed' | 'failed_wrong_target'
 
 /** appendOutbox 的入参（ts/channel/status 由本模块补全，调用方不给篡改口） */
 export interface OutboxAppendInput {
