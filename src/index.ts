@@ -152,6 +152,7 @@ export interface PluginConfig {
   verifyRetries: number
   /** 抢前台模式（默认 false = 微信非前台跳过本轮）。true = 自动激活微信前台发送，仍让路给正在打字的用户（空闲 <10s 跳过） */
   allowTakeFocus: boolean
+  idleSkipBelowSec: number
   /** 每日发送上限（默认 20） */
   maxSendsPerDay: number
   /** wechat-ui 可执行文件（默认 'wechat-ui'；仅 sendMethod='wechat-ui' 用） */
@@ -224,6 +225,7 @@ export const Config: Schema<PluginConfig> = Schema.object({
   verifyDelaySec: Schema.number().default(3).description('DB 回读验证每次尝试前的等待秒数（默认 3；微信异步写本地库，需重试窗口消化竞态）'),
   verifyRetries: Schema.number().default(4).description('DB 回读验证尝试次数（默认 4；穷尽仍未命中才判 failed_wrong_target）'),
   allowTakeFocus: Schema.boolean().default(false).description('抢前台模式（默认 false = 微信非前台跳过本轮，人在电脑前模式）。true = 全自动无人值守：自动激活微信前台发送，但系统空闲 <10s（用户正在打字/操作）仍让路跳过'),
+  idleSkipBelowSec: Schema.number().default(10).description('用户空闲让路阈值秒（默认 10 = 系统空闲 <10s 视为正在操作→跳过本轮让路；0 = 不让路，空闲检测失效直接抢前台发送。日常单日报场景可设 0——每天一次的抢前台可接受；频繁发送建议保持 10）'),
   maxSendsPerDay: Schema.number().default(20).description('每日发送上限（默认 20；超限的当日 pending 标 skipped_quota 防风暴）'),
   wechatUiPath: Schema.string().default('wechat-ui').description('wechat-ui 可执行文件（PATH 解析；建议绝对路径，如 /path/to/macos-wechat-export/wechat-ui）'),
   composerTop: Schema.number().default(0.7).description('wechat-ui --composer-top（默认 0.70；务必按 UI_GUIDE 用 read --snapshot 实测校准）'),
@@ -343,6 +345,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
     sourcePython: config.sourcePython,
     systemIdleSec: defaultSystemIdleSec,
     allowTakeFocus: config.allowTakeFocus,
+    idleSkipBelowSec: config.idleSkipBelowSec,
     intervalSec: config.sendIntervalSec,
     verifyDelaySec: config.verifyDelaySec,
     verifyRetries: config.verifyRetries,

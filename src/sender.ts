@@ -152,6 +152,8 @@ export interface SenderOptions {
   allowTakeFocus?: boolean
   /** 交互闸连续非前台 N 次后 warn（默认 3） */
   frontmostWarnAfter?: number
+  /** Config.idleSkipBelowSec：空闲低于该秒数视为用户正在操作→让路跳过（默认 10 = 现行为；0 = 不让路直接发） */
+  idleSkipBelowSec?: number
   /** 系统空闲秒数注入（默认 Infinity = 闸不生效；生产由 index.ts 注入 defaultSystemIdleSec） */
   systemIdleSec?: () => Promise<number>
   /** 命令执行注入（测试 mock；默认 node:child_process execFile） */
@@ -342,6 +344,7 @@ export class SenderService {
   private readonly runCommandFn: (file: string, args: string[]) => Promise<CommandResult>
   private readonly isFrontmostFn: () => Promise<boolean>
   private readonly idleSecFn: () => Promise<number>
+  private readonly idleSkipBelowSec: number
   private readonly sleep: (ms: number) => Promise<void>
   private readonly verifyDelayMs: number
   private readonly verifyRetries: number
@@ -367,6 +370,7 @@ export class SenderService {
     this.runCommandFn = options.runCommand ?? defaultRunCommand
     this.isFrontmostFn = options.isFrontmost ?? defaultIsFrontmost
     this.idleSecFn = options.systemIdleSec ?? (async () => Number.POSITIVE_INFINITY) // 未注入 = 闸不生效（测试离线）
+    this.idleSkipBelowSec = Math.max(0, options.idleSkipBelowSec ?? IDLE_SKIP_BELOW_SEC)
     this.sleep = options.sleepMs ?? defaultSleep
     this.sourceToolDir = options.sourceToolDir ?? ''
     this.sourcePython = options.sourcePython ?? 'python3'
@@ -391,7 +395,7 @@ export class SenderService {
   /** ③ 交互闸（后半）：系统空闲 <10s 视为用户正在操作 → 跳过本轮防按键串扰 */
   private async userBusy(): Promise<boolean> {
     try {
-      return (await this.idleSecFn()) < IDLE_SKIP_BELOW_SEC
+      return (await this.idleSecFn()) < this.idleSkipBelowSec
     } catch {
       return true // 读不到空闲时间 = fail-safe 跳过
     }
@@ -562,7 +566,7 @@ export class SenderService {
       if (await this.userBusy()) {
         this.consecutiveNotFront += 1
         if (this.consecutiveNotFront >= this.frontmostWarnAfter) {
-          this.options.logger.warn(`sender: 用户持续操作中（系统空闲 <${IDLE_SKIP_BELOW_SEC}s）连续 ${this.consecutiveNotFront} 轮 — 抢前台模式也让路，绝不打断打字（${what} 暂缓）`)
+          this.options.logger.warn(`sender: 用户持续操作中（系统空闲 <${this.idleSkipBelowSec}s）连续 ${this.consecutiveNotFront} 轮 — 抢前台模式也让路，绝不打断打字（${what} 暂缓）`)
         }
         this.audit({ result: 'user_active', takeFocus: true, streak: this.consecutiveNotFront })
         return { blocked: 'user_active', tookFocus: false }
@@ -587,7 +591,7 @@ export class SenderService {
     if (await this.userBusy()) {
       this.consecutiveNotFront += 1
       this.audit({ result: 'user_active' })
-      this.options.logger.info(`sender: 用户正在操作（系统空闲 <${IDLE_SKIP_BELOW_SEC}s）— 跳过本轮防按键串扰（${what}）`)
+      this.options.logger.info(`sender: 用户正在操作（系统空闲 <${this.idleSkipBelowSec}s）— 跳过本轮防按键串扰（${what}）`)
       return { blocked: 'user_active', tookFocus: false }
     }
     this.consecutiveNotFront = 0
@@ -690,6 +694,7 @@ export interface SenderConfigInput {
   sourceToolDir: string
   sourcePython: string
   allowTakeFocus: boolean
+  idleSkipBelowSec: number
 }
 
 export function senderOptionsFromConfig(options: {
@@ -714,6 +719,7 @@ export function senderOptionsFromConfig(options: {
     sourceToolDir: options.config.sourceToolDir,
     sourcePython: options.config.sourcePython,
     allowTakeFocus: options.config.allowTakeFocus,
+    idleSkipBelowSec: options.config.idleSkipBelowSec,
     systemIdleSec: defaultSystemIdleSec,
     setInterval: options.setInterval,
     clearInterval: options.clearInterval,

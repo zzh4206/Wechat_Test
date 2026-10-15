@@ -60,6 +60,8 @@ function makeEnv(overrides = {}) {
     maxSendsPerDay: overrides.maxSendsPerDay ?? 20,
     sourceToolDir: overrides.sourceToolDir ?? '/fake/macos-wechat-export',
     sourcePython: overrides.sourcePython ?? 'python3',
+    idleSkipBelowSec: overrides.idleSkipBelowSec,
+    allowTakeFocus: overrides.allowTakeFocus,
     now: overrides.now ?? (() => new Date(2026, 9, 15, 12, 0).getTime()),
     runCommand: (file, args) => {
       if (file === 'osascript') {
@@ -307,6 +309,30 @@ test('回读本身失败（CLI 报错/库不可读）→ deferred 环境等待�
   assert.equal(audit[0].deferred, true)
   assert.ok(!audit[0].p0, '绝不误判 P0')
   assert.ok(env.logger.logs.warn.some((m) => m.includes('回读本身失败') && m.includes('不判 wrong_target')))
+  rmSync(env.dir, { recursive: true, force: true })
+})
+
+test('idleSkipBelowSec=0：用户活动也不让路（空闲检测失效）→ 抢前台照发，审计 take_focus_sent', async () => {
+  const env = makeEnv({ idleSec: 0.1, idleSkipBelowSec: 0, allowTakeFocus: true })
+  const e = env.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
+  env.lastFeature = `#l${e.id.replace(/[^0-9a-zA-Z]/g, '').slice(0, 8)}`
+  const r = await env.sender.processOnce()
+  assert.equal(r.action, 'sent', '阈值 0 = 不让路，用户活动也照发')
+  assert.equal(env.steps.length > 0, true, '键序确实发出')
+  const audit = readAudit(env.dir)
+  assert.equal(audit[0].result, 'take_focus_sent')
+  assert.ok(!audit.some((a) => a.result === 'user_active'), '无 user_active 让路')
+  assert.equal(readOutbox(env.dir).find((x) => x.id === e.id).status, 'sent')
+  rmSync(env.dir, { recursive: true, force: true })
+})
+
+test('idleSkipBelowSec 默认 10：行为零变化（空闲 <10s 仍让路跳过）', async () => {
+  const env = makeEnv({ idleSec: IDLE_SKIP_BELOW_SEC - 0.5 })
+  env.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
+  const r = await env.sender.processOnce()
+  assert.equal(r.action, 'user_active', '默认阈值不传 = 仍是 10s 让路')
+  assert.equal(env.steps.length, 0, '零按键')
+  assert.equal(readOutbox(env.dir)[0].status, 'pending')
   rmSync(env.dir, { recursive: true, force: true })
 })
 
