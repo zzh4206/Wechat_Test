@@ -1,5 +1,5 @@
 // journal.test.mjs —— WP4：insights.jsonl 落盘 / 二次类型校验 / 引用截断 /
-// mock 时钟跨天日报 / 计数器 / 写入路径全在 stateDir 内。
+// mock 时钟跨天计数器 / 根目录日报退役（M3 report.ts 接棒）/ 写入路径全在 stateDir 内。
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync, existsSync, readFileSync, realpathSync } from 'node:fs'
@@ -82,7 +82,7 @@ test('引用超长截断到 ≤50 字（原始消息全文不落盘）', () => {
   }
 })
 
-test('mock 时钟跨天：生成两天日报 + 计数器按本地自然日切', () => {
+test('mock 时钟跨天：计数器按本地自然日切；根目录日报已退役不再写入', () => {
   // 本地时区构造两个自然日 10:00
   const day1 = new Date(2026, 0, 10, 10, 0, 0).getTime()
   const day2 = new Date(2026, 0, 11, 10, 0, 0).getTime()
@@ -92,21 +92,13 @@ test('mock 时钟跨天：生成两天日报 + 计数器按本地自然日切', 
   clock.now = day1
   journal.record('g1', [topic()])
   journal.record('g2', [topic({ title: '另一群话题' })])
-  const f1 = join(base, 'reports/2026-01-10.md')
-  assert.ok(existsSync(f1))
+  // 根目录日报已退役（M3 report.ts 三层金字塔接棒）：不再生成 reports/<date>.md
+  assert.ok(!existsSync(join(base, 'reports/2026-01-10.md')), '根目录日报不应再写入')
 
   clock.now = day2
   journal.record('g1', [topic({ title: '次日话题' })])
-  const f2 = join(base, 'reports/2026-01-11.md')
-  assert.ok(existsSync(f2), '跨天应生成新文件')
-
-  const report2 = readFileSync(f2, 'utf8')
-  assert.ok(report2.includes('# 群聊日报 2026-01-11'))
-  assert.ok(report2.includes('次日话题'), '当日内容应在')
-  assert.ok(!report2.includes('周末爬山'), '昨日内容不应出现在新日报')
-  const report1 = readFileSync(f1, 'utf8')
-  assert.ok(report1.includes('周末爬山'))
-  assert.ok(!report1.includes('次日话题'), '当日文件不应被次日写入污染')
+  assert.ok(!existsSync(join(base, 'reports/2026-01-11.md')), '跨天也不应再生成根目录日报')
+  assert.ok(existsSync(join(base, 'groups/g1/insights.jsonl')), 'insights.jsonl 产出保持不变')
 
   // 计数器：g1 当日 1 条（跨天后今日归零），g2 仍是昨天的 → 0
   assert.deepEqual(journal.status('g1'), { todayCount: 1, lastDistillAt: day2 })
@@ -116,7 +108,7 @@ test('mock 时钟跨天：生成两天日报 + 计数器按本地自然日切', 
   assert.equal(journal.status('g1').todayCount, 2)
 })
 
-test('日报含群分节、topic 标题 + 摘要 + actors，及其余三类代表条目', () => {
+test('根目录日报退役：多次提炼仅落 jsonl，不产生 reports/ 目录', () => {
   const { journal } = setup()
   journal.record('g9', [
     topic(),
@@ -124,19 +116,14 @@ test('日报含群分节、topic 标题 + 摘要 + actors，及其余三类代�
     { ts: 't', type: 'quote', text: '爬山五分钟拍照两小时', reason: '可能复用' },
     { ts: 't', type: 'opportunity', topic: '爬山', angle: '自嘲体力', urgency: 'low' },
   ])
-  const md = readFileSync(join(base, 'reports/2026-01-10.md'), 'utf8')
-  assert.ok(md.includes('## g9'))
-  assert.ok(md.includes('**周末爬山**：讨论东线还是西线'))
-  assert.ok(md.includes('参与者：A、B'))
-  assert.ok(md.includes('`viewpoint`'))
-  assert.ok(md.includes('`quote`'))
-  assert.ok(md.includes('`opportunity`'))
-  // 增量更新：同一群再提炼，小节整节替换、不重复堆叠
+  const entries = readFileSync(join(base, 'groups/g9/insights.jsonl'), 'utf8')
+    .trim().split('\n').map((l) => JSON.parse(l))
+  assert.equal(entries.length, 4)
+  // 增量更新：再提炼仍只追加 jsonl，不重写任何日报文件
   journal.record('g9', [topic({ title: '新增话题' })])
-  const md2 = readFileSync(join(base, 'reports/2026-01-10.md'), 'utf8')
-  assert.equal((md2.match(/## g9/g) ?? []).length, 1)
-  assert.ok(md2.includes('新增话题'))
-  assert.ok(md2.includes('**周末爬山**'), '旧话题仍应汇总在当日小节里')
+  const lines = readFileSync(join(base, 'groups/g9/insights.jsonl'), 'utf8').trim().split('\n')
+  assert.equal(lines.length, 5)
+  assert.ok(!existsSync(join(base, 'reports')), '根目录 reports/ 不应由 journal 创建（report.ts 走 reports/<chatId>/）')
 })
 
 test('dispose 清引用：status 归零且不抛错', () => {
