@@ -28,8 +28,11 @@ export function errKindOf(error: unknown): 'timeout' | 'other' {
   return /timed?\s?out|timeout/i.test(msg) ? 'timeout' : 'other'
 }
 
-/** llm_call 阶段：map=分批/单次归纳、merge=批摘要合并、distill=提炼器（WP3） */
-export type LlmCallPhase = 'map' | 'merge' | 'distill'
+/**
+ * llm_call 阶段：map=分批/单次归纳、merge=批摘要合并、distill=提炼器（WP3）、
+ * refine=方案 B 滚动流水线段调用（T7，含末段出稿；JSONL/batch_stats 字段口径与其余相位一致，自动兼容）
+ */
+export type LlmCallPhase = 'map' | 'merge' | 'distill' | 'refine'
 
 // —————————————— T9：token 估算与价格表（成本透明化） ——————————————
 
@@ -309,6 +312,31 @@ export interface BatchStats {
   costCny?: number
   /** T9：token 是否估算值（true = 报告尾带 ~；false = 宿主回传真实 usage） */
   tokensEst?: boolean
+  /**
+   * T7：本次生成走的管线（仅 'ab' 双跑模式标注；缺省 = 纯 map-reduce / 纯 refine，不写）。
+   * 只进 meta.batch_stats 与 sidecar，renderBatchStatsLine 据此追加 refine 侧对比段。
+   */
+  pipeline?: 'ab'
+  /** T7：ab 模式下 refine（方案 B）侧的独立统计（B 用独立 Recorder，与 A 互不计入） */
+  refine?: RefineSideStats
+}
+
+/**
+ * T7：ab 双跑模式下方案 B（refine 滚动流水线）侧的独立统计——
+ * 调用数/耗时/费用来自 B 专用 LlmCallRecorder；degradedSegs = 降级段数（含末段整体降级记 1）。
+ */
+export interface RefineSideStats {
+  /** B 侧末段是否产出合法稿（false = 整体降级，sidecar draft 为 null） */
+  ok: boolean
+  calls: number
+  totalMs: number
+  /** 降级段数（中间段跳过 + 末段失败） */
+  degradedSegs: number
+  model?: string
+  inTokens?: number
+  outTokens?: number
+  costCny?: number
+  tokensEst?: boolean
 }
 
 /** token 数展示（≥1000 缩写为 x.xk，如 12300 → 12.3k） */
@@ -328,6 +356,12 @@ export function renderBatchStatsLine(s: Readonly<BatchStats>): string {
   if (s.model !== undefined) {
     const tilde = s.tokensEst === false ? '' : '~'
     line += ` · 模型 ${s.model} · 输入 ${tilde}${fmtTok(s.inTokens ?? 0)} / 输出 ${tilde}${fmtTok(s.outTokens ?? 0)} tok · ≈¥${(s.costCny ?? 0).toFixed(4)}`
+  }
+  // T7：ab 双跑模式追加 refine（方案 B）侧对比段——两管线各自调用数/耗时/费用，供人工评审定位
+  if (s.pipeline === 'ab' && s.refine) {
+    const r = s.refine
+    const tilde = r.tokensEst === false ? '' : '~'
+    line += ` · A/B 双跑：refine 侧 ${r.calls} 次 / ${sec(r.totalMs)} s${r.inTokens !== undefined ? ` · 输入 ${tilde}${fmtTok(r.inTokens)} / 输出 ${tilde}${fmtTok(r.outTokens ?? 0)} tok · ≈¥${(r.costCny ?? 0).toFixed(4)}` : ''}${r.ok ? '' : '（refine 侧降级）'}`
   }
   return line
 }

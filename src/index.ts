@@ -164,6 +164,8 @@ export interface PluginConfig {
   batchThreshold: number
   /** T4：自适应批大小（默认 true：timeout 压缩 ×0.7 / 连续成功扩张 ×1.2，按群按 kind 持久化；false = 固定 batchThreshold 回退通道） */
   adaptiveBatch: boolean
+  /** T7：报告归纳管线（'map-reduce' | 'refine' | 'ab'；默认 'map-reduce' 安全默认，BooookScore 修正案不预设 B 优） */
+  reportPipeline: string
   /** 每日发送上限（默认 20） */
   maxSendsPerDay: number
   /** wechat-ui 可执行文件（默认 'wechat-ui'；仅 sendMethod='wechat-ui' 用） */
@@ -240,6 +242,7 @@ export const Config: Schema<PluginConfig> = Schema.object({
   verifyDelaySec: Schema.number().default(3).description('DB 回读验证每次尝试前的等待秒数（默认 3；微信异步写本地库，需重试窗口消化竞态）'),
   batchThreshold: Schema.number().default(120).description('大窗口分批归纳阈值（默认 120；窗口消息数超过该值时日报/人物日摘自动切批归纳再合并，避免单次大调用超时。≤阈值路径零变化）'),
   adaptiveBatch: Schema.boolean().default(true).description('自适应批大小（默认 true）：批超时自动收缩 safeBatch（×0.7，下限 20）、连续 5 次又快又成功自动扩张（×1.2，上限 120），按群按报告类型持久化。false = 固定用 batchThreshold（回退通道，零行为差异）'),
+  reportPipeline: Schema.string().default('map-reduce').description("T7 报告归纳管线：map-reduce（默认，方案 A，安全默认）| refine（方案 B 滚动流水线接管，实验）| ab（双跑：正式报告仍用 A，B 产出落 reports/<chatId>/<date>.refine.json 供人工三维度评审）。BooookScore 修正案：不预设 B 优，A/B 灰度实测定夺"),
     verifyRetries: Schema.number().default(4).description('DB 回读验证尝试次数（默认 4；穷尽仍未命中才判 failed_wrong_target）'),
   chatVerifyRetries: Schema.number().default(2).description('发送前合规闸（wechat-ui read 标题核验，防误发）失败重试次数（默认 2 = 共 3 次；全失败 deferred 不发不计 attempts）'),
   allowTakeFocus: Schema.boolean().default(false).description('抢前台模式（默认 false = 微信非前台跳过本轮，人在电脑前模式）。true = 全自动无人值守：自动激活微信前台发送，但系统空闲 <10s（用户正在打字/操作）仍让路跳过'),
@@ -484,6 +487,8 @@ export function apply(ctx: Context, config: PluginConfig): void {
       aggregationMaxGroups: config.aggregationMaxGroups,
       batchThreshold: config.batchThreshold,
       adaptiveBatch: config.adaptiveBatch, // T4：false = 固定 batchThreshold（回退通道）
+      // T7：管线开关（非法值回退安全默认 'map-reduce'；默认不动 A 的任何行为）
+      reportPipeline: (['refine', 'ab'].includes(config.reportPipeline) ? config.reportPipeline : 'map-reduce') as 'map-reduce' | 'refine' | 'ab',
       llmPricing: config.llmPricing, // T9：价格表（模型名 → 元/百万 tokens；缺省内置默认表）
       groups: config.groups,
       notifier, // T3：同群连续 2 个窗口 degraded → notify 告警（dry_run 语义在 SystemNotifier 内保持）

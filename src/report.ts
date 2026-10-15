@@ -32,6 +32,8 @@ import type { LlmClient } from './distiller.js'
 import { localDayKey } from './person-digest.js'
 import { LlmCallRecorder, monotonicMs, renderBatchStatsLine, errKindOf, DEFAULT_LLM_PRICING } from './llm-observe.js'
 import type { BatchStats, LlmPricingTable } from './llm-observe.js'
+import { runRefinePipeline } from './pipeline-refine.js'
+import type { RefinePipelineResult } from './pipeline-refine.js'
 
 // T3：errKindOf 已迁至 llm-observe.ts（与 LlmCallRecorder 同处，report/distiller 共用）；
 // 此处再导出保持旧导入路径（tests/report-timeout-split.test.mjs 等）不变。
@@ -40,6 +42,12 @@ export { errKindOf } from './llm-observe.js'
 // 技术文档 §4.1 所指 "report.ts 纯函数" 经此再导出对调用方等价）
 export { splitByRate, SPLIT_MAX_SEG_DEFAULT } from './split-by-rate.js'
 export type { RateSegment, RateSplitMessage, SplitByRateOptions } from './split-by-rate.js'
+// T7：方案 B 滚动 refine 流水线（实现在 pipeline-refine.ts，此处再导出保持 report.ts 单入口 API）
+export {
+  runRefinePipeline, validatePipelineState, parseRefineStateOutput, parseRefineFinalOutput,
+  buildRefineStatePrompt, buildRefineFinalPrompt, pipelineMemoryRelPath, loadPipelineMemory, savePipelineMemory,
+} from './pipeline-refine.js'
+export type { PipelineState, PipelineActor, PipelineQuote, RefinePipelineDeps, RefinePipelineResult } from './pipeline-refine.js'
 
 export type ReportKind = 'daily' | 'weekly' | 'monthly'
 export const REPORT_KINDS: readonly ReportKind[] = ['daily', 'weekly', 'monthly']
@@ -499,6 +507,14 @@ export interface ReportServiceOptions {
    * safe-batch.json）；false = 固定 batchThreshold，零行为差异（回退通道）。
    */
   adaptiveBatch?: boolean
+  /**
+   * T7 报告归纳管线（Config.reportPipeline，默认 'map-reduce' 安全默认——BooookScore 修正案：
+   * 不预设 B 优）。'map-reduce' = 既有 runBatched/单次路径（零行为变化）；
+   * 'refine' = 方案 B 滚动流水线全量接管（实验，B 降级语义与 A 对齐）；
+   * 'ab' = 双跑：正式落盘报告用 map-reduce 结果（默认不动），B 产出写
+   * reports/<chatId>/<dateKey>.refine.json sidecar（draft + σ + 批统计），供人工三维度评审。
+   */
+  reportPipeline?: 'map-reduce' | 'refine' | 'ab'
   /** 白名单群（聚合遍历范围） */
   groups?: readonly string[]
   /** 聚合排序与选取注入（测试用；缺省 defaultRankGroups） */
@@ -523,6 +539,8 @@ export class ReportService {
   private readonly maxGroups: number
   private readonly batchThreshold: number
   private readonly adaptiveBatch: boolean
+  /** T7：报告归纳管线（默认 'map-reduce'；非法值一律回退安全默认） */
+  private readonly pipeline: 'map-reduce' | 'refine' | 'ab'
   private readonly mono: () => number
   private readonly groups: readonly string[]
   private readonly rankFn: (stats: readonly GroupStats[]) => string[]
@@ -534,6 +552,7 @@ export class ReportService {
     this.maxGroups = Math.max(1, Math.floor(options.aggregationMaxGroups ?? 8))
     this.batchThreshold = Math.max(10, Math.floor(options.batchThreshold ?? BATCH_THRESHOLD_DEFAULT))
     this.adaptiveBatch = options.adaptiveBatch ?? true
+    this.pipeline = options.reportPipeline === 'refine' || options.reportPipeline === 'ab' ? options.reportPipeline : 'map-reduce'
     this.mono = options.monotonicMs ?? monotonicMs
     this.groups = options.groups ?? []
     this.rankFn = options.rankGroups ?? defaultRankGroups
@@ -591,9 +610,21 @@ export class ReportService {
     let llmError: string | null = null
     let assertionFails = 0
     let partialNote = ''
-    // T3：批统计骨架（批数/失败批/最大批耗时/检查点命中由各路径回填；总调用/总耗时来自 rec）
+    // T7：批统计骨架（批数/失败批/最大批耗时/检查点命中由各路径回填；总调用/总耗时来自 rec）
     let bs: BatchStats = { batches: 1, failedBatches: 0, maxBatchMs: 0, ckptHits: 0, totalCalls: 0, totalMs: 0 }
-    if (messages.length > this.batchThreshold) {
+    // T7：A/B 灰度——是否走 A 的「分批归纳」路径（refine 模式 A 完全不跑；ab 模式照常跑）
+    const batchedA = messages.length > this.batchThreshold
+    // T7：ab 模式下 B（refine）侧独立统计（独立 Recorder，互不计入；B 失败绝不影响 A）
+    let refineSide: { stats: BatchStats; ok: boolean } | null = null
+    if (this.pipeline === 'refine') {
+      // 方案 B 全量接管：不分「阈值内/外」——splitByRate 自会给出单段（≤minSeg）或多段
+      const res = await this.runRefine(chatId, kind, win, messages, persons, rec)
+      draft = res.draft
+      llmError = res.llmError
+      assertionFails = res.assertionFails
+      partialNote = res.partialNote
+      bs = res.stats
+    } else if (batchedA) {
       // 大窗口分批归纳+合并（线上实测 181 条单次调用 Request timed out）
       const res = await this.runBatched(chatId, kind, win, messages, persons, rec)
       draft = res.draft
@@ -617,6 +648,10 @@ export class ReportService {
           this.options.logger.warn(`report[${chatId}/${kind}/${win.dateKey}]: ${llmError !== null ? 'LLM 调用异常，重试一次' : '金字塔断言未通过，重试一次'}`)
         }
       }
+    }
+    // T7：ab 双跑——A 路径（含分批/单次）跑完后另跑 B（refine）出 sidecar；B 失败不影响 A（内部全兜底）
+    if (this.pipeline === 'ab') {
+      refineSide = await this.runRefineSidecar(chatId, kind, win, messages, persons)
     }
     const degradedReason = llmError !== null
       ? `LLM 调用异常：${llmError}`
@@ -642,7 +677,8 @@ export class ReportService {
     const rs = rec.getStats()
     const batchStats: BatchStats = {
       ...bs,
-      failedBatches: messages.length > this.batchThreshold ? bs.failedBatches : status === 'degraded' ? 1 : 0,
+      // refine 模式 failedBatches 由 runner 按段回填（含末段整体降级）；A 的单次路径沿用旧口径
+      failedBatches: batchedA || this.pipeline === 'refine' ? bs.failedBatches : status === 'degraded' ? 1 : 0,
       totalCalls: rs.calls,
       totalMs: rs.totalMs,
       model: rs.model,
@@ -650,6 +686,21 @@ export class ReportService {
       outTokens: rs.outTokens,
       costCny: rs.costCny,
       tokensEst: rs.tokensEst,
+    }
+    // T7：ab 模式 batch_stats 注明双跑 + B 侧独立统计（两管线各自调用数/耗时/费用）
+    if (this.pipeline === 'ab' && refineSide !== null) {
+      batchStats.pipeline = 'ab'
+      batchStats.refine = {
+        ok: refineSide.ok,
+        calls: refineSide.stats.totalCalls,
+        totalMs: refineSide.stats.totalMs,
+        degradedSegs: refineSide.stats.failedBatches,
+        model: refineSide.stats.model,
+        inTokens: refineSide.stats.inTokens,
+        outTokens: refineSide.stats.outTokens,
+        costCny: refineSide.stats.costCny,
+        tokensEst: refineSide.stats.tokensEst,
+      }
     }
     const md = renderReport({ kind, chatId, window: win, draft, status, messageCount, degradedReason, partialNote, quotes, persons, actions: this.collectActions(chatId, win), board: this.collectBoard(chatId, win), fileLines: this.collectFileLines(chatId, win), batchStats })
     const written = this.options.store.writeText(rel, md)
@@ -1100,6 +1151,91 @@ export class ReportService {
     this.options.store.writeText(reportCkptRelPath(chatId), JSON.stringify(Object.fromEntries(ckpt)))
   }
 
+  // —————————————— T7：方案 B 滚动 refine 流水线接入 ——————————————
+
+  /**
+   * B 段长上限 = 当前生效 safeBatch（自适应开，只读不结算——T4 反馈环属 A 路径，
+   * B 不写入 safe-batch 状态，避免实验路径污染正式回退通道）或配置 batchThreshold。
+   */
+  private effectiveMaxSeg(chatId: string, kind: ReportKind): number {
+    if (!this.adaptiveBatch) return this.batchThreshold
+    return this.loadSafeBatch(chatId, kind).state.safeBatch
+  }
+
+  /** 方案 B 滚动流水线（'refine' 模式全量接管用；rec 为主记录器，phase='refine'） */
+  private async runRefine(
+    chatId: string,
+    kind: ReportKind,
+    win: ReportWindow,
+    messages: readonly StoredMessage[],
+    persons: ReadonlyArray<{ name: string; line: string }>,
+    rec: LlmCallRecorder,
+  ): Promise<RefinePipelineResult> {
+    return runRefinePipeline(messages, persons, {
+      llm: this.options.llm,
+      store: this.options.store,
+      logger: this.options.logger,
+      chatId,
+      kind,
+      winStart: win.start,
+      winEnd: win.end,
+      rec,
+      parseDraft: parseReportDraft,
+      maxSeg: this.effectiveMaxSeg(chatId, kind),
+      sleep: this.sleepFn,
+      now: this.now,
+    })
+  }
+
+  /**
+   * ab 双跑的 B 侧（sidecar）：独立 Recorder（两管线各自调用数/耗时/费用，互不计入），
+   * 产出落 reports/<chatId>/<dateKey>.refine.json（draft + σ + 批统计，供人工三维度
+   * 评审：连贯性/细节召回/任务识别）。B 任何失败只降级 sidecar（draft=null + 错误原因），
+   * 绝不影响 A 的正式报告与状态。
+   */
+  private async runRefineSidecar(
+    chatId: string,
+    kind: ReportKind,
+    win: ReportWindow,
+    messages: readonly StoredMessage[],
+    persons: ReadonlyArray<{ name: string; line: string }>,
+  ): Promise<{ stats: BatchStats; ok: boolean }> {
+    const rec = new LlmCallRecorder(this.options.store, this.now, {
+      model: this.options.llm.modelId?.() ?? 'unknown',
+      pricing: this.options.llmPricing ?? DEFAULT_LLM_PRICING,
+      logger: this.options.logger,
+    })
+    const emptyStats: BatchStats = { batches: 0, failedBatches: 0, maxBatchMs: 0, ckptHits: 0, totalCalls: 0, totalMs: 0 }
+    try {
+      const res = await this.runRefine(chatId, kind, win, messages, persons, rec)
+      this.options.store.writeText(refineSidecarRelPath(chatId, win.dateKey), JSON.stringify({
+        chatId,
+        kind,
+        dateKey: win.dateKey,
+        pipeline: 'refine',
+        generatedAt: this.now(),
+        ok: res.draft !== null,
+        // draft 已映射 msg_id（与正式报告同口径），quoteIdx 保留全窗口序号便于回放
+        draft: res.draft !== null ? mapDraft(res.draft, messages) : null,
+        quoteIdx: res.draft?.quoteIdx ?? [],
+        state: res.memory,
+        partialNote: res.partialNote,
+        llmError: res.llmError,
+        stats: res.stats,
+      }, null, 2))
+      return { stats: res.stats, ok: res.draft !== null }
+    } catch (error) {
+      // 理论不可达（runner 内部已兜底），双保险：B 异常绝不冒泡影响 A
+      const redacted = redactSecretLike(String(error).slice(0, 160))
+      this.options.logger.warn(`report[${chatId}/${kind}/${win.dateKey}] refine sidecar 异常：${redacted}`)
+      this.options.store.writeText(refineSidecarRelPath(chatId, win.dateKey), JSON.stringify({
+        chatId, kind, dateKey: win.dateKey, pipeline: 'refine', generatedAt: this.now(),
+        ok: false, draft: null, quoteIdx: [], state: null, partialNote: '', llmError: redacted, stats: emptyStats,
+      }, null, 2))
+      return { stats: emptyStats, ok: false }
+    }
+  }
+
   // —————————————— T4：safe-batch 状态读写与结算 ——————————————
 
   /**
@@ -1330,4 +1466,9 @@ function mapDraft(draft: ReportDraft, messages: readonly StoredMessage[]): Repor
 /** md 相对路径：<stateDir>/reports/<chatId>/<date>.md（经 store 围栏） */
 export function reportRelPath(chatId: string, dateKey: string): string {
   return ['reports', chatId, `${dateKey}.md`].join('/')
+}
+
+/** T7：ab 双跑 B 侧 sidecar 相对路径：reports/<chatId>/<date>.refine.json（draft + σ + 批统计） */
+export function refineSidecarRelPath(chatId: string, dateKey: string): string {
+  return ['reports', chatId, `${dateKey}.refine.json`].join('/')
 }
