@@ -153,6 +153,8 @@ export interface BatchStats {
   totalCalls: number
   /** LLM 总耗时（毫秒） */
   totalMs: number
+  /** T4：本次实际批大小（自适应开 = safeBatch；单次调用路径缺省不写）。只在 meta 落盘，不进报告尾统计行 */
+  batchSize?: number
 }
 
 /** 报告尾统计行（技术文档 §7：日报含 batch_stats） */

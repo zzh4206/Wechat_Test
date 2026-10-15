@@ -151,10 +151,14 @@ export interface PluginConfig {
   verifyDelaySec: number
   /** DB 回读验证尝试次数（默认 4；总窗口 ≈ verifyDelaySec × verifyRetries ≈ 12s） */
   verifyRetries: number
+  /** 发送前合规闸（wechat-ui read 标题核验）失败重试次数（默认 2 = 总尝试 3 次） */
+  chatVerifyRetries: number
   /** 抢前台模式（默认 false = 微信非前台跳过本轮）。true = 自动激活微信前台发送，仍让路给正在打字的用户（空闲 <10s 跳过） */
   allowTakeFocus: boolean
   idleSkipBelowSec: number
   batchThreshold: number
+  /** T4：自适应批大小（默认 true：timeout 压缩 ×0.7 / 连续成功扩张 ×1.2，按群按 kind 持久化；false = 固定 batchThreshold 回退通道） */
+  adaptiveBatch: boolean
   /** 每日发送上限（默认 20） */
   maxSendsPerDay: number
   /** wechat-ui 可执行文件（默认 'wechat-ui'；仅 sendMethod='wechat-ui' 用） */
@@ -226,7 +230,9 @@ export const Config: Schema<PluginConfig> = Schema.object({
   sendIntervalSec: Schema.number().default(300).description('发送 worker 消费 outbox 的扫描间隔（秒）'),
   verifyDelaySec: Schema.number().default(3).description('DB 回读验证每次尝试前的等待秒数（默认 3；微信异步写本地库，需重试窗口消化竞态）'),
   batchThreshold: Schema.number().default(120).description('大窗口分批归纳阈值（默认 120；窗口消息数超过该值时日报/人物日摘自动切批归纳再合并，避免单次大调用超时。≤阈值路径零变化）'),
+  adaptiveBatch: Schema.boolean().default(true).description('自适应批大小（默认 true）：批超时自动收缩 safeBatch（×0.7，下限 20）、连续 5 次又快又成功自动扩张（×1.2，上限 120），按群按报告类型持久化。false = 固定用 batchThreshold（回退通道，零行为差异）'),
     verifyRetries: Schema.number().default(4).description('DB 回读验证尝试次数（默认 4；穷尽仍未命中才判 failed_wrong_target）'),
+  chatVerifyRetries: Schema.number().default(2).description('发送前合规闸（wechat-ui read 标题核验，防误发）失败重试次数（默认 2 = 共 3 次；全失败 deferred 不发不计 attempts）'),
   allowTakeFocus: Schema.boolean().default(false).description('抢前台模式（默认 false = 微信非前台跳过本轮，人在电脑前模式）。true = 全自动无人值守：自动激活微信前台发送，但系统空闲 <10s（用户正在打字/操作）仍让路跳过'),
   idleSkipBelowSec: Schema.number().default(10).description('用户空闲让路阈值秒（默认 10 = 系统空闲 <10s 视为正在操作→跳过本轮让路；0 = 不让路，空闲检测失效直接抢前台发送。日常单日报场景可设 0——每天一次的抢前台可接受；频繁发送建议保持 10）'),
   maxSendsPerDay: Schema.number().default(20).description('每日发送上限（默认 20；超限的当日 pending 标 skipped_quota 防风暴）'),
@@ -356,6 +362,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
     intervalSec: config.sendIntervalSec,
     verifyDelaySec: config.verifyDelaySec,
     verifyRetries: config.verifyRetries,
+    chatVerifyRetries: config.chatVerifyRetries,
   })
   // report 依赖 llmClient（其下才定义），先占位、llmClient 就绪后赋值
   let report: ReportService | null = null
@@ -458,6 +465,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
       enabled: true,
       aggregationMaxGroups: config.aggregationMaxGroups,
       batchThreshold: config.batchThreshold,
+      adaptiveBatch: config.adaptiveBatch, // T4：false = 固定 batchThreshold（回退通道）
       groups: config.groups,
       notifier, // T3：同群连续 2 个窗口 degraded → notify 告警（dry_run 语义在 SystemNotifier 内保持）
     })

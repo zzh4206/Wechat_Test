@@ -30,7 +30,7 @@ import { assertInsideState, redactSecretLike } from './guard.js'
 import type { GroupStoreService, StoredMessage, ReportMetaRow } from './group-store.js'
 import type { LlmClient } from './distiller.js'
 import { localDayKey } from './person-digest.js'
-import { LlmCallRecorder, monotonicMs, sinceMs, renderBatchStatsLine, errKindOf } from './llm-observe.js'
+import { LlmCallRecorder, monotonicMs, renderBatchStatsLine, errKindOf } from './llm-observe.js'
 import type { BatchStats } from './llm-observe.js'
 
 // T3：errKindOf 已迁至 llm-observe.ts（与 LlmCallRecorder 同处，report/distiller 共用）；
@@ -235,6 +235,52 @@ export function reportCkptRelPath(chatId: string): string {
   return ['reports', chatId, 'ckpt.json'].join('/')
 }
 
+// —————————————————— T4：自适应批大小（safe-batch 状态，技术文档 §3.2） ——————————————————
+
+/** safeBatch 钳制上限（技术文档 §3.1：小批防超时且防中段漏召回——120 为上限而非目标值） */
+export const SAFE_BATCH_MAX = 120
+/**
+ * safeBatch 反馈压缩的目标下限。实际生效下限 = min(此值, 配置 batchThreshold)——
+ * 配置本身低于 20 时（如测试注入 12）不得因反馈反向放大批大小。
+ */
+export const SAFE_BATCH_MIN = 20
+/** 无历史批耗时的 P50 基准（30s）：本次最大批耗时须 < P50×0.5 才有扩张资格 */
+export const SAFE_BATCH_P50_BASE_MS = 30_000
+/** 连续「全部批成功且明显快于历史 P50」多少次生成后扩张 ×1.2 */
+export const SAFE_BATCH_EXPAND_STREAK = 5
+/** 历史批耗时条数上限（滑动窗口；中位数对旧观测不敏感即可，无需更长） */
+export const SAFE_BATCH_DUR_HISTORY = 20
+
+/**
+ * 每 (chatId, kind) 独立的 safeBatch 状态（持久化 reports/<chatId>/safe-batch.json，
+ * 文件整体结构 = { "<kind>": SafeBatchState, ... }，风格对齐 ckpt.json/alert-state.json：
+ * 损坏作废重来、读写不抛错）。
+ */
+export interface SafeBatchState {
+  /** 下次生成使用的批大小（反馈调整对象；构造初始 = 配置 batchThreshold，上限 120） */
+  safeBatch: number
+  /** 连续「全部批成功且最大批耗时 < 历史 P50 × 0.5」的生成次数（计满 5 扩张并清零） */
+  streak: number
+  /** 历史成功生成的最大批耗时样本（毫秒；P50 = 中位数） */
+  durs: number[]
+}
+
+/** safe-batch 状态文件相对路径：reports/<chatId>/safe-batch.json */
+export function safeBatchRelPath(chatId: string): string {
+  return ['reports', chatId, 'safe-batch.json'].join('/')
+}
+
+/**
+ * 历史批耗时 P50（纯函数）：排序取中位数（偶数个取中间两数均值）。
+ * 空历史 / 无有效样本返回 null（调用方退回 30s 基准）。
+ */
+export function p50BatchMs(durs: readonly number[]): number | null {
+  const s = durs.filter((d) => typeof d === 'number' && Number.isFinite(d) && d > 0).sort((a, b) => a - b)
+  if (s.length === 0) return null
+  const mid = Math.floor(s.length / 2)
+  return s.length % 2 === 1 ? s[mid] : Math.round((s[mid - 1] + s[mid]) / 2)
+}
+
 export interface RenderInput {
   kind: ReportKind
   chatId: string
@@ -437,12 +483,23 @@ export interface ReportServiceOptions {
   aggregationMaxGroups?: number
   /** Config.batchThreshold：窗口消息数超过该值时分批归纳+合并（默认 120；不超阈值路径零变化） */
   batchThreshold?: number
+  /**
+   * T4 自适应批大小开关（Config.adaptiveBatch，默认 true）：true = runBatched 批大小取
+   * 该群该 kind 的 safeBatch 状态（timeout 压缩 ×0.7 / 连续成功扩张 ×1.2，持久化
+   * safe-batch.json）；false = 固定 batchThreshold，零行为差异（回退通道）。
+   */
+  adaptiveBatch?: boolean
   /** 白名单群（聚合遍历范围） */
   groups?: readonly string[]
   /** 聚合排序与选取注入（测试用；缺省 defaultRankGroups） */
   rankGroups?: (stats: readonly GroupStats[]) => string[]
   /** T1：批间退避 sleep 注入（缺省 setTimeout 封装；测试注入 spy/零延迟） */
   sleep?: (ms: number) => Promise<void>
+  /**
+   * T4：批耗时单调时钟注入（默认 performance.now；扩张判定依赖批耗时，测试注入
+   * 假时钟驱动「快于/慢于历史 P50」场景）。
+   */
+  monotonicMs?: () => number
   now?: () => number
   /**
    * T3 告警通道（技术文档 §7）：同群同 kind 连续 2 个窗口 degraded → notify 推送。
@@ -455,6 +512,8 @@ export class ReportService {
   private readonly now: () => number
   private readonly maxGroups: number
   private readonly batchThreshold: number
+  private readonly adaptiveBatch: boolean
+  private readonly mono: () => number
   private readonly groups: readonly string[]
   private readonly rankFn: (stats: readonly GroupStats[]) => string[]
   private readonly sleepFn: (ms: number) => Promise<void>
@@ -464,6 +523,8 @@ export class ReportService {
     this.now = options.now ?? (() => Date.now())
     this.maxGroups = Math.max(1, Math.floor(options.aggregationMaxGroups ?? 8))
     this.batchThreshold = Math.max(10, Math.floor(options.batchThreshold ?? BATCH_THRESHOLD_DEFAULT))
+    this.adaptiveBatch = options.adaptiveBatch ?? true
+    this.mono = options.monotonicMs ?? monotonicMs
     this.groups = options.groups ?? []
     this.rankFn = options.rankGroups ?? defaultRankGroups
     this.sleepFn = options.sleep ?? defaultSleep
@@ -819,8 +880,9 @@ export class ReportService {
 
   /**
    * 大窗口分批归纳+合并：
-   * ① 窗口按时间序切 ≤batchThreshold 条/批，逐批 LLM 提炼（批内序号全局化 n=start+i+1，
-   *    evidence 直接可映射全窗口 messages）；
+   * ① 窗口按时间序切批（T4：批大小 = 该群该 kind 的 safeBatch 状态（自适应开）或配置
+   *    batchThreshold（自适应关）；窗口是否分批仍按配置阈值判断），逐批 LLM 提炼
+   *    （批内序号全局化 n=start+i+1，evidence 直接可映射全窗口 messages）；
    * ② 批内失败错误分类（T1，技术文档 §3.3）：timeout → 不原样重试，对该批对半切分
    *    递归归纳（子批序号沿用全局化规则，子批摘要按顺序并入该批位置；叶子批 <5 条仍
    *    timeout → 标 degraded 跳过，禁止无限切分）；非 timeout（断言/解析失败、其他异常）
@@ -841,22 +903,38 @@ export class ReportService {
     rec: LlmCallRecorder,
   ): Promise<{ draft: ReportDraft | null; llmError: string | null; assertionFails: number; partialNote: string; stats: BatchStats }> {
     const tag = `report[${chatId}/${kind}/${win.dateKey}]`
-    const size = this.batchThreshold
+    // T4：批大小决策——自适应开 = 该群该 kind 的 safeBatch 状态（每 (chatId,kind) 独立）；
+    // 关 = 固定配置 batchThreshold（零行为差异）。注意窗口是否分批仍按配置阈值判断，
+    // safeBatch 只影响批内切分粒度。
+    const sb = this.adaptiveBatch ? this.loadSafeBatch(chatId, kind) : null
+    const size = sb ? sb.state.safeBatch : this.batchThreshold
+    // T4 反馈钩子：任一非叶子批（≥5 条）timeout → 压缩下次批大小（×0.7，下限 20）。
+    // 递归对半切分中每层 timeout 都会走到这里（自然连续压两级）；叶子批（<5 条）为
+    // 宿主故障，与批大小无关，不计。压缩同时打断连续成功计数。
+    const press = sb
+      ? () => {
+          sb.pressed = true
+          sb.state.streak = 0
+          const floor = Math.min(SAFE_BATCH_MIN, this.batchThreshold)
+          sb.state.safeBatch = Math.max(floor, Math.floor(sb.state.safeBatch * 0.7))
+        }
+      : null
     const batches: Array<{ start: number; msgs: StoredMessage[] }> = []
     for (let i = 0; i < messages.length; i += size) batches.push({ start: i, msgs: messages.slice(i, i + size) })
     const ckpt = this.loadCkpt(chatId)
     const bo: BackoffState = { streak: 0, sleep: this.sleepFn }
     const parts: Array<{ batch: number; degraded: boolean; draft: ReportDraft | null }> = []
     const failedBatches: number[] = []
-    // T3 batch_stats 骨架：批数/失败批/最大批耗时（不含批间退避 sleep）/检查点命中
-    const bs: BatchStats = { batches: batches.length, failedBatches: 0, maxBatchMs: 0, ckptHits: 0, totalCalls: 0, totalMs: 0 }
+    // T3 batch_stats 骨架：批数/失败批/最大批耗时（不含批间退避 sleep）/检查点命中；
+    // T4：batchSize 记本次实际批大小（自适应时 = safeBatch，可观测性要求）。
+    const bs: BatchStats = { batches: batches.length, failedBatches: 0, maxBatchMs: 0, ckptHits: 0, totalCalls: 0, totalMs: 0, batchSize: size }
     for (let b = 0; b < batches.length; b++) {
       // 批间退避：上一批失败（连续失败 streak>0）→ 与下一批之间 sleep（指数+抖动）
       if (bo.streak > 0) await bo.sleep(backoffDelayMs(bo.streak))
       const { start, msgs } = batches[b]
-      const bt0 = monotonicMs()
-      const res = await this.distillBatch(chatId, kind, win, messages, persons, msgs, start, String(b + 1), ckpt, bo, tag, `${b + 1}/${batches.length}`, bs, rec)
-      bs.maxBatchMs = Math.max(bs.maxBatchMs, sinceMs(bt0))
+      const bt0 = this.mono()
+      const res = await this.distillBatch(chatId, kind, win, messages, persons, msgs, start, String(b + 1), ckpt, bo, tag, `${b + 1}/${batches.length}`, press, bs, rec)
+      bs.maxBatchMs = Math.max(bs.maxBatchMs, Math.max(1, Math.round(this.mono() - bt0)))
       if (res.drafts.length > 0) {
         bo.streak = 0
         for (const d of res.drafts) parts.push({ batch: b + 1, degraded: false, draft: d })
@@ -868,6 +946,8 @@ export class ReportService {
       }
     }
     if (failedBatches.length === batches.length) {
+      // T4：生成结束统一结算 safeBatch（批大小变化只在下次生效，本次批布局不受影响）
+      if (sb) this.finalizeSafeBatch(chatId, kind, sb, false, tag)
       return { draft: null, llmError: '分批归纳全部批次失败（含对半切分与重试）', assertionFails: 0, partialNote: '', stats: bs }
     }
     // 合并调用（输入=各批摘要，输出=最终 schema；不缓存）
@@ -892,6 +972,9 @@ export class ReportService {
     const partialNote = failedBatches.length > 0
       ? `部分素材归纳失败：第 ${failedBatches.join('、')} 批 LLM 调用失败（含对半切分与重试），已跳过该批素材`
       : ''
+    // T4：生成结束统一结算 safeBatch——扩张判定条件 = 全部批成功（含对半切分自愈）
+    // 且合并调用产出合法稿；批大小变化只在下次生成生效。
+    if (sb) this.finalizeSafeBatch(chatId, kind, sb, failedBatches.length === 0 && draft !== null, tag, bs.maxBatchMs)
     return { draft, llmError, assertionFails, partialNote, stats: bs }
   }
 
@@ -915,6 +998,8 @@ export class ReportService {
     bo: BackoffState,
     tag: string,
     label: string,
+    /** T4：timeout 压缩反馈钩子（自适应关闭时为 null；仅非叶子批触发） */
+    press: (() => void) | null,
     /** T3 batch_stats 累计器（检查点命中在此累加；批耗时由 runBatched 外层计时） */
     bs: BatchStats,
     /** T3 llm_call 记录器（每次批调用落一行 phase='map'） */
@@ -935,14 +1020,17 @@ export class ReportService {
       } catch (error) {
         const redacted = redactSecretLike(String(error).slice(0, 160))
         if (errKindOf(error) === 'timeout') {
-          // 容量型故障：对半切分（改变参数重试）；叶子批（<5 条）禁止再切 → degraded 跳过
+          // 容量型故障：对半切分（改变参数重试）；叶子批（<5 条）禁止再切 → degraded 跳过。
+          // T4：对半切分子批不按 safeBatch 重切（错误恢复路径自然小，不受钳制下限约束）；
+          // 非叶子批 timeout 先压缩 safeBatch 再切分（递归每层各自触发 → 一次大超时可连续压两级）。
           this.options.logger.warn(`${tag} batch ${label} timeout: ${redacted}`)
           bo.streak++
           if (msgs.length < 5) return { drafts: [], degraded: true }
+          if (press) press()
           await bo.sleep(backoffDelayMs(bo.streak))
           const mid = Math.floor(msgs.length / 2)
-          const left = await this.distillBatch(chatId, kind, win, messages, persons, msgs.slice(0, mid), start, `${batchKey}-1`, ckpt, bo, tag, `${label}左半`, bs, rec)
-          const right = await this.distillBatch(chatId, kind, win, messages, persons, msgs.slice(mid), start + mid, `${batchKey}-2`, ckpt, bo, tag, `${label}右半`, bs, rec)
+          const left = await this.distillBatch(chatId, kind, win, messages, persons, msgs.slice(0, mid), start, `${batchKey}-1`, ckpt, bo, tag, `${label}左半`, press, bs, rec)
+          const right = await this.distillBatch(chatId, kind, win, messages, persons, msgs.slice(mid), start + mid, `${batchKey}-2`, ckpt, bo, tag, `${label}右半`, press, bs, rec)
           return { drafts: [...left.drafts, ...right.drafts], degraded: left.degraded || right.degraded }
         }
         this.options.logger.warn(`${tag} batch ${label} llm failed: ${redacted}`)
@@ -988,6 +1076,94 @@ export class ReportService {
   /** 持久化检查点（整文件覆写；每批成功即落盘，中断后可续跑） */
   private saveCkpt(chatId: string, ckpt: Map<string, { draft: ReportDraft; ts: number }>): void {
     this.options.store.writeText(reportCkptRelPath(chatId), JSON.stringify(Object.fromEntries(ckpt)))
+  }
+
+  // —————————————— T4：safe-batch 状态读写与结算 ——————————————
+
+  /**
+   * 载入该群该 kind 的 safeBatch 状态（文件 reports/<chatId>/safe-batch.json，按 kind
+   * 分键）。损坏/缺失/条目非法 → 初始值 = 配置 batchThreshold（上限钳 120）。读写全程
+   * 不抛错；file 保留文件里其他 kind 的条目（结算时原样合并回写，互不影响）。
+   */
+  private loadSafeBatch(chatId: string, kind: ReportKind): { state: SafeBatchState; file: Record<string, unknown>; existed: boolean; orig: number; pressed: boolean } {
+    const initial = Math.min(SAFE_BATCH_MAX, Math.max(1, Math.floor(this.batchThreshold)))
+    let state: SafeBatchState = { safeBatch: initial, streak: 0, durs: [] }
+    let file: Record<string, unknown> = {}
+    let existed = false
+    const raw = this.options.store.readText(safeBatchRelPath(chatId))
+    if (raw === null) return { state, file, existed, orig: state.safeBatch, pressed: false }
+    existed = true
+    try {
+      const parsed = JSON.parse(raw) as Record<string, unknown>
+      if (parsed && typeof parsed === 'object') file = parsed
+      const e = file[kind] as Partial<SafeBatchState> | null | undefined
+      if (e && typeof e === 'object' && typeof e.safeBatch === 'number' && Number.isInteger(e.safeBatch) && e.safeBatch > 0) {
+        state = {
+          // 上限钳 120（历史文件可能写于旧配置，超上限值一律压回）
+          safeBatch: Math.min(SAFE_BATCH_MAX, e.safeBatch),
+          streak: typeof e.streak === 'number' && Number.isInteger(e.streak) && e.streak >= 0 ? e.streak : 0,
+          durs: Array.isArray(e.durs)
+            ? e.durs.filter((d): d is number => typeof d === 'number' && Number.isFinite(d) && d > 0).slice(-SAFE_BATCH_DUR_HISTORY)
+            : [],
+        }
+      } else if (e !== undefined) {
+        // 条目存在但非法：作废该条目重来（文件本身有效，保留其他 kind）
+        this.options.logger.warn(`report[${chatId}/${kind}]: safe-batch 条目非法，作废重来`)
+      }
+    } catch (error) {
+      this.options.logger.warn(`report[${chatId}]: safe-batch 状态文件损坏，作废重来：${String(error).slice(0, 120)}`)
+      file = {}
+    }
+    return { state, file, existed, orig: state.safeBatch, pressed: false }
+  }
+
+  /**
+   * 生成结束统一结算 safeBatch（一次生成只写盘一次，不在每批写）：
+   * - 全部批成功（含对半切分自愈）且合并产出合法稿：
+   *   该次最大批耗时 < 历史 P50 × 0.5（无历史以 30s 为基准）→ streak +1，计满 5 →
+   *   ×1.2（上限 120）并清零；耗时不达标 / 本次出现过 timeout（即便对半自愈）→
+   *   streak 清零（超时本身说明批仍偏大，不计入扩张连续）。
+   *   本次耗时样本无论达标与否都进历史（P50 反映真实分布）。
+   * - 任一批失败（degraded/合并失败）→ streak 清零。
+   * - timeout 压缩发生在批失败当下（press 钩子），此处只负责扩张判定、写盘与告警。
+   * 写盘保留文件中其他 kind 条目；变化时 warn 一行（含原因与检查点失效提示）。
+   */
+  private finalizeSafeBatch(
+    chatId: string,
+    kind: ReportKind,
+    sb: { state: SafeBatchState; file: Record<string, unknown>; existed: boolean; orig: number; pressed: boolean },
+    allOk: boolean,
+    tag: string,
+    maxBatchMs?: number,
+  ): void {
+    const st = sb.state
+    if (allOk) {
+      const p50 = p50BatchMs(st.durs) ?? SAFE_BATCH_P50_BASE_MS
+      const fast = typeof maxBatchMs === 'number' && maxBatchMs > 0 && maxBatchMs < p50 * 0.5
+      // 本次耗时样本无论达标与否都进历史（P50 反映真实分布）
+      st.durs = [...st.durs, Math.max(1, Math.round(maxBatchMs ?? 1))].slice(-SAFE_BATCH_DUR_HISTORY)
+      // 本次生成出现过 timeout（即便对半切分自愈）→ 不计入扩张连续（超时本身说明批仍偏大）
+      if (fast && !sb.pressed) {
+        st.streak++
+        if (st.streak >= SAFE_BATCH_EXPAND_STREAK) {
+          st.safeBatch = Math.min(SAFE_BATCH_MAX, Math.floor(st.safeBatch * 1.2))
+          st.streak = 0
+        }
+      } else {
+        st.streak = 0
+      }
+    } else {
+      st.streak = 0
+    }
+    const changed = st.safeBatch !== sb.orig
+    if (changed) {
+      const reason = sb.pressed ? 'timeout 压缩' : '连续成功扩张'
+      this.options.logger.warn(`${tag}: safeBatch ${sb.orig}→${st.safeBatch}：${reason}；下次窗口批边界变化，既有检查点按范围失效属预期`)
+    } else if (!sb.existed) {
+      this.options.logger.warn(`${tag}: safeBatch=${st.safeBatch} 初始化（${safeBatchRelPath(chatId)}）`)
+    }
+    // 一次生成统一写盘一次（其他 kind 条目原样保留；写失败由 Store 内部消化不抛错）
+    this.options.store.writeText(safeBatchRelPath(chatId), JSON.stringify({ ...sb.file, [kind]: st }))
   }
 
   // —————————————— T3：degraded 连续窗口告警（技术文档 §7） ——————————————
