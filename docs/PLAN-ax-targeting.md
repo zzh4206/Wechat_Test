@@ -1,5 +1,10 @@
 # 计划报告：sender 定位升级——AX 侧栏定位实施计划（按工作内容划分）
 
+> **⛔ 状态更新（2026-10-15 13:4X）：G1 不通过，AX 定位路线（WP-AX2/3/4）全线暂停。**
+> 实证结论：微信 4.1.13 的 AX 树仅暴露窗口壳（Swift+pyobjc 双载体交叉验证，90+ 采样从未物化；wechat-mcp 的丰富树结论基于 4.0.x，4.1.x 回退）。
+> 计划转向：**路线 A（wechat-ui read OCR 标题核验）作为发送前合规闸**，详见 [REPORT-ax-tree-research.md §4] 与下方"路线 A 实施工单"。
+> 本文件 WP-AX2/3/4 冻结存档；WP-AX1 的探针与报告转为 AX 路线回归诊断资产（微信未来版本恢复 AX 后 `spikes/ax-probe --dump` 一键复判）。
+
 > 编号：PLAN-AX-TARGETING-2026-10-15
 > 依据：[REPORT-ax-tree-research.md](REPORT-ax-tree-research.md)（调查结论：AX 树可读，误判已修正）
 > 目标：**废除"用户必须开着文件传输助手"的前提**——sender 每次自行定位并打开目标会话，误发风险归零
