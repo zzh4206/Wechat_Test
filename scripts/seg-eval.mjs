@@ -1,18 +1,16 @@
 #!/usr/bin/env node
 // seg-eval.mjs —— T5：切分质量评测入口。
 //
-// 用法：node scripts/seg-eval.mjs <golden.json> [--splitter rate] [--k <int>]
+// 用法：node scripts/seg-eval.mjs <golden.json> [--splitter rate|gap] [--k <int>]
 //   golden.json：tests/fixtures/seg-golden/<chatId>-<date>.json
 //               { chat, date, messages:[{ts,msgId}], boundaries:[...] }
 //
-// 扩展点（对接 T6/T1）：当前只实现 `rate` 切分器演示版（时间间隔 >30 分钟切点，
-// 与 golden 预填规则一致，仅作管线演示——此时 hyp==ref，WindowDiff/Pk 恒 0）。
-// 将来 report.ts 落地 `splitByRate`（另一任务）后，只需在此处：
-//     import { splitByRate } from '../lib/report.js'
-//     splitters['rate'] = (msgs) => boundariesFromSegments(splitByRate(msgs, {...}))
-// 并在 splitters 表注册新切分器（如 embedding、supervised）即可，评测循环不用改。
+// 扩展点（T6 已兑现）：`rate` 切分器已接 lib/split-by-rate.js 的 splitByRate 实现；
+// 旧 30 分钟间隙切分逻辑保留为 `gap` 切分器作对照。注册新切分器（embedding、
+// supervised 等）只需往 splitters 表加一项，评测循环不用改。
 import { readFileSync } from 'node:fs'
 import { windowDiff, boundaryPk, boundariesByTimeGap } from '../lib/segment-eval.js'
+import { splitByRate } from '../lib/split-by-rate.js'
 
 const args = process.argv.slice(2)
 const file = args.find((a) => !a.startsWith('--'))
@@ -20,7 +18,7 @@ const splitterName = args.includes('--splitter') ? args[args.indexOf('--splitter
 const kArg = args.includes('--k') ? Number(args[args.indexOf('--k') + 1]) : undefined
 
 if (!file) {
-  console.error('用法: node scripts/seg-eval.mjs <golden.json> [--splitter rate] [--k <int>]')
+  console.error('用法: node scripts/seg-eval.mjs <golden.json> [--splitter rate|gap] [--k <int>]')
   process.exit(1)
 }
 
@@ -29,10 +27,17 @@ const msgs = golden.messages ?? []
 const ref = golden.boundaries ?? []
 const n = msgs.length
 
-// 切分器注册表：返回 hyp 切点位置数组（1-based 新段首条消息序号）
+// 切分器注册表：返回 hyp 切点位置数组（1-based 新段首条消息序号）。
+// rate 取的是「非重叠归属区」边界（RateSegment.start）：重叠带仅影响 prompt 上下文、
+// 不产生额外切点，故切点 = 每段 start + 1（跳过首段）。
+const segmentsToBoundaries = (segments) => segments.slice(1).map((s) => s.start + 1)
+
 const splitters = {
-  // rate 演示版：时间间隔 >30 分钟切点（AUTO-PRELIM 同款规则）
-  rate: (messages) => boundariesByTimeGap(messages.map((m) => m.ts)),
+  // rate（T6 实现）：速率低谷切点 + 段长钳制 + 重叠带 + 引用边保护
+  rate: (messages) =>
+    segmentsToBoundaries(splitByRate(messages, { minSeg: 20, maxSeg: 120, overlap: 8 })),
+  // gap（对照，T5 演示版保留）：相邻时间间隔 >30 分钟切点（AUTO-PRELIM 同款规则）
+  gap: (messages) => boundariesByTimeGap(messages.map((m) => m.ts)),
 }
 
 const splitter = splitters[splitterName]

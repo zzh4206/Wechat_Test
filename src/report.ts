@@ -36,6 +36,10 @@ import type { BatchStats, LlmPricingTable } from './llm-observe.js'
 // T3：errKindOf 已迁至 llm-observe.ts（与 LlmCallRecorder 同处，report/distiller 共用）；
 // 此处再导出保持旧导入路径（tests/report-timeout-split.test.mjs 等）不变。
 export { errKindOf } from './llm-observe.js'
+// T6：splitByRate 节奏分段纯函数（实现在 split-by-rate.ts，此处再导出保持 report.ts 单入口 API，
+// 技术文档 §4.1 所指 "report.ts 纯函数" 经此再导出对调用方等价）
+export { splitByRate, SPLIT_MAX_SEG_DEFAULT } from './split-by-rate.js'
+export type { RateSegment, RateSplitMessage, SplitByRateOptions } from './split-by-rate.js'
 
 export type ReportKind = 'daily' | 'weekly' | 'monthly'
 export const REPORT_KINDS: readonly ReportKind[] = ['daily', 'weekly', 'monthly']
