@@ -36,6 +36,8 @@ export interface Insight {
 /** 宿主 LLM 的最小抽象：给一段完整 prompt，返回文本 */
 export interface LlmClient {
   complete(prompt: string): Promise<string>
+  /** T9 成本观测：暴露模型名（Recorder 据此查价格表算费用；缺省 'unknown'）。可选——mock/旧实现不带 */
+  modelId?(): string
 }
 
 export interface HostLlmService {
@@ -140,6 +142,11 @@ export class DefaultLlmClient implements LlmClient {
   /** 宿主可用方法名清单（探测可见化） */
   hostMethodNames(): string[] {
     return this.host ? Object.keys(this.host) : []
+  }
+
+  /** T9 成本观测：暴露模型 id（构造即定，LlmCallRecorder 据此查价格表） */
+  modelId(): string {
+    return this.model
   }
 
   async complete(prompt: string): Promise<string> {

@@ -30,8 +30,8 @@ import { assertInsideState, redactSecretLike } from './guard.js'
 import type { GroupStoreService, StoredMessage, ReportMetaRow } from './group-store.js'
 import type { LlmClient } from './distiller.js'
 import { localDayKey } from './person-digest.js'
-import { LlmCallRecorder, monotonicMs, renderBatchStatsLine, errKindOf } from './llm-observe.js'
-import type { BatchStats } from './llm-observe.js'
+import { LlmCallRecorder, monotonicMs, renderBatchStatsLine, errKindOf, DEFAULT_LLM_PRICING } from './llm-observe.js'
+import type { BatchStats, LlmPricingTable } from './llm-observe.js'
 
 // T3：errKindOf 已迁至 llm-observe.ts（与 LlmCallRecorder 同处，report/distiller 共用）；
 // 此处再导出保持旧导入路径（tests/report-timeout-split.test.mjs 等）不变。
@@ -484,6 +484,12 @@ export interface ReportServiceOptions {
   /** Config.batchThreshold：窗口消息数超过该值时分批归纳+合并（默认 120；不超阈值路径零变化） */
   batchThreshold?: number
   /**
+   * T9 成本透明（Config.llmPricing）：模型名 → {input, output} 元/百万 tokens。
+   * 缺省 DEFAULT_LLM_PRICING（智谱官方定价页 2026-10 抓取，以供应商页面为准）。
+   * 未知模型费用记 0 并 warn 一次。
+   */
+  llmPricing?: LlmPricingTable
+  /**
    * T4 自适应批大小开关（Config.adaptiveBatch，默认 true）：true = runBatched 批大小取
    * 该群该 kind 的 safeBatch 状态（timeout 压缩 ×0.7 / 连续成功扩张 ×1.2，持久化
    * safe-batch.json）；false = 固定 batchThreshold，零行为差异（回退通道）。
@@ -559,7 +565,12 @@ export class ReportService {
     const messages = this.options.groupStore.getMessages(chatId, { afterTs: win.start - 1, beforeTs: win.end, limit: 2000 })
     const messageCount = messages.length
     // T3：每次 run 新建一个记录器——其累计统计恰为本次的 LLM 调用数/总耗时（batch_stats 来源）
-    const rec = new LlmCallRecorder(this.options.store, this.now)
+    // T9：注入模型名（LlmClient.modelId）与价格表——逐行落成本五字段，累计进 batch_stats
+    const rec = new LlmCallRecorder(this.options.store, this.now, {
+      model: this.options.llm.modelId?.() ?? 'unknown',
+      pricing: this.options.llmPricing ?? DEFAULT_LLM_PRICING,
+      logger: this.options.logger,
+    })
     if (messageCount === 0) {
       // T3：empty 路径 batch_stats 全 0（零 LLM 调用可见化）
       const batchStats: BatchStats = { batches: 0, failedBatches: 0, maxBatchMs: 0, ckptHits: 0, totalCalls: 0, totalMs: 0 }
@@ -622,12 +633,19 @@ export class ReportService {
 
     const quotes = this.pickQuotes(draft, messages)
     // T3：回填 batch_stats 终值——单次调用路径失败批随最终 status 定（degraded=1 批全失败）；
-    // 分批路径 failedBatches 已由 runBatched 按批回填（部分失败不整体降级时更真实）
+    // 分批路径 failedBatches 已由 runBatched 按批回填（部分失败不整体降级时更真实）；
+    // T9：成本五字段来自 rec 累计（模型/token/费用，估算带 tokensEst）。
+    const rs = rec.getStats()
     const batchStats: BatchStats = {
       ...bs,
       failedBatches: messages.length > this.batchThreshold ? bs.failedBatches : status === 'degraded' ? 1 : 0,
-      totalCalls: rec.getStats().calls,
-      totalMs: rec.getStats().totalMs,
+      totalCalls: rs.calls,
+      totalMs: rs.totalMs,
+      model: rs.model,
+      inTokens: rs.inTokens,
+      outTokens: rs.outTokens,
+      costCny: rs.costCny,
+      tokensEst: rs.tokensEst,
     }
     const md = renderReport({ kind, chatId, window: win, draft, status, messageCount, degradedReason, partialNote, quotes, persons, actions: this.collectActions(chatId, win), board: this.collectBoard(chatId, win), fileLines: this.collectFileLines(chatId, win), batchStats })
     const written = this.options.store.writeText(rel, md)

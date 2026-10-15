@@ -139,6 +139,11 @@ export interface PluginConfig {
   llmModel: string
   /** LLM 注册表回退的 openai 兼容 baseURL（空 = zai 默认端点；API key 走 ZAI_API_KEY 环境变量） */
   llmBaseUrl: string
+  /**
+   * T9 成本透明：价格表（模型名 → {input, output} 元/百万 tokens）。
+   * 默认取智谱官方定价页 2026-10 抓取值；调价改配置即可，以供应商页面为准。
+   */
+  llmPricing: Record<string, { input: number; output: number }>
   /** 红线升级 2026-10-14：发送总闸（默认 false = 零发送活动） */
   senderEnabled: boolean
   /** 发送 dry_run（默认 true = keyboard 模式键序到第 8 步定位即停，不粘贴消息不回车） */
@@ -223,6 +228,10 @@ export const Config: Schema<PluginConfig> = Schema.object({
   activitySpikeMultiplier: Schema.number().default(3).description('M6 活跃度突变倍数（默认 3 = 现行为：今日 > 近 7 日均值 × N 标注异常）'),
   llmModel: Schema.string().default('').description("LLM 模型（空 = 注册默认 'glm-5.3'；provider=zai）"),
   llmBaseUrl: Schema.string().default('').description('LLM openai 兼容 baseURL（空 = zai 默认端点）。API key 从 ZAI_API_KEY 环境变量读，绝不落日志/落盘'),
+  llmPricing: Schema.dict(Schema.object({
+    input: Schema.number().default(0).description('输入价格（元/百万 tokens）'),
+    output: Schema.number().default(0).description('输出价格（元/百万 tokens）'),
+  })).default({ 'glm-5.3': { input: 8, output: 28 }, 'glm-5.3-flash': { input: 0.8, output: 2.8 } }).description('T9 价格表：模型名 → {input, output} 元/百万 tokens。默认取智谱官方定价页 2026-10 抓取值，以供应商页面为准（https://docs.bigmodel.cn/cn/guide/start/pricing）。未知模型费用记 0 并 warn 一次'),
   // —— 红线升级（2026-10-14 用户批准）：filehelper 发送 worker（全部默认保守 = 关/干跑）——
   senderEnabled: Schema.boolean().default(false).description('发送总闸（默认 false = 零发送活动）。开启前务必先完成 TCC"辅助功能"授权 + sendDryRun=true 干跑确认搜索定位'),
   sendDryRun: Schema.boolean().default(true).description('发送 dry_run（默认 true = keyboard 模式执行搜索键序到第 8 步定位会话即停，不粘贴消息不回车；人工确认定位正确后再关掉真发）'),
@@ -316,7 +325,8 @@ export function apply(ctx: Context, config: PluginConfig): void {
   store.ensureDir('.')
 
   // —— T3：LLM 调用结构化观测（report/distiller 共用同一记录器；JSONL 落 groups/<chatId>/） ——
-  const llmCallRecorder = new LlmCallRecorder(store)
+  // T9：模型名与价格表在 llmClient 就绪后注入（成本五字段进每行 llm_call）。
+  // （声明移到 llmClient 之后——distiller 装配在其下游，无前向引用问题。）
 
   const personas = new PersonaService({ stateDir, logger })
 
@@ -454,6 +464,14 @@ export function apply(ctx: Context, config: PluginConfig): void {
     },
   )
 
+  // —— T3+T9：LLM 调用结构化观测记录器（distiller 用；report 每次 run 自建）——
+  // 模型名取 llmClient.modelId()；价格表来自 Config.llmPricing（未知模型费用记 0 并 warn 一次）。
+  const llmCallRecorder = new LlmCallRecorder(store, undefined, {
+    model: llmClient.modelId?.() ?? 'unknown',
+    pricing: config.llmPricing,
+    logger: logger as unknown as { warn?: (m: string) => void },
+  })
+
   // —— M3：报告引擎（reportEnabled 默认 false = 零活动；手动 generateReport 可调） ——
   if (config.reportEnabled) {
     report = new ReportService({
@@ -466,6 +484,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
       aggregationMaxGroups: config.aggregationMaxGroups,
       batchThreshold: config.batchThreshold,
       adaptiveBatch: config.adaptiveBatch, // T4：false = 固定 batchThreshold（回退通道）
+      llmPricing: config.llmPricing, // T9：价格表（模型名 → 元/百万 tokens；缺省内置默认表）
       groups: config.groups,
       notifier, // T3：同群连续 2 个窗口 degraded → notify 告警（dry_run 语义在 SystemNotifier 内保持）
     })

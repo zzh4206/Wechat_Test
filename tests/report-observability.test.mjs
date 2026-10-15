@@ -165,7 +165,8 @@ test('② 2 批（1 失败）+ 合并 → 报告末尾统计行：批 2（失败
   const statLine = lines.find((l) => l.startsWith('> 统计：批 '))
   assert.ok(statLine, '报告含 batch_stats 行')
   assert.equal(lines[lines.length - 1], statLine, '统计行在报告末尾')
-  assert.match(statLine, /^> 统计：批 2（失败 1）· 最大批耗时 \d+(\.\d+)? s · 缓存命中 0 · LLM 调用 4 次 \/ \d+(\.\d+)? s$/)
+  // T9：统计行追加成本段（mock LLM 无 modelId → 'unknown'，未命中默认价格表 → 费用 0；token 为估算带 ~）
+  assert.match(statLine, /^> 统计：批 2（失败 1）· 最大批耗时 \d+(\.\d+)? s · 缓存命中 0 · LLM 调用 4 次 \/ \d+(\.\d+)? s · 模型 unknown · 输入 ~[\d.]+k? \/ 输出 ~[\d.]+k? tok · ≈¥0\.0000$/)
   rmSync(dir, { recursive: true, force: true })
 })
 

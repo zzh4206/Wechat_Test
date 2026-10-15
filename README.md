@@ -72,6 +72,27 @@ pnpm add --config.auto-install-peers=false git+https://github.com/zzh4206/Wechat
 
 状态目录内容：`insights.jsonl`（提炼结果）、`report-YYYY-MM-DD.md`（日报）、`audit.log`（读取审计）、`cursor.json`（增量游标）、`personas/`（人格）。
 
+## 成本可观测（T9）
+
+每份报告的末尾统计行写明本次生成用了什么模型、花了多少 token、多少钱：
+
+```
+> 统计：批 2（失败 0）· 最大批耗时 31.4 s · 缓存命中 0 · LLM 调用 3 次 / 45.2 s · 模型 glm-5.3 · 输入 ~12.3k / 输出 ~4.5k tok · ≈¥0.0223
+```
+
+- **数据来源**：每次 `llm.complete` 落一行结构化 JSON 到 `groups/<chatId>/llm-calls.jsonl`（含 `model / inTokens / outTokens / costCny / tokensEst` 五个成本字段）；报告尾统计行 = 当次生成的累计。
+- **token 计量口径**：宿主 LLM 回传 usage 时用真实值（此时统计行不带 `~`）；当前生产路径（complete/chat → stream → openai 兼容 fetch）只回传纯文本、拿不到 usage，因此默认按智谱官方换算估算——**GLM token : 汉字 ≈ 1 : 1.6，即 tokens ≈ 字符数 ÷ 1.6**。估算值一律带 `tokensEst: true` 标记、统计行带 `~`，与真实值可区分。
+- **费用口径**：`costCny = 输入 tokens/1M × input 价 + 输出 tokens/1M × output 价`，保留 4 位小数（日级费用常在分厘级）；费用恒带 `≈`（价格表可能滞后于供应商调价）。未知模型费用记 0 并 warn 提示一次"未配置价格"。
+- **价格表配置 `llmPricing`**（键 = 模型名，值 = 元/百万 tokens；**调价只改配置，不动代码**）：
+
+```yaml
+llmPricing:
+  glm-5.3: { input: 8, output: 28 }        # 智谱官方定价页 2026-10 抓取
+  glm-5.3-flash: { input: 0.8, output: 2.8 }
+```
+
+默认值即上表；**以供应商页面为准**：[智谱官方定价页](https://docs.bigmodel.cn/cn/guide/start/pricing)。模型名取自 `llmModel` 配置（空 = `glm-5.3`）。
+
 ## 安全模型（红线）
 
 - 插件不持有任何消息发送通道（发送类调用黑名单静态测试）

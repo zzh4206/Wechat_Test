@@ -215,6 +215,54 @@ testKindIntervalMin: 10       # 启动后每 10 分钟依次强制触发一次 w
 
 ⚠️ **测试完务必把 `scheduleTestMode` 改回 false（或删掉这两行）并重启**——开着它每 N 分钟就跑一轮周报+月报 LLM 调用，烧 token 且重复写 outbox。
 
+### 7.11 成本可观测（T9：模型 / token / 费用透明）
+
+**报告尾统计行**（每次生成都带，含 degraded/empty 路径——empty 零调用时省略成本段）：
+
+```
+> 统计：批 2（失败 0）· 最大批耗时 31.4 s · 缓存命中 0 · LLM 调用 3 次 / 45.2 s · 模型 glm-5.3 · 输入 ~12.3k / 输出 ~4.5k tok · ≈¥0.0223
+```
+
+- token 带 `~` = 估算值（宿主不回传 usage，按官方口径 **1.6 汉字/token** 即 `chars ÷ 1.6` 估算）；不带 `~` = 宿主回传了真实 usage。费用恒带 `≈`（价格表可能滞后），保留 4 位小数。
+- 同口径数据逐调用落 `groups/<chatId>/llm-calls.jsonl`（每次 `llm.complete` 一行）；`report_meta.batch_stats` 也含 `model/inTokens/outTokens/costCny/tokensEst`（随报告元数据入库，可回查历史）。
+
+**`llm-calls.jsonl` 字段表**：
+
+| 字段 | 说明 |
+|---|---|
+| `ev` | 恒为 `llm_call` |
+| `chat` / `kind` / `phase` | 群 / 业务种类（daily/weekly/monthly/distill）/ 阶段（map=分批、merge=合并、distill=提炼） |
+| `batch` / `msgs` | 批号（0 = 合并调用）/ 本次调用覆盖消息条数 |
+| `promptChars` / `durMs` / `ok` / `errKind` / `ts` | prompt 字符数（不记内容）/ 耗时 / 成败 / 失败分类（timeout/other）/ 时间戳 |
+| `model` | 模型名（来自 `LlmClient.modelId()`，即 `llmModel` 配置，空 = `glm-5.3`；缺省 `unknown`） |
+| `inTokens` / `outTokens` | 输入 / 输出 tokens（真实 usage 或 chars÷1.6 估算） |
+| `costCny` | 费用（元）= inTokens/1M × input 价 + outTokens/1M × output 价；**未知模型 = 0**（日志 warn 一次"未配置价格"） |
+| `tokensEst` | `true` = 估算值；`false` = 宿主回传真实 usage |
+
+**价格调整：改配置即可，无需改代码 / 重新构建**（`cordis.patch.yml`）：
+
+```yaml
+llmPricing:
+  glm-5.3: { input: 8, output: 28 }        # 元/百万 tokens，智谱官方定价页 2026-10 抓取
+  glm-5.3-flash: { input: 0.8, output: 2.8 }
+```
+
+默认值即上表；**以供应商页面为准**：<https://docs.bigmodel.cn/cn/guide/start/pricing>。换模型（改 `llmModel`）记得同步补价格表条目，否则费用记 0。
+
+**月度费用汇总**（从 JSONL 汇总，两条已验证的 jq 示例）：
+
+```sh
+# ① 各自然月费用合计（全部群）
+jq -s 'group_by(.ts/1000|floor|strftime("%Y-%m")) | map({month: (.[0].ts/1000|floor|strftime("%Y-%m")), cny: (([.[].costCny]|add)*1000|round/1000)})' \
+  ~/.dsh/dsh-group-lurker/groups/*/llm-calls.jsonl
+
+# ② 单月费用合计（把 "2026-10" 换成目标月）
+jq -s '[.[] | select((.ts/1000|floor|strftime("%Y-%m"))=="2026-10") | .costCny] | add' \
+  ~/.dsh/dsh-group-lurker/groups/*/llm-calls.jsonl
+```
+
+（`ts` 为毫秒时间戳；`costCny` 逐行累加即总费用，与报告尾 ≈¥ 同口径。）
+
 ## 8. 排障
 
 **第一诊断工具：读取层探针 `spikes/db-probe.mjs`**（插件仓库内，只读）——任何"读不到消息/昵称解析失败/库打不开"问题先跑它再查插件：
