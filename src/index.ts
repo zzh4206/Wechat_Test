@@ -153,6 +153,7 @@ export interface PluginConfig {
   /** 抢前台模式（默认 false = 微信非前台跳过本轮）。true = 自动激活微信前台发送，仍让路给正在打字的用户（空闲 <10s 跳过） */
   allowTakeFocus: boolean
   idleSkipBelowSec: number
+  batchThreshold: number
   /** 每日发送上限（默认 20） */
   maxSendsPerDay: number
   /** wechat-ui 可执行文件（默认 'wechat-ui'；仅 sendMethod='wechat-ui' 用） */
@@ -223,7 +224,8 @@ export const Config: Schema<PluginConfig> = Schema.object({
   sendMethod: Schema.string().default('keyboard').description("发送原语（默认 'keyboard' = wx-chatbot 式键盘模拟 + DB 回读验证，TCC 只需辅助功能；'wechat-ui' 可切回旧 UI 校准实现）"),
   sendIntervalSec: Schema.number().default(300).description('发送 worker 消费 outbox 的扫描间隔（秒）'),
   verifyDelaySec: Schema.number().default(3).description('DB 回读验证每次尝试前的等待秒数（默认 3；微信异步写本地库，需重试窗口消化竞态）'),
-  verifyRetries: Schema.number().default(4).description('DB 回读验证尝试次数（默认 4；穷尽仍未命中才判 failed_wrong_target）'),
+  batchThreshold: Schema.number().default(120).description('大窗口分批归纳阈值（默认 120；窗口消息数超过该值时日报/人物日摘自动切批归纳再合并，避免单次大调用超时。≤阈值路径零变化）'),
+    verifyRetries: Schema.number().default(4).description('DB 回读验证尝试次数（默认 4；穷尽仍未命中才判 failed_wrong_target）'),
   allowTakeFocus: Schema.boolean().default(false).description('抢前台模式（默认 false = 微信非前台跳过本轮，人在电脑前模式）。true = 全自动无人值守：自动激活微信前台发送，但系统空闲 <10s（用户正在打字/操作）仍让路跳过'),
   idleSkipBelowSec: Schema.number().default(10).description('用户空闲让路阈值秒（默认 10 = 系统空闲 <10s 视为正在操作→跳过本轮让路；0 = 不让路，空闲检测失效直接抢前台发送。日常单日报场景可设 0——每天一次的抢前台可接受；频繁发送建议保持 10）'),
   maxSendsPerDay: Schema.number().default(20).description('每日发送上限（默认 20；超限的当日 pending 标 skipped_quota 防风暴）'),
@@ -451,6 +453,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
       logger: logger as unknown as StoreLogger,
       enabled: true,
       aggregationMaxGroups: config.aggregationMaxGroups,
+      batchThreshold: config.batchThreshold,
       groups: config.groups,
     })
   }
@@ -734,6 +737,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
         logger: logger as unknown as StoreLogger,
         enabled: true,
         activitySpikeMultiplier: config.activitySpikeMultiplier, // M6-T4：突变倍数配置化
+        batchThreshold: config.batchThreshold,
       })
     : null
 
