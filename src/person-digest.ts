@@ -26,6 +26,7 @@ import { assertInsideState } from './guard.js'
 import type { GroupStoreService, StoredMessage, PersonDigestRow } from './group-store.js'
 import type { LlmClient } from './distiller.js'
 import { derivePid } from './persona-track.js'
+import { errKindOf, backoffDelayMs } from './report.js'
 
 /** LLM 输出中单个话题条目（校验后的形状；evidence 是映射回 msg_id 之前的本地序号） */
 export interface DigestTopic {
@@ -78,6 +79,8 @@ export interface PersonDigestOptions {
   activitySpikeMultiplier?: number
   /** Config.batchThreshold：日窗上下文消息数超过该值时分批归纳+合并（默认 120；不超阈值路径零变化） */
   batchThreshold?: number
+  /** T1：批间退避 sleep 注入（缺省 setTimeout 封装；测试注入 spy/零延迟） */
+  sleep?: (ms: number) => Promise<void>
   now?: () => number
 }
 
@@ -115,6 +118,7 @@ export class PersonDigestService {
   /** M6-T4：活跃度突变倍数（可配置） */
   private readonly spikeMultiplier: number
   private readonly batchThreshold: number
+  private readonly sleepFn: (ms: number) => Promise<void>
   private readonly inFlight = new Map<string, Promise<GenerateDailyResult>>()
 
   constructor(private readonly options: PersonDigestOptions) {
@@ -123,6 +127,7 @@ export class PersonDigestService {
     // M6-T4：突变倍数配置化（默认 3 = 现行为）
     this.spikeMultiplier = Math.max(1, options.activitySpikeMultiplier ?? 3)
     this.batchThreshold = Math.max(10, Math.floor(options.batchThreshold ?? BATCH_THRESHOLD_DEFAULT))
+    this.sleepFn = options.sleep ?? ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
   }
 
   /**
@@ -254,9 +259,12 @@ export class PersonDigestService {
    * 返回 wire（数据区数组），供 evidence 序号 → msg_id 映射。
    */
   /**
-   * 大窗口分批归纳+合并（与 report 同构）：按 ≤batchThreshold 条/批切 included，
-   * 逐批 LLM 提炼（批内序号全局化），单批失败重试一次仍失败 → 跳过并标注 partialNote；
-   * 合并调用输出最终 schema → parsePersonDigest（全局序号直接映射 probe.ctx）。
+   * 大窗口分批归纳+合并（与 report 同构，T1 同步改造）：
+   * - 批 prompt 惰性构建（对半切分子批按需重建 wire，全局编号 n=start+i+1 不变量保持）；
+   * - 批内失败错误分类：timeout → 对半切分递归（叶子批 <5 条仍 timeout → degraded 跳过，
+   *   禁止无限切分）；非 timeout（断言/解析失败、其他异常）→ 重试一次；
+   * - 批间退避：连续失败后批与批之间 sleep（指数 2s 起、30s 封顶、乘 0.75–1.25 抖动）；
+   * - 合并调用输出最终 schema → parsePersonDigest（全局序号直接映射 probe.ctx）。
    */
   private async runBatched(
     chatId: string,
@@ -270,39 +278,26 @@ export class PersonDigestService {
   ): Promise<{ digest: PersonDigest | null; partialNote: string }> {
     const tag = `person-digest[${chatId}/${pid}/${day}]`
     const size = this.batchThreshold
-    // —— 按切片构建批 prompt（contextSlice 幂等，切片后重建 wire，全局编号）——
+    // —— included = 进入数据区的全窗上下文（contextSlice 幂等），批 prompt 惰性构建 ——
     const included = this.buildPrompt(pid, day, displayName, dayMsgs, personMsgs, keys).ctx
-    const prompts: Array<{ start: number; prompt: string }> = []
-    for (let start = 0; start < included.length; start += size) {
-      const slice = included.slice(start, start + size)
-      const personKeys = keys ?? [pid, derivePid(pid)]
-      const wire = slice.map((m, i) => {
-        const mine = personKeys.includes(m.senderPid)
-        const e: { n: number; who: string; text: string; mine?: boolean } = {
-          n: start + i + 1,
-          who: m.senderName || '（未知成员）',
-          text: m.text,
-        }
-        if (mine) e.mine = true
-        return e
-      })
-      prompts.push({ start, prompt: this.buildBatchPrompt(pid, day, displayName, wire) })
-    }
+    const personKeys = keys ?? [pid, derivePid(pid)]
+    const batchCount = Math.ceil(included.length / size)
+    const bo = { streak: 0, sleep: this.sleepFn }
     const parts: Array<{ batch: number; degraded: boolean; digest: PersonDigest | null }> = []
     const failedBatches: number[] = []
-    for (let b = 0; b < prompts.length; b++) {
-      let parsed: PersonDigest | null = null
-      for (let attempt = 0; attempt < 2 && parsed === null; attempt++) {
-        try {
-          const raw = await this.options.llm.complete(prompts[b].prompt)
-          parsed = parsePersonDigest(raw, pid, day, total)
-        } catch (error) {
-          this.options.logger.warn(`${tag} batch ${b + 1}/${prompts.length} llm failed: ${String(error).slice(0, 160)}`)
-        }
-        if (parsed === null && attempt === 0) this.options.logger.warn(`${tag}: 批 ${b + 1} 失败，重试一次`)
+    for (let b = 0; b < batchCount; b++) {
+      // 批间退避：上一批失败（连续失败 streak>0）→ 与下一批之间 sleep（指数+抖动）
+      if (bo.streak > 0) await bo.sleep(backoffDelayMs(bo.streak))
+      const start = b * size
+      const res = await this.distillBatch(pid, day, displayName, personKeys, included, start, Math.min(size, included.length - start), total, tag, `${b + 1}/${batchCount}`, bo)
+      if (res.digests.length > 0) {
+        bo.streak = 0
+        for (const d of res.digests) parts.push({ batch: b + 1, degraded: false, digest: d })
       }
-      if (parsed === null) failedBatches.push(b + 1)
-      parts.push({ batch: b + 1, degraded: parsed === null, digest: parsed })
+      if (res.degraded) {
+        failedBatches.push(b + 1)
+        parts.push({ batch: b + 1, degraded: true, digest: null })
+      }
     }
     const okParts = parts.filter((p) => p.digest !== null)
     if (okParts.length === 0) return { digest: null, partialNote: '' }
@@ -329,9 +324,69 @@ export class PersonDigestService {
       if (digest === null && attempt === 0) this.options.logger.warn(`${tag}: 合并失败，重试一次`)
     }
     const partialNote = failedBatches.length > 0
-      ? `部分素材归纳失败：第 ${failedBatches.join('、')} 批 LLM 调用失败（含重试），已跳过该批素材`
+      ? `部分素材归纳失败：第 ${failedBatches.join('、')} 批 LLM 调用失败（含对半切分与重试），已跳过该批素材`
       : ''
     return { digest, partialNote }
+  }
+
+  /**
+   * 单批归纳（与 report.distillBatch 同构，无检查点）：timeout → 对半切分递归
+   * （子批按需重建批 prompt，全局编号不变量 n=start+i+1 保持）；叶子批（<5 条）仍
+   * timeout → degraded（禁止无限切分）；非 timeout 异常/断言失败 → 重试一次。
+   */
+  private async distillBatch(
+    pid: string,
+    day: string,
+    displayName: string,
+    personKeys: readonly string[],
+    included: readonly StoredMessage[],
+    start: number,
+    count: number,
+    total: number,
+    tag: string,
+    label: string,
+    bo: { streak: number; sleep: (ms: number) => Promise<void> },
+  ): Promise<{ digests: PersonDigest[]; degraded: boolean }> {
+    const slice = included.slice(start, start + count)
+    const wire = slice.map((m, i) => {
+      const mine = personKeys.includes(m.senderPid)
+      const e: { n: number; who: string; text: string; mine?: boolean } = {
+        n: start + i + 1,
+        who: m.senderName || '（未知成员）',
+        text: m.text,
+      }
+      if (mine) e.mine = true
+      return e
+    })
+    const prompt = this.buildBatchPrompt(pid, day, displayName, wire)
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let raw: string
+      try {
+        raw = await this.options.llm.complete(prompt)
+      } catch (error) {
+        const msg = String(error).slice(0, 160)
+        if (errKindOf(error) === 'timeout') {
+          // 容量型故障：对半切分（改变参数重试）；叶子批（<5 条）禁止再切 → degraded 跳过
+          this.options.logger.warn(`${tag} batch ${label} timeout: ${msg}`)
+          bo.streak++
+          if (count < 5) return { digests: [], degraded: true }
+          await bo.sleep(backoffDelayMs(bo.streak))
+          const mid = Math.floor(count / 2)
+          const left = await this.distillBatch(pid, day, displayName, personKeys, included, start, mid, total, tag, `${label}左半`, bo)
+          const right = await this.distillBatch(pid, day, displayName, personKeys, included, start + mid, count - mid, total, tag, `${label}右半`, bo)
+          return { digests: [...left.digests, ...right.digests], degraded: left.degraded || right.degraded }
+        }
+        this.options.logger.warn(`${tag} batch ${label} llm failed: ${msg}`)
+        if (attempt === 1) return { digests: [], degraded: true }
+        this.options.logger.warn(`${tag}: 批 ${label} 失败，重试一次`)
+        continue
+      }
+      const parsed = parsePersonDigest(raw, pid, day, total)
+      if (parsed !== null) return { digests: [parsed], degraded: false }
+      if (attempt === 1) return { digests: [], degraded: true }
+      this.options.logger.warn(`${tag}: 批 ${label} 输出断言未通过，重试一次`)
+    }
+    return { digests: [], degraded: true }
   }
 
   /** 批 prompt：与 buildPrompt 同构，但数据区 wire 已切片且全局编号（避免全窗消息重复进入数据区） */

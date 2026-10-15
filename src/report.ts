@@ -180,6 +180,64 @@ export function clampQuote(text: string): string {
 /** 大窗口分批阈值默认值（线上实测 181 条单次调用 Request timed out） */
 export const BATCH_THRESHOLD_DEFAULT = 120
 
+// —————————————————— T1：timeout 分类 + 批间退避 ——————————————————
+
+/**
+ * 错误分类（T1，技术文档 §3.3）：timeout 类故障对半切分重试（改变参数重试），
+ * 非 timeout（断言/解析失败、其他异常）保持"重试一次"。
+ * 匹配 distiller 抛出的 `llm stream finished with error: Request timed out.`
+ * 用 `/timed?\s?out|timeout/i` 容错匹配（覆盖 timeout / timed out / timedout 等变体）。
+ */
+export function errKindOf(error: unknown): 'timeout' | 'other' {
+  const msg = error instanceof Error ? error.message : String(error ?? '')
+  return /timed?\s?out|timeout/i.test(msg) ? 'timeout' : 'other'
+}
+
+/** 批间退避基数（2s 起，指数增长） */
+export const BACKOFF_BASE_MS = 2_000
+/** 批间退避封顶（30s） */
+export const BACKOFF_MAX_MS = 30_000
+
+/**
+ * 退避时长（纯函数，可注入随机源便于测试）：指数 2s 起、30s 封顶，
+ * 每次乘随机抖动系数 0.75–1.25（防重试风暴与同步拥塞，技术文档 §3.3 依据 E2 Brooker）。
+ * streak = 连续失败次数（从 1 起）。
+ */
+export function backoffDelayMs(streak: number, rnd: () => number = Math.random): number {
+  const exp = Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * 2 ** (Math.max(1, streak) - 1))
+  return Math.round(exp * (0.75 + rnd() * 0.5))
+}
+
+/** 默认 sleep（setTimeout 的 Promise 封装；测试可经 options.sleep 注入零延迟/spy） */
+export function defaultSleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/** 退避共享状态：连续失败计数（成功一批即清零）+ 可注入 sleep */
+interface BackoffState {
+  streak: number
+  sleep: (ms: number) => Promise<void>
+}
+
+// —————————————————— T2：检查点缓存（断点续跑） ——————————————————
+
+/** 检查点缓存有效期（+7 天过期；读取时顺带清理过期项） */
+export const CKPT_TTL_MS = 7 * 86_400_000
+
+/**
+ * 检查点键（win.start 必须进键——backfill 改变窗口起点时检查点自动失效，技术文档 §6；
+ * start/count 也进键——批切分边界变化（batchThreshold 调整 / T4 自适应批大小 / 消息集回灌）
+ * 时旧批号会指向不同消息范围，必须失效，防止错误摘要被静默复用【负责人审查加固 2026-10-15】）
+ */
+export function reportCkptKey(chatId: string, kind: ReportKind, win: ReportWindow, batchIndex: string, start: number, count: number): string {
+  return `report-ckpt:${chatId}:${kind}:${win.start}:${win.dateKey}:${batchIndex}:${start}+${count}`
+}
+
+/** 检查点缓存文件（每群一个 JSON；复用 Store 落盘机制，最小侵入） */
+export function reportCkptRelPath(chatId: string): string {
+  return ['reports', chatId, 'ckpt.json'].join('/')
+}
+
 export interface RenderInput {
   kind: ReportKind
   chatId: string
@@ -377,6 +435,8 @@ export interface ReportServiceOptions {
   groups?: readonly string[]
   /** 聚合排序与选取注入（测试用；缺省 defaultRankGroups） */
   rankGroups?: (stats: readonly GroupStats[]) => string[]
+  /** T1：批间退避 sleep 注入（缺省 setTimeout 封装；测试注入 spy/零延迟） */
+  sleep?: (ms: number) => Promise<void>
   now?: () => number
 }
 
@@ -386,6 +446,7 @@ export class ReportService {
   private readonly batchThreshold: number
   private readonly groups: readonly string[]
   private readonly rankFn: (stats: readonly GroupStats[]) => string[]
+  private readonly sleepFn: (ms: number) => Promise<void>
   private readonly inFlight = new Map<string, Promise<GenerateReportResult>>()
 
   constructor(private readonly options: ReportServiceOptions) {
@@ -394,6 +455,7 @@ export class ReportService {
     this.batchThreshold = Math.max(10, Math.floor(options.batchThreshold ?? BATCH_THRESHOLD_DEFAULT))
     this.groups = options.groups ?? []
     this.rankFn = options.rankGroups ?? defaultRankGroups
+    this.sleepFn = options.sleep ?? defaultSleep
   }
 
   /**
@@ -725,9 +787,17 @@ export class ReportService {
   /**
    * 大窗口分批归纳+合并：
    * ① 窗口按时间序切 ≤batchThreshold 条/批，逐批 LLM 提炼（批内序号全局化 n=start+i+1，
-   *    evidence 直接可映射全窗口 messages）；单批失败重试一次，仍失败 → 该批标记 degraded 跳过；
-   * ② 合并调用：输入=各批摘要 JSON（含 degraded 标注），输出=最终 schema → 走既有断言/降级链路；
-   * ③ 部分批次失败不整体降级——报告头打「部分素材归纳失败」标注（partialNote）。
+   *    evidence 直接可映射全窗口 messages）；
+   * ② 批内失败错误分类（T1，技术文档 §3.3）：timeout → 不原样重试，对该批对半切分
+   *    递归归纳（子批序号沿用全局化规则，子批摘要按顺序并入该批位置；叶子批 <5 条仍
+   *    timeout → 标 degraded 跳过，禁止无限切分）；非 timeout（断言/解析失败、其他异常）
+   *    → 保持"重试一次"；
+   * ③ 批间退避：连续失败后批与批之间 sleep（指数 2s 起、30s 封顶、乘 0.75–1.25 抖动）；
+   * ④ 检查点缓存（T2，技术文档 §5）：每批调 LLM 前先查检查点（键含 win.start），
+   *    命中直接用缓存批摘要跳过调用；成功并解析通过后写检查点（对半子批键为 原批号-子批号）；
+   * ⑤ 合并调用：输入=各批摘要 JSON（含 degraded 标注），输出=最终 schema → 走既有断言/降级
+   *    链路；合并调用不缓存（输入依赖全批，缓存意义小）；
+   * ⑥ 部分批次失败不整体降级——报告头打「部分素材归纳失败」标注（partialNote）。
    */
   private async runBatched(
     chatId: string,
@@ -740,27 +810,28 @@ export class ReportService {
     const size = this.batchThreshold
     const batches: Array<{ start: number; msgs: StoredMessage[] }> = []
     for (let i = 0; i < messages.length; i += size) batches.push({ start: i, msgs: messages.slice(i, i + size) })
+    const ckpt = this.loadCkpt(chatId)
+    const bo: BackoffState = { streak: 0, sleep: this.sleepFn }
     const parts: Array<{ batch: number; degraded: boolean; draft: ReportDraft | null }> = []
     const failedBatches: number[] = []
     for (let b = 0; b < batches.length; b++) {
+      // 批间退避：上一批失败（连续失败 streak>0）→ 与下一批之间 sleep（指数+抖动）
+      if (bo.streak > 0) await bo.sleep(backoffDelayMs(bo.streak))
       const { start, msgs } = batches[b]
-      let parsed: ReportDraft | null = null
-      for (let attempt = 0; attempt < 2 && parsed === null; attempt++) {
-        try {
-          const raw = await this.options.llm.complete(this.buildPrompt(chatId, kind, win, msgs, persons, start))
-          parsed = parseReportDraft(raw, messages.length)
-        } catch (error) {
-          this.options.logger.warn(`${tag} batch ${b + 1}/${batches.length} llm failed: ${redactSecretLike(String(error).slice(0, 160))}`)
-        }
-        if (parsed === null && attempt === 0) this.options.logger.warn(`${tag}: 批 ${b + 1} 失败，重试一次`)
+      const res = await this.distillBatch(chatId, kind, win, messages, persons, msgs, start, String(b + 1), ckpt, bo, tag, `${b + 1}/${batches.length}`)
+      if (res.drafts.length > 0) {
+        bo.streak = 0
+        for (const d of res.drafts) parts.push({ batch: b + 1, degraded: false, draft: d })
       }
-      if (parsed === null) failedBatches.push(b + 1)
-      parts.push({ batch: b + 1, degraded: parsed === null, draft: parsed })
+      if (res.degraded) {
+        failedBatches.push(b + 1)
+        parts.push({ batch: b + 1, degraded: true, draft: null })
+      }
     }
     if (failedBatches.length === batches.length) {
-      return { draft: null, llmError: '分批归纳全部批次失败（含重试）', assertionFails: 0, partialNote: '' }
+      return { draft: null, llmError: '分批归纳全部批次失败（含对半切分与重试）', assertionFails: 0, partialNote: '' }
     }
-    // 合并调用（输入=各批摘要，输出=最终 schema）
+    // 合并调用（输入=各批摘要，输出=最终 schema；不缓存）
     let draft: ReportDraft | null = null
     let llmError: string | null = null
     let assertionFails = 0
@@ -779,9 +850,95 @@ export class ReportService {
       }
     }
     const partialNote = failedBatches.length > 0
-      ? `部分素材归纳失败：第 ${failedBatches.join('、')} 批 LLM 调用失败（含重试），已跳过该批素材`
+      ? `部分素材归纳失败：第 ${failedBatches.join('、')} 批 LLM 调用失败（含对半切分与重试），已跳过该批素材`
       : ''
     return { draft, llmError, assertionFails, partialNote }
+  }
+
+  /**
+   * 单批归纳（含错误分类重试与检查点）：返回该批产出的批摘要列表与是否 degraded。
+   * - 检查点命中 → 直接用缓存摘要（0 次 LLM 调用）；
+   * - timeout → 对半切分递归（子批键 原批号-1 / 原批号-2 …，全局序号不变量 n=start+i+1 保持）；
+   *   叶子批（<5 条）仍 timeout → degraded（禁止无限切分）；
+   * - 非 timeout 异常/断言失败 → 重试一次（原路径）。
+   */
+  private async distillBatch(
+    chatId: string,
+    kind: ReportKind,
+    win: ReportWindow,
+    messages: readonly StoredMessage[],
+    persons: ReadonlyArray<{ name: string; line: string }>,
+    msgs: readonly StoredMessage[],
+    start: number,
+    batchKey: string,
+    ckpt: Map<string, { draft: ReportDraft; ts: number }>,
+    bo: BackoffState,
+    tag: string,
+    label: string,
+  ): Promise<{ drafts: ReportDraft[]; degraded: boolean }> {
+    const ckptKey = reportCkptKey(chatId, kind, win, batchKey, start, msgs.length)
+    const hit = ckpt.get(ckptKey)
+    if (hit) return { drafts: [hit.draft], degraded: false }
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let raw: string
+      try {
+        raw = await this.options.llm.complete(this.buildPrompt(chatId, kind, win, msgs, persons, start))
+      } catch (error) {
+        const redacted = redactSecretLike(String(error).slice(0, 160))
+        if (errKindOf(error) === 'timeout') {
+          // 容量型故障：对半切分（改变参数重试）；叶子批（<5 条）禁止再切 → degraded 跳过
+          this.options.logger.warn(`${tag} batch ${label} timeout: ${redacted}`)
+          bo.streak++
+          if (msgs.length < 5) return { drafts: [], degraded: true }
+          await bo.sleep(backoffDelayMs(bo.streak))
+          const mid = Math.floor(msgs.length / 2)
+          const left = await this.distillBatch(chatId, kind, win, messages, persons, msgs.slice(0, mid), start, `${batchKey}-1`, ckpt, bo, tag, `${label}左半`)
+          const right = await this.distillBatch(chatId, kind, win, messages, persons, msgs.slice(mid), start + mid, `${batchKey}-2`, ckpt, bo, tag, `${label}右半`)
+          return { drafts: [...left.drafts, ...right.drafts], degraded: left.degraded || right.degraded }
+        }
+        this.options.logger.warn(`${tag} batch ${label} llm failed: ${redacted}`)
+        if (attempt === 1) return { drafts: [], degraded: true }
+        this.options.logger.warn(`${tag}: 批 ${label} 失败，重试一次`)
+        continue
+      }
+      const parsed = parseReportDraft(raw, messages.length)
+      if (parsed !== null) {
+        // 调用成功且解析通过 → 写检查点（断点续跑：重跑只补失败批）
+        ckpt.set(ckptKey, { draft: parsed, ts: this.now() })
+        this.saveCkpt(chatId, ckpt)
+        return { drafts: [parsed], degraded: false }
+      }
+      if (attempt === 1) return { drafts: [], degraded: true }
+      this.options.logger.warn(`${tag}: 批 ${label} 输出断言未通过，重试一次`)
+    }
+    return { drafts: [], degraded: true }
+  }
+
+  /** 载入检查点缓存（顺带过滤 +7 天过期项并回写清理；损坏即作废重来） */
+  private loadCkpt(chatId: string): Map<string, { draft: ReportDraft; ts: number }> {
+    const rel = reportCkptRelPath(chatId)
+    const out = new Map<string, { draft: ReportDraft; ts: number }>()
+    const raw = this.options.store.readText(rel)
+    if (raw === null) return out
+    try {
+      const obj = JSON.parse(raw) as Record<string, unknown>
+      const cutoff = this.now() - CKPT_TTL_MS
+      let expired = false
+      for (const [k, v] of Object.entries(obj ?? {})) {
+        const e = v as { draft?: ReportDraft; ts?: number } | null
+        if (e && typeof e.ts === 'number' && e.ts >= cutoff && e.draft && typeof e.draft === 'object') out.set(k, { draft: e.draft, ts: e.ts })
+        else expired = true
+      }
+      if (expired) this.options.store.writeText(rel, JSON.stringify(Object.fromEntries(out)))
+    } catch (error) {
+      this.options.logger.warn(`report[${chatId}]: 检查点缓存损坏，作废重来：${String(error).slice(0, 120)}`)
+    }
+    return out
+  }
+
+  /** 持久化检查点（整文件覆写；每批成功即落盘，中断后可续跑） */
+  private saveCkpt(chatId: string, ckpt: Map<string, { draft: ReportDraft; ts: number }>): void {
+    this.options.store.writeText(reportCkptRelPath(chatId), JSON.stringify(Object.fromEntries(ckpt)))
   }
 
   /** 合并调用 prompt：指令区=同一 schema 的最终报告；数据区=各批摘要 JSON（degraded 批带标注） */

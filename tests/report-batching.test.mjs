@@ -98,10 +98,10 @@ test('181 条 → 2 批 + 合并（共 3 次调用）；批 2 全局序号从 12
   rmSync(dir, { recursive: true, force: true })
 })
 
-test('单批失败（重试一次仍失败）→ 部分素材标注，其余照常归纳，不整体降级', async () => {
+test('单批失败（非 timeout，重试一次仍失败）→ 部分素材标注，其余照常归纳，不整体降级', async () => {
   const { dir, gs, llm, report } = makeEnv([
-    new Error('Request timed out'),
-    new Error('Request timed out'), // 批 1 重试仍失败
+    new Error('connection reset by peer'), // 非 timeout：保持"重试一次"原路径
+    new Error('connection reset by peer'), // 批 1 重试仍失败
     legalDraft([121]), // 批 2 成功
     legalDraft([121]), // 合并成功
   ])
