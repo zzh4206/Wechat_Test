@@ -59,6 +59,7 @@ function makeEnv(overrides = {}) {
     sendMethod: 'keyboard',
     maxSendsPerDay: overrides.maxSendsPerDay ?? 20,
     sourceToolDir: overrides.sourceToolDir ?? '/fake/macos-wechat-export',
+    sourceDbRoot: overrides.sourceDbRoot ?? '/fake/wechat-db-storage',
     sourcePython: overrides.sourcePython ?? 'python3',
     idleSkipBelowSec: overrides.idleSkipBelowSec,
     allowTakeFocus: overrides.allowTakeFocus,
@@ -147,7 +148,13 @@ test('键序正确性（真发）：简化键序（activate→粘贴→回车）
   // 回读参数形态：只读、filehelper、limit 3
   const spawn = env.steps.find((s) => s.kind === 'spawn')
   assert.equal(spawn.file, 'python3')
-  assert.deepEqual(spawn.args, [join('/fake/macos-wechat-export', 'wechat_db.py'), 'read', '--chat-id', 'filehelper', '--limit', '3'])
+  // --db-root/--key-file 是 CLI 全局参数，必须在子命令 read 之前（实测放后面报 unrecognized arguments）
+  assert.deepEqual(spawn.args, [
+    join('/fake/macos-wechat-export', 'wechat_db.py'),
+    '--db-root', '/fake/wechat-db-storage',
+    '--key-file', join('/fake/macos-wechat-export', '.wechat-local/keys.json'),
+    'read', '--chat-id', 'filehelper', '--limit', '3',
+  ])
   // 验证延迟在回读前
   const sleepIdx = seq.indexOf(`sleep:${VERIFY_DELAY_MS}`)
   assert.ok(sleepIdx >= 0 && sleepIdx < seq.length - 1, `真发后应有 sleep:${VERIFY_DELAY_MS} 再回读`)
@@ -273,7 +280,7 @@ test('回读重试窗口可配：verifyRetries=2 / verifyDelaySec=1（1s × 2 �
   const e = env.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
   const r = await new SenderService({
     outbox: env.outbox, store: env.store, logger: silentLogger, enabled: true, dryRun: false,
-    sendMethod: 'keyboard', sourceToolDir: '/fake/macos-wechat-export', sourcePython: 'python3',
+    sendMethod: 'keyboard', sourceToolDir: '/fake/macos-wechat-export', sourceDbRoot: '/fake/wechat-db-storage', sourcePython: 'python3',
     verifyDelaySec: 1, verifyRetries: 2,
     runCommand: (file, args) => {
       if (file === 'osascript') return Promise.resolve({ code: 0, stdout: '«class UTF8»"saved-content"', stderr: '' })
@@ -361,6 +368,19 @@ test('keyboard 模式缺 sourceToolDir：fail-closed 不发键序，计数 attem
   const after = readOutbox(env.dir).find((x) => x.id === e.id)
   assert.equal(after.status, 'failed')
   assert.equal(after.attempts, MAX_ATTEMPTS)
+  rmSync(env.dir, { recursive: true, force: true })
+})
+
+test('keyboard 模式缺 sourceDbRoot：fail-closed 不发键序，计数 attempts（多账号环境回读必需）', async () => {
+  const env = makeEnv({ sourceDbRoot: '' })
+  const e = env.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
+  for (let i = 1; i <= MAX_ATTEMPTS; i++) await env.sender.processOnce()
+  assert.equal(env.steps.length, 0, '无法验证 = 一个按键都不发')
+  const after = readOutbox(env.dir).find((x) => x.id === e.id)
+  assert.equal(after.status, 'failed')
+  assert.equal(after.attempts, MAX_ATTEMPTS)
+  const audit = readAudit(env.dir)
+  assert.ok(audit.every((a) => a.result === 'unverified_no_db_tool' && a.missing === 'sourceDbRoot'))
   rmSync(env.dir, { recursive: true, force: true })
 })
 

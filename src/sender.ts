@@ -140,6 +140,8 @@ export interface SenderOptions {
   composerTop?: number
   /** Config.sourceToolDir：wechat_db.py 所在目录（keyboard 真发后 DB 回读验证必需，缺失 fail-closed 不发） */
   sourceToolDir?: string
+  /** Config.sourceDbRoot：微信本地库根目录（多账号环境 CLI 必需 --db-root，缺失 fail-closed 不发） */
+  sourceDbRoot?: string
   /** Config.sourcePython（默认 'python3'） */
   sourcePython?: string
   /** Config.verifyDelaySec：回读验证每次尝试前的等待秒数（默认 3） */
@@ -336,6 +338,7 @@ export class SenderService {
   private readonly frontmostWarnAfter: number
   private readonly intervalSec: number
   private readonly sourceToolDir: string
+  private readonly sourceDbRoot: string
   private readonly sourcePython: string
   private readonly now: () => number
   private readonly setIntervalFn: typeof setInterval
@@ -373,6 +376,7 @@ export class SenderService {
     this.idleSkipBelowSec = Math.max(0, options.idleSkipBelowSec ?? IDLE_SKIP_BELOW_SEC)
     this.sleep = options.sleepMs ?? defaultSleep
     this.sourceToolDir = options.sourceToolDir ?? ''
+    this.sourceDbRoot = options.sourceDbRoot ?? ''
     this.sourcePython = options.sourcePython ?? 'python3'
     this.primitive = this.method === 'wechat-ui'
       ? new WechatUiSender({ wechatUiPath: options.wechatUiPath ?? 'wechat-ui', composerTop: options.composerTop ?? 0.7, runCommand: this.runCommandFn })
@@ -442,11 +446,12 @@ export class SenderService {
     }
 
     // keyboard 模式 fail-closed：没有 wechat_db.py 就无法做 DB 回读验证，宁可不发
-    if (this.method === 'keyboard' && this.sourceToolDir === '') {
+    if (this.method === 'keyboard' && (this.sourceToolDir === '' || this.sourceDbRoot === '')) {
       const status: OutboxEntry['status'] = attempts >= MAX_ATTEMPTS ? 'failed' : 'pending'
       this.options.outbox.updateSendState(id, { status, attempts })
-      this.audit({ id, kind: entry.kind, result: 'unverified_no_db_tool', attempts })
-      this.options.logger.error(`sender: keyboard 模式缺 sourceToolDir（无法 DB 回读验证）— fail-closed 不发送 id=${id} attempts=${attempts}`)
+      const missing = this.sourceToolDir === '' ? 'sourceToolDir' : 'sourceDbRoot'
+      this.audit({ id, kind: entry.kind, result: 'unverified_no_db_tool', attempts, missing })
+      this.options.logger.error(`sender: keyboard 模式缺 ${missing}（无法 DB 回读验证）— fail-closed 不发送 id=${id} attempts=${attempts}`)
       return { action: 'failed' }
     }
 
@@ -473,7 +478,10 @@ export class SenderService {
       for (let attempt = 1; attempt <= this.verifyRetries; attempt++) {
         await this.sleep(this.verifyDelayMs)
         const v = await this.runCommandFn(this.sourcePython, [
-          join(this.sourceToolDir, 'wechat_db.py'), 'read', '--chat-id', 'filehelper', '--limit', '3',
+          join(this.sourceToolDir, 'wechat_db.py'),
+          '--db-root', this.sourceDbRoot,
+          '--key-file', join(this.sourceToolDir, '.wechat-local/keys.json'),
+          'read', '--chat-id', 'filehelper', '--limit', '3',
         ])
         if (v.code !== 0) { readBroken = true; break }
         if (v.stdout.includes(feature)) { verified = true; break }
@@ -692,6 +700,7 @@ export interface SenderConfigInput {
   wechatUiPath: string
   composerTop: number
   sourceToolDir: string
+  sourceDbRoot: string
   sourcePython: string
   allowTakeFocus: boolean
   idleSkipBelowSec: number
@@ -717,6 +726,7 @@ export function senderOptionsFromConfig(options: {
     wechatUiPath: options.config.wechatUiPath,
     composerTop: options.config.composerTop,
     sourceToolDir: options.config.sourceToolDir,
+    sourceDbRoot: options.config.sourceDbRoot,
     sourcePython: options.config.sourcePython,
     allowTakeFocus: options.config.allowTakeFocus,
     idleSkipBelowSec: options.config.idleSkipBelowSec,

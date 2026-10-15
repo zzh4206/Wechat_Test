@@ -342,6 +342,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
     wechatUiPath: config.wechatUiPath,
     composerTop: config.composerTop,
     sourceToolDir: config.sourceToolDir ?? '',
+    sourceDbRoot: config.sourceDbRoot ?? '',
     sourcePython: config.sourcePython,
     systemIdleSec: defaultSystemIdleSec,
     allowTakeFocus: config.allowTakeFocus,
