@@ -354,6 +354,12 @@ Accessibility Inspector 确认元素层级）。**实证结论回填此处：___
   低于该阈值才跳过本轮让路（`user_active`）；≥阈值或设 0 → 不让路，直接抢前台发送。
   **日常单日报场景可设 0**（每天一次的抢前台可接受）；默认 10 适合频繁发送场景（绝不打断打字）；
 - **失败重试**：attempts 落盘，≥3 次转 `failed` 不再重试（防风暴）；
+- **发送/验证状态机解耦（P0 重发循环根治 2026-10-15）**：键序执行到 Return 即落
+  `sent_pending_verify` + `transmittedAt`（先落盘再验证）——该状态**绝不整条重发**，后续周期
+  只重试回读验证：命中 → `sent`；穷尽未命中 → `failed_wrong_target`（P0 终态）；CLI 报错 →
+  保持 `sent_pending_verify` + `verifyAttempts` 累计（≥5 轮 error 级人工介入告警）。只有
+  **发送前**失败（activate 失败/环境不可用等）才保持 pending 重试整条发送。状态机：
+  `pending → sent_pending_verify → sent | failed_wrong_target`；`verify_read_deferred` 自环；
 - **熄屏/锁屏 = 环境等待（非失败）**：AX 读不到微信窗口（熄屏、锁屏、主窗口关闭）时本轮标记
   `screen_locked_deferred`——**不计 attempts、状态保持 pending**，下轮消费周期自动重试，
   无限等待直到环境恢复（解锁后自动恢复发送，无 attempts 损耗、不熔断）；

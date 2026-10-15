@@ -45,7 +45,7 @@ function makeEnv(overrides = {}) {
     now: overrides.now ?? FIXED_NOW,
     runCommand: (file, args) => {
       spawnCalls.push({ file, args })
-      return Promise.resolve(overrides.spawnResult ?? { code: 0, stdout: 'sent_ui_verified', stderr: '' })
+      return Promise.resolve(env.spawnResult ?? overrides.spawnResult ?? { code: 0, stdout: 'sent_ui_verified', stderr: '' })
     },
     isFrontmost: () => Promise.resolve(env.frontmost),
   })
@@ -202,11 +202,12 @@ test('audit 无正文：只记 id/kind/result/attempts 元数据', async () => {
   env.outbox.appendOutbox({ kind: 'daily', title: '机密标题abc', body: '机密正文xyz', evidence_ref: 'x' })
   await env.sender.processOnce()
   const audit = readAudit(env.dir)
-  assert.equal(audit.length, 1)
+  // 发送/验证解耦：transmitted（落盘 sent_pending_verify）+ sent（回读命中）两行元数据
+  assert.equal(audit.length, 2)
   const raw = JSON.stringify(audit)
   assert.ok(!raw.includes('机密标题abc'))
   assert.ok(!raw.includes('机密正文xyz'))
-  assert.equal(audit[0].result, 'sent')
+  assert.deepEqual(audit.map((a) => a.result), ['transmitted', 'sent'])
   rmSync(env.dir, { recursive: true, force: true })
 })
 
@@ -323,8 +324,8 @@ test('allowTakeFocus=true：微信非前台也照发（跳过前台闸），审�
   assert.equal(r.action, 'sent')
   assert.equal(env.spawnCalls.length, 1, '非前台照发（抢前台模式）')
   assert.equal(readOutbox(env.dir).find((x) => x.id === e.id).status, 'sent')
-  const audit = readAudit(env.dir).find((a) => a.id === e.id)
-  assert.equal(audit.result, 'take_focus_sent', '审计可区分两种模式')
+  const audit = readAudit(env.dir).find((a) => a.id === e.id && a.result === 'take_focus_sent')
+  assert.ok(audit, '审计可区分两种模式（transmitted 之外应有 take_focus_sent 行）')
   rmSync(env.dir, { recursive: true, force: true })
 })
 
@@ -342,6 +343,36 @@ test('allowTakeFocus=true：空闲 <10s（用户正在打字）仍跳过并计�
   const gates = readAudit(env.dir).filter((a) => a.result === 'user_active')
   assert.equal(gates.length, 3)
   assert.ok(gates.every((a) => a.takeFocus === true))
+  rmSync(env.dir, { recursive: true, force: true })
+})
+
+test('发送前失败（spawn 报错）→ 保持 pending 计 attempts，可整条重发（与验证失败解耦）', async () => {
+  const env = makeEnv({ spawnResult: { code: 1, stdout: '', stderr: 'ui boom' } })
+  const e = env.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
+  const r = await env.sender.processOnce()
+  assert.equal(r.action, 'failed')
+  const after = readOutbox(env.dir).find((x) => x.id === e.id)
+  assert.equal(after.status, 'pending', '消息没打出去 → 保持 pending 可整条重发')
+  assert.equal(after.attempts, 1)
+  assert.equal(after.transmittedAt, undefined, '未 transmitted')
+  // 恢复后下轮整条重发成功
+  env.spawnResult = { code: 0, stdout: 'sent_ui_verified', stderr: '' }
+  const r2 = await env.sender.processOnce()
+  assert.equal(r2.action, 'sent')
+  assert.equal(readOutbox(env.dir).find((x) => x.id === e.id).status, 'sent')
+  rmSync(env.dir, { recursive: true, force: true })
+})
+
+test('sent_pending_verify 历史条目：消费循环视作已发送——绝不重发（wechat-ui 无回读阶段则原样保留）', async () => {
+  const env = makeEnv()
+  const e = env.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
+  // 模拟"已发送但验证中断"的落盘形态
+  env.outbox.updateSendState(e.id, { status: 'sent_pending_verify', transmittedAt: Date.now(), verifyAttempts: 1 })
+  const spawnsBefore = env.spawnCalls.length
+  const r = await env.sender.processOnce()
+  assert.equal(r.action, 'empty', 'spv 条目不进 pending 消费队列')
+  assert.equal(env.spawnCalls.length, spawnsBefore, 'spawn 零新增——绝不重发')
+  assert.equal(readOutbox(env.dir).find((x) => x.id === e.id).status, 'sent_pending_verify', 'wechat-ui 无回读阶段，原样保留')
   rmSync(env.dir, { recursive: true, force: true })
 })
 

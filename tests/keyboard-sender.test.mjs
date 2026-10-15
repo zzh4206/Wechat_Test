@@ -161,8 +161,8 @@ test('键序正确性（真发）：简化键序（activate→粘贴→回车）
   // 状态机 + 审计
   assert.equal(readOutbox(env.dir).find((x) => x.id === e.id).status, 'sent')
   const audit = readAudit(env.dir)
-  assert.equal(audit[0].result, 'sent')
-  assert.equal(audit[0].method, 'keyboard')
+  assert.deepEqual(audit.map((a) => a.result), ['transmitted', 'sent'], '先落 transmitted 再验证置 sent')
+  assert.equal(audit[1].method, 'keyboard')
   rmSync(env.dir, { recursive: true, force: true })
 })
 
@@ -236,8 +236,9 @@ test('回读未命中（可能发错会话）→ P0：标 failed_wrong_target �
   const after = readOutbox(env.dir).find((x) => x.id === e.id)
   assert.equal(after.status, 'failed_wrong_target', '终态：不重试（重试可能再次误发）')
   const audit = readAudit(env.dir)
-  assert.equal(audit[0].result, 'failed_wrong_target')
-  assert.equal(audit[0].p0, true, '审计行醒目标 P0')
+  assert.deepEqual(audit.map((a) => a.result), ['transmitted', 'failed_wrong_target'])
+  const p0 = audit.find((a) => a.result === 'failed_wrong_target')
+  assert.equal(p0.p0, true, '审计行醒目标 P0')
   assert.ok(env.logger.logs.warn.some((m) => m.includes('P0') && m.includes('failed_wrong_target')), '立即 warn')
   // 重试窗口：4 次尝试（每次前 sleep VERIFY_DELAY_MS），穷尽后才终判
   assert.equal(env.steps.filter((x) => x.kind === 'spawn').length, VERIFY_RETRIES, '穷尽 verifyRetries 次回读')
@@ -264,8 +265,8 @@ test('回读重试窗口（异步写入竞态修复）：首次回读空、第�
   assert.equal(env.steps.filter((x) => x.kind === 'spawn').length, 2, '只回读 2 次即命中')
   assert.equal(readOutbox(env.dir).find((x) => x.id === e.id).status, 'sent')
   const audit = readAudit(env.dir)
-  assert.equal(audit[0].result, 'sent')
-  assert.ok(!audit[0].p0, '无 P0')
+  assert.deepEqual(audit.map((a) => a.result), ['transmitted', 'sent'])
+  assert.ok(!audit.some((a) => a.p0), '无 P0')
   rmSync(env.dir, { recursive: true, force: true })
 })
 
@@ -300,7 +301,7 @@ test('回读重试窗口可配：verifyRetries=2 / verifyDelaySec=1（1s × 2 �
   rmSync(env.dir, { recursive: true, force: true })
 })
 
-test('回读本身失败（CLI 报错/库不可读）→ deferred 环境等待语义：attempts 不增、保持 pending、不误判 wrong_target', async () => {
+test('回读本身失败（CLI 报错）→ 保持 sent_pending_verify 只重试验证、绝不重发；verifyAttempts≥5 人工告警', async () => {
   const env = makeEnv({
     logger: recordingLogger(),
     dbReadResult: { code: 1, stdout: '', stderr: 'db locked' },
@@ -309,13 +310,21 @@ test('回读本身失败（CLI 报错/库不可读）→ deferred 环境等待�
   const r = await env.sender.processOnce()
   assert.equal(r.action, 'deferred', '回读失败 = 环境等待，不是 wrong_target')
   const after = readOutbox(env.dir).find((x) => x.id === e.id)
-  assert.equal(after.status, 'pending', '保持 pending，下轮重试验证')
-  assert.equal(after.attempts, 0, 'attempts 不增')
+  assert.equal(after.status, 'sent_pending_verify', '已 transmitted 绝不回退 pending（防重发循环）')
+  assert.equal(after.transmittedAt > 0, true, 'transmittedAt 落盘')
+  assert.equal(after.verifyAttempts, 1, '验证轮数计数')
   const audit = readAudit(env.dir)
-  assert.equal(audit[0].result, 'verify_read_deferred')
-  assert.equal(audit[0].deferred, true)
-  assert.ok(!audit[0].p0, '绝不误判 P0')
-  assert.ok(env.logger.logs.warn.some((m) => m.includes('回读本身失败') && m.includes('不判 wrong_target')))
+  assert.deepEqual(audit.map((a) => a.result), ['transmitted', 'verify_read_deferred'])
+  assert.ok(!audit.some((a) => a.p0), '绝不误判 P0')
+  assert.ok(env.logger.logs.warn.some((m) => m.includes('绝不重发')))
+  // 下一轮：零重发，只重试验证（verifyAttempts 累计到 5 → error 人工告警）
+  const spawnsBefore = env.steps.filter((x) => x.kind === 'osascript' && x.step === 'activate').length
+  for (let i = 0; i < 4; i++) await env.sender.processOnce()
+  const after5 = readOutbox(env.dir).find((x) => x.id === e.id)
+  assert.equal(after5.status, 'sent_pending_verify', '仍未验证通过，保持待验证')
+  assert.equal(after5.verifyAttempts, 5)
+  assert.equal(env.steps.filter((x) => x.kind === 'osascript' && x.step === 'activate').length, spawnsBefore, '验证-only 轮零键序（零重发）')
+  assert.ok(env.logger.logs.error.some((m) => m.includes('人工介入')), 'verifyAttempts≥5 转人工告警')
   rmSync(env.dir, { recursive: true, force: true })
 })
 
@@ -327,7 +336,7 @@ test('idleSkipBelowSec=0：用户活动也不让路（空闲检测失效）→ �
   assert.equal(r.action, 'sent', '阈值 0 = 不让路，用户活动也照发')
   assert.equal(env.steps.length > 0, true, '键序确实发出')
   const audit = readAudit(env.dir)
-  assert.equal(audit[0].result, 'take_focus_sent')
+  assert.deepEqual(audit.map((a) => a.result), ['transmitted', 'take_focus_sent'])
   assert.ok(!audit.some((a) => a.result === 'user_active'), '无 user_active 让路')
   assert.equal(readOutbox(env.dir).find((x) => x.id === e.id).status, 'sent')
   rmSync(env.dir, { recursive: true, force: true })

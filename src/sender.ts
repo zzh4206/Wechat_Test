@@ -54,6 +54,8 @@ export const KEY_DELAY_PASTE_MS = 300
 export const VERIFY_DELAY_MS = 3000
 /** DB 回读验证默认尝试次数（Config.verifyRetries 可配；4 次 × 3s ≈ 12s 总重试窗口） */
 export const VERIFY_RETRIES = 4
+/** sent_pending_verify 回读 CLI 连续失败轮数达到该值 → error 级人工介入告警 */
+export const VERIFY_MANUAL_ALERT_ATTEMPTS = 5
 /** 系统空闲低于该秒数视为用户正在操作（跳过防按键串扰） */
 export const IDLE_SKIP_BELOW_SEC = 10
 
@@ -462,61 +464,94 @@ export class SenderService {
       this.options.logger.info(`sender: 环境不可用挂起 id=${id} (${r.detail}) — 不计 attempts，下轮重试`)
       return { action: 'deferred' }
     }
-    let ok = r.ok && r.stage === 'sent'
-    let wrongTarget = false
-    // keyboard 模式：DB 回读验证（替代 OCR/截图）——验证通过才算 sent。
-    // 无搜索定位（目标会话 = 用户当前打开的会话）后，回读是**唯一的目标兜底闸**。
-    // 线上实测：微信把已发消息**异步写入**本地库，单次立即回读会跑在写入提交前面（时序竞态）
-    // → 误判 failed_wrong_target。因此改为**重试窗口**：verifyRetries 次尝试、每次前等
-    // verifyDelaySec 秒（默认 4 次 × 3s ≈ 12s 总窗口）；任一次命中特征串 → sent。
-    // 4 次穷尽仍未命中 → 才判 failed_wrong_target（终态 + P0 审计 + warn，语义不变）；
-    // 回读本身失败（CLI 报错/库不可读）→ 按环境等待语义 deferred 处理（attempts 不增，
-    // 下轮重试验证），绝不误判 wrong_target。
-    if (ok && this.method === 'keyboard') {
-      let verified = false
-      let readBroken = false
-      for (let attempt = 1; attempt <= this.verifyRetries; attempt++) {
-        await this.sleep(this.verifyDelayMs)
-        const v = await this.runCommandFn(this.sourcePython, [
-          join(this.sourceToolDir, 'wechat_db.py'),
-          '--db-root', this.sourceDbRoot,
-          '--key-file', join(this.sourceToolDir, '.wechat-local/keys.json'),
-          'read', '--chat-id', 'filehelper', '--limit', '3',
-        ])
-        if (v.code !== 0) { readBroken = true; break }
-        if (v.stdout.includes(feature)) { verified = true; break }
-      }
-      if (readBroken) {
-        // 保持 pending + attempts 不增（落 0 占位），下轮重试验证
-        this.options.outbox.updateSendState(id, { status: 'pending', attempts: entry.attempts ?? 0 })
-        this.audit({ id, kind: entry.kind, result: 'verify_read_deferred', attempts: entry.attempts ?? 0, deferred: true, method: this.method })
-        this.options.logger.warn(`sender: DB 回读本身失败 id=${id} — 按环境等待处理（attempts 不增，下轮重试验证），不判 wrong_target`)
-        return { action: 'deferred' }
-      }
-      if (!verified) {
-        ok = false
-        wrongTarget = true
-      }
+    const transmitted = r.ok && r.stage === 'sent'
+    if (!transmitted) {
+      // 发送前失败（activate 失败等）→ 保持 pending 重试整条发送（现行为不变）
+      const status: OutboxEntry['status'] = attempts >= MAX_ATTEMPTS ? 'failed' : 'pending'
+      this.options.outbox.updateSendState(id, { status, attempts })
+      this.audit({ id, kind: entry.kind, result: 'send_failed', attempts, method: this.method })
+      this.options.logger.error(`sender: send failed id=${id} attempts=${attempts}${status === 'failed' ? ' — marked failed, no more retries' : ''}`)
+      return { action: 'failed' }
     }
-    if (ok) {
-      this.options.outbox.updateSendState(id, { status: 'sent', attempts })
-      // 抢前台模式放行的发送单独记 result，审计可区分两种模式
+    // ★ 发送/验证解耦关键点：键序已执行到 Return，消息已打出去——先落盘
+    //   sent_pending_verify + transmittedAt，**再**做回读验证。后续周期见到该状态绝不重发。
+    this.options.outbox.updateSendState(id, { status: 'sent_pending_verify', attempts, transmittedAt: this.now() })
+    this.audit({ id, kind: entry.kind, result: 'transmitted', attempts, method: this.method })
+    if (this.method !== 'keyboard') {
+      // wechat-ui：spawn 已带 sent_ui_verified 校验，无回读阶段 → 直接终态 sent
+      this.options.outbox.updateSendState(id, { status: 'sent' })
+      this.audit({ id, kind: entry.kind, result: tookFocus ? 'take_focus_sent' : 'sent', attempts, method: this.method })
+      return { action: 'sent' }
+    }
+    return this.verifyTransmitted(entry, id, feature, attempts, tookFocus)
+  }
+
+  /**
+   * 回读验证阶段（只验证、绝不重发）：对 sent_pending_verify 条目跑 verifyRetries × verifyDelaySec
+   * 回读窗口。命中 → sent；穷尽未命中 → failed_wrong_target（P0 终态）；CLI 报错 → 保持
+   * sent_pending_verify + verifyAttempts++（≥5 转人工告警），下轮只重试验证。
+   */
+  private async verifyTransmitted(
+    entry: OutboxEntry,
+    id: string,
+    feature: string,
+    attempts: number,
+    tookFocus = false,
+  ): Promise<{ action: 'sent' | 'failed' | 'deferred' }> {
+    let verified = false
+    let readBroken = false
+    for (let attempt = 1; attempt <= this.verifyRetries; attempt++) {
+      await this.sleep(this.verifyDelayMs)
+      const v = await this.runCommandFn(this.sourcePython, [
+        join(this.sourceToolDir, 'wechat_db.py'),
+        '--db-root', this.sourceDbRoot,
+        '--key-file', join(this.sourceToolDir, '.wechat-local/keys.json'),
+        'read', '--chat-id', 'filehelper', '--limit', '3',
+      ])
+      if (v.code !== 0) { readBroken = true; break }
+      if (v.stdout.includes(feature)) { verified = true; break }
+    }
+    if (readBroken) {
+      // 回读 CLI 失败 = 验证环境问题：保持 sent_pending_verify 绝不重发，只累计验证轮数
+      const verifyAttempts = (entry.verifyAttempts ?? 0) + 1
+      this.options.outbox.updateSendState(id, { status: 'sent_pending_verify', verifyAttempts })
+      this.audit({ id, kind: entry.kind, result: 'verify_read_deferred', attempts, verifyAttempts, deferred: true, method: this.method })
+      if (verifyAttempts >= VERIFY_MANUAL_ALERT_ATTEMPTS) {
+        this.options.logger.error(`sender: [人工介入] id=${id} 已 ${verifyAttempts} 轮回读失败（CLI 报错）——消息可能已发出但无法验证，请人工检查文件传输助手`)
+      } else {
+        this.options.logger.warn(`sender: DB 回读本身失败 id=${id}（第 ${verifyAttempts} 轮）— 保持 sent_pending_verify 只重试验证，绝不重发`)
+      }
+      return { action: 'deferred' }
+    }
+    if (verified) {
+      this.options.outbox.updateSendState(id, { status: 'sent' })
       this.audit({ id, kind: entry.kind, result: tookFocus ? 'take_focus_sent' : 'sent', attempts, method: this.method })
       this.options.logger.info(`sender: sent id=${id} kind=${entry.kind}${tookFocus ? ' (take_focus)' : ''} (method=${this.method}, db_verified, content not logged)`)
       return { action: 'sent' }
     }
-    if (wrongTarget) {
-      // P0：回读未命中——消息可能发进了非 filehelper 会话。终态不再重试（重试可能再次误发）。
-      this.options.outbox.updateSendState(id, { status: 'failed_wrong_target', attempts })
-      this.audit({ id, kind: entry.kind, result: 'failed_wrong_target', attempts, method: this.method, p0: true })
-      this.options.logger.warn(`sender: [P0] DB 回读未命中特征串 id=${id}——消息可能发进了非 filehelper 会话，已标 failed_wrong_target 终态（不重试），请立即人工检查微信当前会话与已发内容`)
-      return { action: 'failed' }
-    }
-    const status: OutboxEntry['status'] = attempts >= MAX_ATTEMPTS ? 'failed' : 'pending'
-    this.options.outbox.updateSendState(id, { status, attempts })
-    this.audit({ id, kind: entry.kind, result: 'send_failed', attempts, method: this.method })
-    this.options.logger.error(`sender: send failed id=${id} attempts=${attempts}${status === 'failed' ? ' — marked failed, no more retries' : ''}`)
+    // P0：回读穷尽未命中——消息可能发进了非 filehelper 会话。终态不再重试（重试可能再次误发）。
+    this.options.outbox.updateSendState(id, { status: 'failed_wrong_target', attempts })
+    this.audit({ id, kind: entry.kind, result: 'failed_wrong_target', attempts, method: this.method, p0: true })
+    this.options.logger.warn(`sender: [P0] DB 回读未命中特征串 id=${id}——消息可能发进了非 filehelper 会话，已标 failed_wrong_target 终态（不重试），请立即人工检查微信当前会话与已发内容`)
     return { action: 'failed' }
+  }
+
+  /** 验证-only 轮：处理历史 sent_pending_verify 条目（绝不重发，只重试回读验证） */
+  private async verifyOnlyPass(): Promise<{ action: string; processed: number }> {
+    if (this.method !== 'keyboard') return { action: 'empty', processed: 0 } // wechat-ui 无回读阶段
+    const all = this.options.outbox.listOutbox()
+    const spv = all.filter((e) => e.status === 'sent_pending_verify' && e.channel === 'filehelper' && e.id)
+    let deferred = 0
+    let failed = 0
+    let sent = 0
+    for (const entry of spv) {
+      const feature = `#l${(entry.id ?? '').replace(/[^0-9a-zA-Z]/g, '').slice(0, 8)}`
+      const r = await this.verifyTransmitted(entry, entry.id ?? '', feature, entry.attempts ?? 0)
+      if (r.action === 'sent') sent += 1
+      else if (r.action === 'deferred') deferred += 1
+      else failed += 1
+    }
+    return { action: failed > 0 ? 'failed' : deferred > 0 ? 'deferred' : sent > 0 ? 'sent' : 'empty', processed: sent + deferred + failed }
   }
 
   /**
@@ -623,8 +658,14 @@ export class SenderService {
       }
     }
 
+    // ②' 验证-only 轮：sent_pending_verify 条目绝不重发，只重试回读验证（发送/验证解耦）
+    const vpass = await this.verifyOnlyPass()
+
     const pending = all.filter((e) => e.status === 'pending' && e.channel === 'filehelper')
-    if (pending.length === 0) return { action: 'empty', processed: 0 }
+    if (pending.length === 0) {
+      if (vpass.processed > 0) return { action: vpass.action, processed: vpass.processed }
+      return { action: 'empty', processed: 0 }
+    }
 
     // 频控：今日已发送条数 → 预算外的当日 pending 标 skipped_quota
     const today = this.dayKey(this.now())
@@ -658,8 +699,8 @@ export class SenderService {
       else if (r.action === 'deferred') deferred += 1
       else failed += 1
     }
-    if (deferred > 0 && failed === 0) return { action: 'deferred', processed: sent + deferred }
-    return { action: failed > 0 ? 'failed' : 'sent', processed: sent + failed + deferred }
+    if (deferred > 0 && failed === 0) return { action: 'deferred', processed: sent + deferred + vpass.processed }
+    return { action: failed > 0 ? 'failed' : 'sent', processed: sent + failed + deferred + vpass.processed }
   }
 
   /**

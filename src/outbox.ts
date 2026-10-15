@@ -34,10 +34,14 @@ export interface OutboxEntry {
   id?: string
   /** 发送 worker 已尝试次数（sender 维护；≥3 转 failed 不再重试） */
   attempts?: number
+  /** 键序已把消息打出去的时间戳（发送/验证解耦：>0 即绝不整条重发，只重试验证） */
+  transmittedAt?: number
+  /** sent_pending_verify 状态下的回读验证轮数（CLI 报错累计；≥5 转人工告警） */
+  verifyAttempts?: number
 }
 
-/** 生命周期状态：pending → sent | dry_run | skipped_quota | skipped_channel | failed（sender worker 推进） */
-export type OutboxStatus = 'pending' | 'sent' | 'dry_run' | 'skipped_quota' | 'skipped_channel' | 'failed' | 'failed_wrong_target'
+/** 生命周期状态：pending → sent_pending_verify → sent 或 failed_wrong_target；dry_run、skipped、failed 为旁路终态（sender worker 推进） */
+export type OutboxStatus = 'pending' | 'sent_pending_verify' | 'sent' | 'dry_run' | 'skipped_quota' | 'skipped_channel' | 'failed' | 'failed_wrong_target'
 
 /** appendOutbox 的入参（ts/channel/status 由本模块补全，调用方不给篡改口） */
 export interface OutboxAppendInput {
@@ -104,7 +108,7 @@ export class Outbox {
    * 发送 worker 专用：按 id 推进条目生命周期状态（pending → sent / dry_run / skipped / failed）。
    * 原地重写 outbox.jsonl（逐行 JSON，命中行打补丁）；找不到 id / 写失败返回 false。
    */
-  updateSendState(id: string, patch: { status: OutboxStatus; attempts?: number }): boolean {
+  updateSendState(id: string, patch: { status: OutboxStatus; attempts?: number; transmittedAt?: number; verifyAttempts?: number }): boolean {
     if (id === '') return false
     const raw = this.options.store.readText(OUTBOX_REL)
     if (!raw) return false
