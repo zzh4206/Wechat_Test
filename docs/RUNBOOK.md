@@ -376,6 +376,22 @@ Accessibility Inspector 确认元素层级）。**实证结论回填此处：___
 - **测试模式隔离**：`scheduleTestMode` 产生的报告同样进 outbox、同样可发——测试期务必保持
   `sendDryRun: true`，验证完及时关掉 scheduleTestMode。
 
+## 排障：重新登录/切换微信账号后读取失效（code 15）
+
+**现象**：微信重新登录（或切换账号）后，读取层报 SQLCipher code 15 / audit 出现 ok:false / 报告与摘要停更。
+
+**原因**：数据库密钥与登录态绑定，重新登录后微信轮换库密钥，旧 `keys.json` 失效。
+
+**处置**：重跑取钥刷新（需先退出微信）：
+```bash
+cd $HOME/WeChat/macos-wechat-export
+python3.14 bootstrap_keys.py --acknowledge-debug-copy --db-root "<小号 db_storage 绝对路径>"
+python3.14 wechat_db.py --db-root "<同上>" verify   # 预期 19/19 verified
+```
+然后重开微信（小号）、重启 DSH 即恢复。**切勿**为此切回大号或动其他账号的库。
+
+（实测记录：2026-10-15 重新登录后 message_0.db code 15，重跑取钥 19/19 恢复。）
+
 ## 附录：macos-wechat-export 目录盘点（2026-10-13）
 
 > 结论：除 `__pycache__`（92K 编译缓存，随时再生）外**无废弃物**，整目录 ~400KB，不做瘦身。逐类依据如下。
