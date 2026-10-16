@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # 启用 merge queue 时必须声明，否则队列上的检查永远不会被触发
+  merge_group:
+
+# 最小权限：workflow 默认拿到的是仓库级默认权限（通常可写），显式收窄
+permissions:
+  contents: read
+
+# 同一分支的新推送取消上一次仍在跑的运行
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # 检查名会被分支保护规则引用，改名会导致保护规则静默失配 —— 改名前先改规则集
+  build-test:
+    name: build-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 类型检查
+        run: npx tsc --noEmit
+
+      - name: 构建（tsc → lib/）
+        run: npm run build
+
+      # 测试导入的是 lib/ 编译产物，故必须在 build 之后运行
+      - name: 测试
+        run: npm test
+
+  sensitive-scan:
+    name: sensitive-scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 拒绝真实 wxid / 群 ID / 家目录路径 / 密钥
+        run: ./scripts/check-sensitive.sh
+
+      - name: 拒绝 keys.json 与数据库文件被提交
+        run: |
+          if git ls-files | grep -E '(^|/)keys\.json$|\.db$|\.sqlite$'; then
+            echo "❌ 密钥或数据库文件被纳入版本控制" >&2
+            exit 1
+          fi
+          echo "✅ 未发现 keys.json / *.db / *.sqlite"
