@@ -1,7 +1,9 @@
 node_modules/
 lib/
 state/
-vendor/
+vendor/*
+!vendor/macos-wechat-export/
+!vendor/VENDOR-NOTE.md
 .DS_Store
 *.log
 .npm-cache/
