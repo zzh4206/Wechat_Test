@@ -12,6 +12,7 @@
 - 发送段改用 `wechat-ui deliver --chat`：定位打开 → 点焦点 → 合成 Cmd+V → OCR 复核草稿 → OCR 锚定"发送"按钮 → 轮询草稿清空（替代对微信 4.x 输入框无效的合成 Return）
 - 仓库防线：`scripts/check-sensitive.sh` 与 CI `sensitive-scan` job，阻止真实 `wxid` / 群 ID / 家目录路径 / 密钥再次进入仓库
 - 治理文件：`SECURITY.md`、`CONTRIBUTING.md`、`CHANGELOG.md`、`.github/` 工作流与模板、`.gitattributes`、`.editorconfig`、`docs/README.md` 文档索引
+- `AGENTS.md`：给并行工作的 AI agent 的硬性约束（提交前必跑命令、敏感数据红线表、R1–R5 安全边界、并行提交注意）
 
 ### Changed
 

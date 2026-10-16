@@ -74,6 +74,7 @@
 
 ## 相关
 
+- 给 AI agent 的硬性约束：[../AGENTS.md](../AGENTS.md)
 - 贡献方式与提交规范：[../CONTRIBUTING.md](../CONTRIBUTING.md)
 - 安全政策与漏洞上报：[../SECURITY.md](../SECURITY.md)
 - 版本变更：[../CHANGELOG.md](../CHANGELOG.md)
