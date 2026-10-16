@@ -50,6 +50,12 @@ function makeEnv(overrides = {}) {
     // 发送前合规闸（wechat-ui read）默认通过；chatReadSeq/chatReadResult 可覆盖
     chatReadSeq: overrides.chatReadSeq ?? null,
     chatReadResult: overrides.chatReadResult ?? { code: 0, stdout: 'chat matched: 文件传输助手', stderr: '' },
+    // 定位闸（wechat-ui open）默认成功（already_open 幂等路径）；locateResult 可覆盖
+    locateSeq: overrides.locateSeq ?? null,
+    locateResult: overrides.locateResult ?? { code: 0, stdout: '{"type":"opened","already_open":true}', stderr: '' },
+    // 发送段（wechat-ui deliver）默认成功；deliverResult 可覆盖
+    deliverSeq: overrides.deliverSeq ?? null,
+    deliverResult: overrides.deliverResult ?? { code: 0, stdout: '{"type":"delivered_ui"}', stderr: '' },
     ...overrides,
   }
   let axCalls = 0 // ax:window 调用序（首读=1，复读=2）
@@ -84,6 +90,21 @@ function makeEnv(overrides = {}) {
         return Promise.resolve(ok ? { code: 0, stdout, stderr: '' } : { code: 1, stdout: '', stderr: 'err' })
       }
       steps.push({ kind: 'spawn', file, args })
+      // 定位闸 spawn（wechat-ui open --chat 文件传输助手）独立注入：locateSeq 按序弹出 / locateResult 固定
+      if (args[0] === 'open' && args.includes('--chat')) {
+        if (env.locateSeq) {
+          const seqOut = env.locateSeq.length > 0 ? env.locateSeq.shift() : env.locateResult
+          return Promise.resolve(seqOut)
+        }
+        return Promise.resolve(env.locateResult)
+      }
+      if (args[0] === 'deliver' && args.includes('--chat')) {
+        if (env.deliverSeq) {
+          const seqOut = env.deliverSeq.length > 0 ? env.deliverSeq.shift() : env.deliverResult
+          return Promise.resolve(seqOut)
+        }
+        return Promise.resolve(env.deliverResult)
+      }
       // 发送前合规闸 spawn（wechat-ui read --chat 文件传输助手）独立注入：chatReadSeq 按序弹出 / chatReadResult 固定
       if (args[0] === 'read' && args.includes('--chat')) {
         if (env.chatReadSeq) {
@@ -142,19 +163,18 @@ test('键序正确性（真发）：简化键序（activate→粘贴→回车）
   assert.equal(r.action, 'sent')
   const seq = env.steps.map((s) => (s.kind === 'sleep' ? `sleep:${s.ms}` : s.kind === 'spawn' ? 'spawn' : s.step))
   assert.deepEqual(seq, [
-    'spawn', // 发送前合规闸：wechat-ui read 标题核验（防误发）
+    'spawn', // ⓪ 定位闸：wechat-ui open 侧栏 OCR 定位（already_open 幂等通过）
+    'spawn', // ④ 发送前合规闸：wechat-ui read 标题核验（防误发）
     'activate',
     'clipboard_save',
     `clipboard_set:【lurker】日报 关键判断 ${env.lastFeature}`,
-    'key:cmd+v',
-    `sleep:${KEY_DELAY_PASTE_MS}`,
-    'key:return',
+    'spawn', // 发送段：wechat-ui deliver（定位+粘贴+发送按钮点击，合成 Enter 已证死）
     'clipboard_set:saved-content', // 恢复剪贴板
     `sleep:${VERIFY_DELAY_MS}`,
     'spawn', // wechat_db.py read（DB 回读验证兜底——唯一目标闸）
   ])
-  // 无搜索定位：绝不出现 Esc/AX/点击/↓/搜索词粘贴
-  for (const banned of ['key:esc', 'ax:window', 'key:down']) assert.ok(!seq.includes(banned), `不应出现 ${banned}`)
+  // 无搜索定位：绝不出现 Esc/AX/点击/↓/搜索词粘贴（cmd+v/return 也已移除——deliver 工具内完成）
+  for (const banned of ['key:esc', 'ax:window', 'key:down', 'key:cmd+v', 'key:return']) assert.ok(!seq.includes(banned), `不应出现 ${banned}`)
   assert.ok(!seq.some((x) => String(x).startsWith('click')), '不应点击搜索框')
   assert.ok(!seq.includes('clipboard_set:文件传输助手'), '不应粘贴搜索词')
   // 回读参数形态：只读、filehelper、limit 3（合规闸 spawn 是 wechat-ui read，回读 spawn 是 python3）
@@ -185,6 +205,7 @@ test('dry_run：确认前台后直接结束（不碰输入框不回车），条�
   assert.equal(r.action, 'sent') // 消费完成，走 dry_run 路径
   const seq = env.steps.map((s) => (s.kind === 'sleep' ? `sleep:${s.ms}` : s.kind === 'spawn' ? 'spawn' : s.step))
   assert.deepEqual(seq, [
+    'spawn', // ⓪ 定位闸照常执行（already_open 幂等通过）
     'spawn', // dry_run 合规闸照常执行（只读核验，验证 TCC 与定位）
     'activate',
     'clipboard_save',
@@ -254,7 +275,7 @@ test('回读未命中（可能发错会话）→ P0：标 failed_wrong_target �
   assert.equal(p0.p0, true, '审计行醒目标 P0')
   assert.ok(env.logger.logs.warn.some((m) => m.includes('P0') && m.includes('failed_wrong_target')), '立即 warn')
   // 重试窗口：4 次尝试（每次前 sleep VERIFY_DELAY_MS），穷尽后才终判
-  assert.equal(env.steps.filter((x) => x.kind === 'spawn').length, VERIFY_RETRIES + 1, '穷尽 verifyRetries 次回读（+1 次发送前合规闸核验）')
+  assert.equal(env.steps.filter((x) => x.kind === 'spawn').length, VERIFY_RETRIES + 3, '穷尽 verifyRetries 次回读（+1 定位闸 +1 合规闸 +1 deliver）')
   assert.equal(env.steps.filter((x) => x.kind === 'sleep' && x.ms === VERIFY_DELAY_MS).length, VERIFY_RETRIES, '每次尝试前等 verifyDelaySec')
   // 终态：后续周期不再消费
   const spawns = env.steps.filter((x) => x.kind === 'spawn').length
@@ -275,7 +296,7 @@ test('回读重试窗口（异步写入竞态修复）：首次回读空、第�
   env.lastFeature = `#l${e.id.replace(/[^0-9a-zA-Z]/g, '').slice(0, 8)}` // 让 MATCH_FEATURE 占位替换命中本条特征串
   const r = await env.sender.processOnce()
   assert.equal(r.action, 'sent', '竞态窗口内第二次回读命中 → sent（不误判 wrong_target）')
-  assert.equal(env.steps.filter((x) => x.kind === 'spawn').length, 3, '只回读 2 次即命中（+1 次发送前合规闸）')
+  assert.equal(env.steps.filter((x) => x.kind === 'spawn').length, 5, '只回读 2 次即命中（+1 定位闸 +1 合规闸 +1 deliver）')
   assert.equal(readOutbox(env.dir).find((x) => x.id === e.id).status, 'sent')
   const audit = readAudit(env.dir)
   assert.deepEqual(audit.map((a) => a.result), ['transmitted', 'sent'])
@@ -298,6 +319,14 @@ test('回读重试窗口可配：verifyRetries=2 / verifyDelaySec=1（1s × 2 �
     verifyDelaySec: 1, verifyRetries: 2,
     runCommand: (file, args) => {
       if (file === 'osascript') return Promise.resolve({ code: 0, stdout: '«class UTF8»"saved-content"', stderr: '' })
+      if (args[0] === 'deliver' && args.includes('--chat')) { // 发送段
+        env.steps.push({ kind: 'spawn', file, args })
+        return Promise.resolve({ code: 0, stdout: '{"type":"delivered_ui"}', stderr: '' })
+      }
+      if (args[0] === 'open' && args.includes('--chat')) { // 定位闸
+        env.steps.push({ kind: 'spawn', file, args })
+        return Promise.resolve({ code: 0, stdout: '{"type":"opened","already_open":true}', stderr: '' })
+      }
       if (args[0] === 'read' && args.includes('--chat')) { // 发送前合规闸
         env.steps.push({ kind: 'spawn', file, args })
         return Promise.resolve({ code: 0, stdout: 'chat matched: 文件传输助手', stderr: '' })
@@ -312,8 +341,8 @@ test('回读重试窗口可配：verifyRetries=2 / verifyDelaySec=1（1s × 2 �
     sleepMs: (ms) => { env.steps.push({ kind: 'sleep', ms }); return Promise.resolve() },
   }).processOnce()
   assert.equal(r.action, 'sent')
-  assert.equal(env.steps.filter((x) => x.kind === 'spawn').length, 3, '回读 2 次（+1 次发送前合规闸）')
-  assert.deepEqual(env.steps.filter((x) => x.kind === 'sleep').map((x) => x.ms), [KEY_DELAY_PASTE_MS, 1000, 1000])
+  assert.equal(env.steps.filter((x) => x.kind === 'spawn').length, 5, '回读 2 次（+1 定位闸 +1 合规闸 +1 deliver）')
+  assert.deepEqual(env.steps.filter((x) => x.kind === 'sleep').map((x) => x.ms), [1000, 1000])
   assert.equal(readOutbox(env.dir).find((x) => x.id === e.id).status, 'sent')
   rmSync(env.dir, { recursive: true, force: true })
 })
@@ -552,5 +581,91 @@ test('抗干扰③：签名命中但 create_time 早于 transmittedAt-60s → �
   const r = await env.sender.processOnce()
   assert.equal(r.action, 'failed', '陈旧签名不作为验证通过')
   assert.equal(readOutbox(env.dir).find((x) => x.id === e.id).status, 'failed_wrong_target')
+  rmSync(env.dir, { recursive: true, force: true })
+})
+
+// ===== 定位闸（wechat-ui open，2026-10-16 HANDOFF-sender-autotarget）四场景 =====
+
+test('定位闸：already_open 幂等通过 → 键序照常（locate spawn 首位）', async () => {
+  const env = makeEnv()
+  const e = env.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
+  env.lastFeature = `#l${e.id.replace(/[^0-9a-zA-Z]/g, '').slice(0, 8)}`
+  const r = await env.sender.processOnce()
+  assert.equal(r.action, 'sent')
+  const firstSpawn = env.steps.find((s) => s.kind === 'spawn')
+  assert.deepEqual(firstSpawn.args, ['open', '--chat', '文件传输助手'], '定位闸参数：open + 同源常量目标')
+  rmSync(env.dir, { recursive: true, force: true })
+})
+
+test('定位闸：chat_not_in_sidebar（target_missing）→ deferred 零键序零粘贴，不计 attempts', async () => {
+  const env = makeEnv({
+    locateResult: { code: 2, stdout: '{"type":"error","reason":"chat_not_in_sidebar"}', stderr: '' },
+  })
+  const e = env.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
+  const r = await env.sender.processOnce()
+  assert.equal(r.action, 'deferred')
+  const seq = env.steps.map((s) => (s.kind === 'osascript' ? s.step : s.kind))
+  assert.ok(!seq.includes('activate') && !seq.includes('key:return'), '定位失败零键序')
+  assert.ok(!seq.some((x) => String(x).startsWith('clipboard_set')), '定位失败零粘贴')
+  const entry = readOutbox(env.dir).find((x) => x.id === e.id)
+  assert.equal(entry.status, 'pending', '保持 pending 下轮重试')
+  assert.equal(entry.attempts ?? 0, 0, '不计 attempts')
+  const audit = readAudit(env.dir)
+  assert.equal(audit[0].result, 'locate_deferred')
+  assert.equal(audit[0].reason, 'target_missing')
+  assert.equal(audit[0].deferred, true)
+  rmSync(env.dir, { recursive: true, force: true })
+})
+
+test('定位闸：ambiguous_sidebar_match（重名/多义）→ 同样 target_missing 绝不模糊点击', async () => {
+  const env = makeEnv({
+    locateResult: { code: 2, stdout: '{"type":"error","reason":"ambiguous_sidebar_match"}', stderr: '' },
+  })
+  env.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
+  const r = await env.sender.processOnce()
+  assert.equal(r.action, 'deferred')
+  assert.equal(readAudit(env.dir)[0].reason, 'target_missing', '多义归类 target_missing')
+  rmSync(env.dir, { recursive: true, force: true })
+})
+
+test('定位闸：screen_locked（env_unavailable）→ deferred 不计 attempts，下轮重试语义保留', async () => {
+  const env = makeEnv({
+    locateResult: { code: 2, stdout: '{"type":"error","reason":"screen_locked"}', stderr: '' },
+  })
+  const e = env.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
+  const r = await env.sender.processOnce()
+  assert.equal(r.action, 'deferred')
+  assert.equal(readAudit(env.dir)[0].reason, 'env_unavailable')
+  assert.equal(readOutbox(env.dir).find((x) => x.id === e.id).attempts ?? 0, 0, '环境不可用不计 attempts')
+  rmSync(env.dir, { recursive: true, force: true })
+})
+
+test('定位闸：wechat-ui 缺失（ui_tool_missing）→ deferred 精确 reason + warn 指向 wechatUiPath', async () => {
+  const env = makeEnv({
+    locateResult: { code: null, stdout: '', stderr: '', error: 'spawn wechat-ui ENOENT' },
+    logger: recordingLogger(),
+  })
+  env.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
+  const r = await env.sender.processOnce()
+  assert.equal(r.action, 'deferred')
+  assert.equal(readAudit(env.dir)[0].reason, 'ui_tool_missing')
+  assert.ok(env.logger.logs.warn.some((m) => m.includes('wechatUiPath')), 'warn 指向部署检查')
+  rmSync(env.dir, { recursive: true, force: true })
+})
+
+test('定位闸：OCR 抖动重试（首败 env 后第二次 opened）→ 放行发送', async () => {
+  const env = makeEnv({
+    locateSeq: [
+      { code: 2, stdout: '{"type":"error","reason":"wechat_not_frontmost"}', stderr: '' },
+      { code: 0, stdout: '{"type":"opened","already_open":false}', stderr: '' },
+    ],
+  })
+  const e = env.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
+  env.lastFeature = `#l${e.id.replace(/[^0-9a-zA-Z]/g, '').slice(0, 8)}`
+  // 注意：locateGate 单次执行（重试交给下一消费轮），此场景模拟"下轮成功"——手动二连 processOnce
+  const r1 = await env.sender.processOnce()
+  assert.equal(r1.action, 'deferred', '首轮非前台 → deferred')
+  const r2 = await env.sender.processOnce()
+  assert.equal(r2.action, 'sent', '次轮定位成功 → 发送链照常')
   rmSync(env.dir, { recursive: true, force: true })
 })

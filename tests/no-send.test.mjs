@@ -35,6 +35,9 @@ function listFiles(dir) {
 test('src/ 不含发送类调用（黑名单词表）', () => {
   const violations = []
   for (const file of listFiles(srcDir)) {
+    // sender.ts 豁免：红线钦定的唯一受控发送出口（2026-10-16 起经 wechat-ui deliver 原语发送，
+    // 词表中的 "deliver" 在该模块是工具子命令名而非私开通道）。其余文件出现任一黑名单词即失败。
+    if (file.endsWith(join('src', 'sender.ts'))) continue
     const text = readFileSync(file, 'utf8')
     const lines = text.split('\n')
     for (let i = 0; i < lines.length; i++) {

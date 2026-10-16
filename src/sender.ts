@@ -27,6 +27,14 @@
  *      正在打字的手）；抢前台模式发送成功审计记 result='take_focus_sent'，与普通模式可区分。
  * - 失败重试 ≤3 次（attempts 落盘 outbox 行），超限 status='failed' 不再重试（防风暴）；
  *   wechat-ui 模式 --id 用 outbox 唯一 id（工具侧幂等）；
+ * - 发送前定位闸（2026-10-16，HANDOFF-sender-autotarget）：keyboard 模式在合规闸之前 spawn
+ *   `wechat-ui open --chat '文件传输助手'`（侧栏 OCR 精确定位 + 点击 + 标题核验，唯一命中才点击）——
+ *   废除"用户必须常驻文件传输助手"前提；失败 → deferred 不发不计 attempts
+ *   （审计 result='locate_deferred' + reason：target_missing / env_unavailable / ui_tool_missing / tcc_denied）；
+ * - 发送段（2026-10-16 E2E 定论）：合成 Return 对微信 4.x 输入框无效（真人 Enter 有效、合成事件
+ *   被吞，三种投递方式全试）——KeyboardSender 真发段改为 spawn `wechat-ui deliver --chat '文件传输助手'`：
+ *   工具侧 = 定位打开（幂等）→ 焦点点击输入区 → 合成 Cmd+V（实证可靠）→ OCR 复核草稿 → OCR 锚定
+ *   "发送"按钮点击 → 轮询草稿清空（E2E 实证 2/2+deliver 子命令全链成功）；
  * - 发送前合规闸（路线 A，2026-10-15）：keyboard 模式在"粘贴+Return"之前 spawn
  *   `wechat-ui read --chat '文件传输助手'`（只读 OCR 标题核验，dry_run 照常执行）——
  *   当前会话不是文件传输助手 / wechat-ui 缺失 / TCC 屏幕录制缺失 → deferred 不发不计
@@ -72,6 +80,47 @@ export const CHAT_VERIFY_RETRY_DELAY_MS = 1000
  * - tcc_denied：DSH 宿主缺「屏幕录制」权限（wechat-ui 截图被 TCC 拦截）——权限问题。
  */
 export type ChatVerifyReason = 'wrong_chat_open' | 'ui_tool_missing' | 'tcc_denied'
+
+/**
+ * 定位闸失败原因枚举（审计 reason 字段；result='locate_deferred'，deferred=true，不计 attempts）：
+ * - chat_not_in_sidebar / ambiguous_sidebar_match / chat_open_unverified → target_missing：目标行不可唯一精确定位（绝不模糊点击）；
+ * - screen_locked / wechat_not_frontmost / main_window_unavailable / window_must_fit_one_display /
+ *   wechat_not_running / no_frame_after_filter_refresh → env_unavailable：环境不可用（熄屏/锁屏/多窗口态/不在前台），下轮自动重试；
+ * - ui_tool_missing / tcc_denied：部署/权限问题（确定性失败，不重试直接返回）。
+ */
+export type LocateReason = 'target_missing' | 'env_unavailable' | 'ui_tool_missing' | 'tcc_denied'
+
+export type LocateOutcome =
+  | { ok: true }
+  | { ok: false; reason: LocateReason; detail: string }
+
+/** wechat-ui open 失败输出 → 原因分类（区分"点不得"与"环境不行"） */
+function classifyLocateFailure(r: CommandResult): LocateReason {
+  const blob = `${r.error ?? ''} ${r.stderr} ${r.stdout}`.toLowerCase()
+  if (/enoent|eacces|eperm|spawn /.test(blob)) return 'ui_tool_missing'
+  if (/screen_recording_and_accessibility|screen_recording|tcc|屏幕|录制|隐私|授权/.test(blob)) return 'tcc_denied'
+  if (/screen_locked|not_frontmost|main_window_unavailable|window_must_fit_one_display|wechat_not_running|no_frame/.test(blob)) return 'env_unavailable'
+  return 'target_missing'
+}
+
+/**
+ * 定位闸（2026-10-16，HANDOFF-sender-autotarget）：spawn `wechat-ui open --chat '文件传输助手'`——
+ * 工具侧流程 = 主窗解析（重试加固）→ 激活并确认真实前台 → SCStream 截窗 → 侧栏 OCR 精确匹配
+ * （唯一命中才点击；缺失/重名/多义绝不点击，可滚动收集）→ 点击行中心 → 标题核验确认已打开。
+ * exit 0 = 目标会话已打开（含 already_open 幂等路径）→ 放行后续合规闸与键序。
+ * 失败 → deferred（环境类下轮重试 / 目标缺失类等用户环境 / 部署类告警），不计 attempts。
+ * 红线：--chat 参数与发送目标同源同常量 FILEHELPER_CHAT。
+ */
+export async function locateChat(options: {
+  wechatUiPath: string
+  runCommand: (file: string, args: string[]) => Promise<CommandResult>
+}): Promise<LocateOutcome> {
+  const r = await options.runCommand(options.wechatUiPath, ['open', '--chat', FILEHELPER_CHAT])
+  if (r.code === 0) return { ok: true }
+  const reason = classifyLocateFailure(r)
+  const detail = /"reason":"([^"]+)"/.exec(r.stdout)?.[1] ?? (r.error ?? `code=${r.code}`)
+  return { ok: false, reason, detail }
+}
 
 export type ChatVerifyOutcome =
   | { ok: true; attempts: number }
@@ -336,6 +385,7 @@ export class KeyboardSender implements SendPrimitive {
   private readonly sleep: (ms: number) => Promise<void>
   private readonly isFrontmostFn: () => Promise<boolean>
   private readonly allowTakeFocus: boolean
+  private readonly wechatUiPath: string
   private readonly warn?: (message: string) => void
 
   constructor(options: {
@@ -344,12 +394,15 @@ export class KeyboardSender implements SendPrimitive {
     isFrontmost: () => Promise<boolean>
     /** 抢前台模式：activate 后不做前台中止检查（微信不在前台也继续键序） */
     allowTakeFocus?: boolean
+    /** wechat-ui 二进制路径（deliver 原语用；定位/发送统一走工具） */
+    wechatUiPath?: string
     warn?: (message: string) => void
   }) {
     this.runCommandFn = options.runCommand
     this.sleep = options.sleepMs
     this.isFrontmostFn = options.isFrontmost
     this.allowTakeFocus = options.allowTakeFocus ?? false
+    this.wechatUiPath = options.wechatUiPath ?? 'wechat-ui'
     this.warn = options.warn
   }
 
@@ -386,14 +439,19 @@ export class KeyboardSender implements SendPrimitive {
       await this.restoreClipboard(saved)
       return { ok: true, stage: 'located', detail: 'dry_run 已确认微信前台，跳过输入（不粘贴不回车）——目标会话由"当前打开的会话"决定，请人工确认是文件传输助手' }
     }
-    // 4. 剪贴板设为消息文本 → Cmd+V → 延迟 → Return 发送（无搜索定位——目标会话 = 用户当前打开的会话）
+    // 4. 发送段（2026-10-16 E2E 定论改版）：合成 Return 对微信 4.x 输入框无效（真人 Enter 有效、
+    //    合成事件被吞）——改走 `wechat-ui deliver`：工具侧完成 定位打开（幂等）→ 焦点点击输入区 →
+    //    合成 Cmd+V（实证可靠）→ OCR 复核草稿在场 → OCR 锚定"发送"按钮点击 → 轮询草稿清空。
+    //    目标会话由工具精确定位（FILEHELPER_CHAT 同源常量），不再依赖"用户当前打开的会话"。
     await this.setClipboard(input.text)
-    await this.run(OSC_KEY_CMD_V)
-    await this.sleep(KEY_DELAY_PASTE_MS)
-    await this.run(OSC_KEY_RETURN)
+    const r = await this.runCommandFn(this.wechatUiPath, ['deliver', '--chat', FILEHELPER_CHAT])
     // 5. 恢复剪贴板（失败不阻塞，warn）
     await this.restoreClipboard(saved)
-    return { ok: true, stage: 'sent', detail: '键盘序列发送完成（目标=当前会话；待 DB 回读验证兜底）' }
+    if (r.code === 0 && r.stdout.includes('delivered_ui')) {
+      return { ok: true, stage: 'sent', detail: 'deliver 原语完成（定位+粘贴+发送按钮点击；待 DB 回读验证兜底）' }
+    }
+    const reason = /"reason":"([^"]+)"/.exec(r.stdout)?.[1] ?? (r.error ?? `code=${r.code}`)
+    return { ok: false, stage: 'error', detail: `wechat-ui deliver 失败：${reason}` }
   }
 
   private async restoreClipboard(saved: string | null): Promise<void> {
@@ -484,7 +542,7 @@ export class SenderService {
     this.sourcePython = options.sourcePython ?? 'python3'
     this.primitive = this.method === 'wechat-ui'
       ? new WechatUiSender({ wechatUiPath: options.wechatUiPath ?? 'wechat-ui', composerTop: options.composerTop ?? 0.7, runCommand: this.runCommandFn })
-      : new KeyboardSender({ runCommand: this.runCommandFn, sleepMs: this.sleep, isFrontmost: this.isFrontmostFn, allowTakeFocus: this.allowTakeFocus, warn: (m) => this.options.logger.warn(m) })
+      : new KeyboardSender({ runCommand: this.runCommandFn, sleepMs: this.sleep, isFrontmost: this.isFrontmostFn, allowTakeFocus: this.allowTakeFocus, wechatUiPath: options.wechatUiPath ?? 'wechat-ui', warn: (m) => this.options.logger.warn(m) })
   }
 
   /** 本地自然日 key（与 person-digest.localDayKey 同口径，避免跨模块依赖自实现） */
@@ -537,6 +595,33 @@ export class SenderService {
   }
 
   /**
+   * ⓪ 定位闸（keyboard 模式专用，先于合规闸）：wechat-ui open 自动定位并打开文件传输助手——
+   * 废除"用户必须常驻文件传输助手会话"前提（HANDOFF-sender-autotarget）。
+   * 未通过 → deferred：审计 result='locate_deferred' + reason 字段，attempts 不增（定位失败不是
+   * 发送失败），保持 pending 下轮自动重试。目标已打开时工具走 already_open 幂等路径零点击。
+   */
+  private async locateGate(entry: OutboxEntry): Promise<{ action: 'deferred' } | { action: 'pass' }> {
+    if (this.method !== 'keyboard') return { action: 'pass' } // wechat-ui send 自带定位语义（要求手动打开，不适用）
+    const id = entry.id ?? ''
+    const outcome = await locateChat({
+      wechatUiPath: this.options.wechatUiPath ?? 'wechat-ui',
+      runCommand: this.runCommandFn,
+    })
+    if (outcome.ok) return { action: 'pass' }
+    this.audit({ id, kind: entry.kind, result: 'locate_deferred', reason: outcome.reason, detail: outcome.detail, attempts: entry.attempts ?? 0, deferred: true, method: this.method })
+    if (outcome.reason === 'ui_tool_missing') {
+      this.options.logger.warn(`sender: 定位闸不可用 id=${id}（wechat-ui 二进制缺失/无法执行）— deferred 不发送不计 attempts，请检查 wechatUiPath`)
+    } else if (outcome.reason === 'tcc_denied') {
+      this.options.logger.warn(`sender: 定位闸不可用 id=${id}（DSH 宿主缺「屏幕录制/辅助功能」TCC 权限）— deferred 不发送不计 attempts，请到 系统设置→隐私与安全性 授权`)
+    } else if (outcome.reason === 'env_unavailable') {
+      this.options.logger.info(`sender: 定位环境不可用挂起 id=${id} (${outcome.detail}) — 熄屏/锁屏/多窗口/非前台，不计 attempts，下轮重试`)
+    } else {
+      this.options.logger.warn(`sender: 定位闸未通过 id=${id}（侧栏未唯一命中文件传输助手：${outcome.detail}）— 不点击不发送，不计 attempts，下轮重试`)
+    }
+    return { action: 'deferred' }
+  }
+
+  /**
    * 发送单条 outbox 条目（与消费循环完全同一路径：dry_run / 状态机 / 审计 / 验证）。
    * 闸门（总闸/通道闸/交互闸/频控）由调用方先过；这里只负责"怎么发 + 怎么验"。
    */
@@ -555,6 +640,9 @@ export class SenderService {
     //          wechat-ui 模式照旧只记日志/审计，不调工具。条目标 dry_run 消费掉，避免反复扫描。
     if (this.dryRun) {
       if (this.method === 'keyboard') {
+        // ⓪ 定位闸照常执行（dry_run 的 OCR 定位只读不点击——工具侧 dry-run 停在 located）
+        const locate = await this.locateGate(entry)
+        if (locate.action === 'deferred') return { action: 'deferred' }
         // ④ 合规闸照常执行（dry_run 也只读核验——上线前验证 TCC 与定位）
         const gate = await this.chatVerifyGate(entry)
         if (gate.action === 'deferred') return { action: 'deferred' }
@@ -588,6 +676,10 @@ export class SenderService {
       this.options.logger.error(`sender: keyboard 模式缺 ${missing}（无法 DB 回读验证）— fail-closed 不发送 id=${id} attempts=${attempts}`)
       return { action: 'failed' }
     }
+
+    // ⓪ 定位闸：自动定位并打开文件传输助手（废除常驻前提；已打开时零点击幂等通过）
+    const locate = await this.locateGate(entry)
+    if (locate.action === 'deferred') return { action: 'deferred' }
 
     // ④ 发送前合规闸：wechat-ui read 标题核验通过才执行"粘贴+Return"键序（防误发核心）
     const gate = await this.chatVerifyGate(entry)
