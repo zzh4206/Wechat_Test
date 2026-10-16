@@ -94,6 +94,8 @@ llmPricing:
 
 默认值即上表；**以供应商页面为准**：[智谱官方定价页](https://docs.bigmodel.cn/cn/guide/start/pricing)。模型名取自 `llmModel` 配置（空 = `glm-5.3`）。
 
+**费用汇总**：`node scripts/llm-cost.mjs`（默认本月；`--month` / `--day` / `--chat` / `--state` 过滤）输出每群 × 每日费用表 + 合计。费用按未命中缓存价计 = 保守上界（实际命中 prompt cache 时更低）。更多示例见 RUNBOOK §7.11。
+
 ### 两段式生成实验开关（T8 `schemaTwoStage`）
 
 报告生成的每次 LLM 调用默认是"一步出 JSON"——金字塔 schema + 字段断言属强格式约束。实验依据（EMNLP 2024 Industry《Let Me Speak Freely?》）：格式约束越严，模型推理性能下降越大。开关打开后（默认 `false` = 零变化），report 生成路径（map 批 / merge 合并 / refine 段）的每次调用拆两步：第一步输出**无 schema 约束的自由文本归纳**（保留消息序号 n 供溯源），第二步独立调用把自由文本**格式化为既有 schema**（小输入、无超时风险），再走既有断言与降级链路。两步都进 `llm-calls.jsonl` 与报告尾统计行（phase 沿用原值），成本天然可见——**如何对比观察**：同一窗口分别在 `schemaTwoStage: false / true` 下生成（或结合 `reportPipeline: 'ab'` 双跑），对照报告尾"LLM 调用次数/费用"行与归纳质量（连贯性、evidence 溯源命中率）人工评审；开关仅作用于 report，distiller 不受影响。

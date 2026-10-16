@@ -253,7 +253,20 @@ llmPricing:
 
 默认值即上表；**以供应商页面为准**：<https://docs.bigmodel.cn/cn/guide/start/pricing>。换模型（改 `llmModel`）记得同步补价格表条目，否则费用记 0。
 
-**月度费用汇总**（从 JSONL 汇总，两条已验证的 jq 示例）：
+**费用汇总（推荐：内置命令）**：
+
+```sh
+# 本月每群×每日费用表 + 合计（默认 stateDir 与当前月）
+node scripts/llm-cost.mjs
+# 指定月 / 单日 / 单群 / 其他 stateDir
+node scripts/llm-cost.mjs --month 2026-10 --chat 12345678@chatroom   # 群 ID 用占位符
+node scripts/llm-cost.mjs --day 2026-10-16
+node scripts/llm-cost.mjs --state /path/to/stateDir
+```
+
+（口径：token 为估算+宿主 usage 混合；费用按未命中缓存价计=保守上界，实际命中 prompt cache 时更低；输出末行自动披露未知模型行数与损坏行数。）
+
+**备选：手写 jq**（已验证的两条示例，适合管道组合）：
 
 ```sh
 # ① 各自然月费用合计（全部群）
