@@ -1,0 +1,23 @@
+# 默认：文本文件按内容自动判定，检出为 LF
+* text=auto eol=lf
+
+# 显式声明，避免平台差异
+*.md   text eol=lf
+*.ts   text eol=lf
+*.mjs  text eol=lf
+*.json text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.sh   text eol=lf
+
+# 二进制：不做换行转换
+*.png  binary
+*.jpg  binary
+*.db   binary
+wechat-ui binary
+
+# 语言统计：构建产物不计入（lib/ 由 npm run build 生成）
+lib/ linguist-generated=true
+
+# 过程性文档不计入仓库语言统计
+docs/notes/ linguist-documentation=true
