@@ -188,3 +188,31 @@ test('person-digest 大窗口分批：>阈值 → 批+合并调用，evidence �
   gs.dispose()
   rmSync(dir, { recursive: true, force: true })
 })
+
+// —— 日报窗口锚定调度（前日 20:20 → 触发时刻）——
+
+const WBASE = new Date(2026, 9, 16).getTime() // 2026-10-16（触发日）
+const W = (d, h, m = 0) => WBASE + d * 86_400_000 + h * 3600_000 + m * 60_000
+
+test('窗口边界保险：前日 20:29 的消息在今昨两份日报中都命中（刻意重叠）', async () => {
+  const { reportWindow } = await import('../lib/report.js')
+  // 今日报告（触发 Oct 16 20:30）：窗口 [Oct 15 20:20, Oct 16 20:30]
+  const today = reportWindow('daily', W(0, 20, 30))
+  assert.equal(today.start, W(-1, 20, 20))
+  assert.equal(today.end, W(0, 20, 30))
+  // 昨日报告（触发 Oct 15 20:30）：窗口 [Oct 14 20:20, Oct 15 20:30]
+  const yesterday = reportWindow('daily', W(-1, 20, 30))
+  assert.equal(yesterday.start, W(-2, 20, 20))
+  assert.equal(yesterday.end, W(-1, 20, 30))
+  // 边界消息：前日 20:29（在 20:30 发送前一分钟发出）
+  const boundary = W(-1, 20, 29)
+  assert.ok(boundary >= today.start && boundary <= today.end, '今日报告含前日 20:29 消息')
+  assert.ok(boundary >= yesterday.start && boundary <= yesterday.end, '昨日报告也含（重叠保险，属预期）')
+})
+
+test('窗口边界：前日 20:19 的消息不进今日日报（余量 10 分钟之外）', async () => {
+  const { reportWindow } = await import('../lib/report.js')
+  const today = reportWindow('daily', W(0, 20, 30))
+  const early = W(-1, 20, 19)
+  assert.ok(early < today.start, '20:19 早于窗口起点，归昨日之前的语义（不重复捕捞）')
+})

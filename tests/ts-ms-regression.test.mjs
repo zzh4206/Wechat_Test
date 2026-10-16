@@ -17,13 +17,13 @@ test('热修回归：今日消息（毫秒 ts）在 daily 窗口内被 getMessag
   try {
     const gs = new GroupStoreService(dir, { warn() {}, error() {} })
     const now = Date.now()
-    // 真实量级毫秒窗口：今日自然日（本地时区 00:00 → 明日 00:00），与 report.ts 同口径
+    // 真实量级毫秒窗口：daily 窗口 = 前日 20:20 → 触发时刻（end 含，与 report.ts 同口径）
     const win = reportWindow('daily', now)
-    assert.ok(now >= win.start && now < win.end, 'now 必须落在 daily 窗口内')
+    assert.ok(now >= win.start && now <= win.end, 'now 必须落在 daily 窗口内（end=触发时刻，含）')
 
     await gs.appendMessages(CHAT, [
       { chatId: CHAT, senderPid: 'wxid_a', senderName: '甲', text: '今天下午开组会', msgId: 'm1', ts: now - 60_000, kind: 'text' },
-      { chatId: CHAT, senderPid: 'wxid_b', senderName: '乙', text: '收到', msgId: 'm2', ts: now, kind: 'text' },
+      { chatId: CHAT, senderPid: 'wxid_b', senderName: '乙', text: '收到', msgId: 'm2', ts: now - 1, kind: 'text' }, // end=触发时刻含边界：取 now-1 落在窗口内
     ])
 
     const hit = gs.getMessages(CHAT, { afterTs: win.start - 1, beforeTs: win.end, limit: 2000 })

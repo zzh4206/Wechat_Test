@@ -80,11 +80,25 @@ export interface ReportWindow {
  * end 一律 = asOf 当日 24:00（报告覆盖到"截止当天"）。手动与调度触发同窗，
  * 故手动触发不会让后续常规报告错位。
  */
+/**
+ * 窗口计算（2026-10-15 调度对齐决策）：
+ * - daily：**前一日 20:20 → 触发时刻**。动机：日报 20:30 定时送达，旧窗口 [当天00:00, 20:30]
+ *   会把「昨晚 20:30 之后的消息」漏进两份日报的夹缝（昨报已发出、今报不含）。新窗口锚定
+ *   20:20（10 分钟边界余量）保证 20:30 附近的重要消息必被至少一份日报捕获；20:20–20:30 的
+ *   重叠是刻意的边界保险，两份日报都含它，属预期行为。边界语义：start 含（≥20:20:00）、
+ *   end 含（≤触发时刻）。dateKey 不变（报告仍按触发日命名）。
+ * - weekly/monthly：日历语义不变（本周一 00:00 / 本月 1 日 00:00 → 当日 24:00）。
+ */
 export function reportWindow(kind: ReportKind, asOfTs: number): ReportWindow {
   const d = new Date(asOfTs)
   const dayStart = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime()
   const end = dayStart + 86_400_000
   let start = dayStart
+  if (kind === 'daily') {
+    // 前一日 20:20 起（10 分钟边界余量），end = 触发时刻（见函数头注释的调度对齐决策）
+    start = dayStart - 86_400_000 + 20 * 3600_000 + 20 * 60_000
+    return { start, end: asOfTs, dateKey: localDayKey(asOfTs) }
+  }
   if (kind === 'weekly') {
     const dowMon = (d.getDay() + 6) % 7 // 周一=0
     start = dayStart - dowMon * 86_400_000

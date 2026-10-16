@@ -71,11 +71,20 @@ function makeEnv(script, extra = {}) {
   return { dir, gs, store, llm, report }
 }
 
-test('周期切窗：daily=当天；weekly=本周一起；monthly=本月 1 日起（纯函数）', () => {
+test('周期切窗：daily=前日20:20→触发时刻（调度对齐）；weekly=本周一起；monthly=本月 1 日起（纯函数）', () => {
+  // ① 触发 20:30 → [前日 20:20, 20:30]
   const d = reportWindow('daily', T(20, 30))
-  assert.equal(d.start, BASE)
-  assert.equal(d.end, BASE + 86_400_000)
+  assert.equal(d.start, BASE - 86_400_000 + 20 * 3600_000 + 20 * 60_000)
+  assert.equal(d.end, T(20, 30))
   assert.equal(d.dateKey, '2026-06-10')
+  // ② 触发 09:00 → [前日 20:20, 09:00]
+  const d2 = reportWindow('daily', T(9))
+  assert.equal(d2.start, BASE - 86_400_000 + 20 * 3600_000 + 20 * 60_000)
+  assert.equal(d2.end, T(9))
+  // ③ 触发 19:00 → [前日 20:20, 19:00]
+  const d3 = reportWindow('daily', T(19))
+  assert.equal(d3.start, BASE - 86_400_000 + 20 * 3600_000 + 20 * 60_000)
+  assert.equal(d3.end, T(19))
   const w = reportWindow('weekly', T(20, 40))
   assert.equal(w.start, BASE - 2 * 86_400_000) // 本周一 00:00
   assert.equal(w.dateKey, '2026-06-10')
