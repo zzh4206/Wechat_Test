@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 🔒 报告安全或隐私问题（私密）
+    url: https://github.com/zzh4206/Wechat_Test/security/advisories/new
+    about: 请勿用公开 issue 报告漏洞、密钥泄露或真实标识符泄露，请走私密渠道。
+  - name: 📖 安装与配置问题先看 RUNBOOK
+    url: https://github.com/zzh4206/Wechat_Test/blob/main/docs/RUNBOOK.md
+    about: 安装、授权、白名单、审计与卸载步骤都在这里。

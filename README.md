@@ -1,12 +1,13 @@
 # @zzh4206/dsh-group-lurker
 
-一个独立可复用的 [DeepSeek Harness（DSH）](https://github.com/deepseek-ai) Cordis 插件：**只读旁听微信群聊，按群维护独立上下文与人格，提炼关键信息并生成日志。不发送任何消息。**
+一个独立可复用的 [DeepSeek Harness（DSH）](https://github.com/deepseek-ai) Cordis 插件：**只读旁听微信群聊，按群维护独立上下文与人格，提炼关键信息并生成日志。**
 
-> 仅支持 macOS 微信 4.x（本地 SQLCipher 库读取路线）。MVP 阶段只观察、零发送。
+> 仅支持 macOS 微信 4.x（本地 SQLCipher 库读取路线）。
+> **默认零读取、零发送**：白名单为空即拒绝启动；发送能力为「受控单出口」，默认关闭（详见[安全模型](#安全模型红线)）。
 
 ## 特性
 
-- **只读**：经只读子进程读取微信本地库，永不写微信数据、永不动微信进程；静态 `no-send` 测试哨兵钉死"零发送通道"
+- **只读为默认**：经只读子进程读取微信本地库，永不写微信数据、永不动微信进程；`no-send` 静态哨兵扫描源码与编译产物，钉死"发送原语只允许出现在 `src/sender.ts`"
 - **受监管读取（管控三原则）**：
   1. 默认全拒——`groups` 白名单为空即拒绝启动读取（fail-closed）
   2. 白名单外的群在适配器层零子进程调用（测试断言）
@@ -99,22 +100,35 @@ llmPricing:
 
 ## 安全模型（红线）
 
-- 插件不持有任何消息发送通道（发送类调用黑名单静态测试）
-- 取钥产物 `keys.json` 只存在于工具目录（0600），本插件不复制、不打印、不提交；解密经 stdin 传钥（不进命令行参数）
-- 不逆向微信协议；不修改微信客户端；UI 自动化发送属二期，另行评估
-- 白名单外群：适配器第一行闸门拒绝，零子进程调用
+五条红线，任何一条被测试击穿即为 **P0 事故**、必须停止发版。完整基线、威胁模型与验收矩阵见 **[docs/SECURITY-TEST-PLAN.md](docs/SECURITY-TEST-PLAN.md)**。
+
+| # | 红线 | 实现锚点 |
+|---|---|---|
+| **R1** | **受控单出口**：微信发送仅允许 `src/sender.ts` 一个模块、仅 filehelper 一个通道（`ALLOWED_CHANNELS` 代码级硬编码）；四道闸 = 总闸 `senderEnabled`（默认 `false`）+ `sendDryRun`（默认 `true`）+ 通道闸 + 交互闸（前台 + 用户空闲）+ 合规闸（OCR 核验当前会话）；另有频控 `maxSendsPerDay`、重试 ≤3 防风暴、审计只记元数据。**sender.ts 以外任何模块出现发送原语 = P0** | `src/sender.ts` + `no-send` 哨兵 |
+| **R2** | **默认全拒**：白名单为空或未列出的群 → 零读取、零子进程调用 | `src/source/wechat-db.ts` 构造闸门 + `gate()` |
+| **R3** | **路径围栏**：所有 fs 写入必须落在 `stateDir` 内 | `src/guard.ts` `assertInsideState()` + `src/store.ts` 唯一写入点 |
+| **R4** | **注入隔离**：消息原文永远只是数据，不是指令 | `src/guard.ts` `sanitize()` + distiller 指令区/数据区分离 |
+| **R5** | **密钥零接触**：不读取、不复制、不打印 `keys.json`，不写微信数据 | 子进程经外部 CLI，密钥由工具自解析；解密经 stdin（不进命令行参数） |
+
+其它边界：不逆向微信通信协议；不修改微信客户端；UI 自动化发送仅走上面 R1 的受控通道。
 
 ## 开发
 
 ```bash
 npm install
 npm run build   # tsc → lib/
-npm test        # node --test（64 例，全离线 mock，不碰真实库）
+npm test        # node --test，379 例，全离线 mock，不碰真实库
 ```
 
-- 项目文档（PRD/技术设计/工作拆分/spike 报告）：[docs/](docs/)
-- 历史：第一代 im-connect 路线的 vendor 参考副本已于 2026-10-13 删除（路线淘汰）
+> 测试导入的是**编译产物 `lib/`**，所以改完 `src/` 必须先 `npm run build` 再 `npm test`。
+
+- **文档索引（从这里进）**：[docs/README.md](docs/README.md)
+- 安装 / 授权 / 白名单 / 审计 / 卸载：[docs/RUNBOOK.md](docs/RUNBOOK.md)
+- 安全政策与漏洞上报：[SECURITY.md](SECURITY.md)
+- 贡献方式与提交规范：[CONTRIBUTING.md](CONTRIBUTING.md)
+- 版本变更：[CHANGELOG.md](CHANGELOG.md)
 - 开发进度日志：[docs/PROGRESS.md](docs/PROGRESS.md)
+- 历史：第一代 im-connect 路线的 vendor 参考副本已于 2026-10-13 删除（路线淘汰）
 
 ## License
 

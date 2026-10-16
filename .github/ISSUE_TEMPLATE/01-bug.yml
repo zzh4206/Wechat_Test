@@ -1,0 +1,65 @@
+name: 缺陷报告
+description: 报告一个可复现的问题
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ⚠️ **安全或隐私问题请不要在这里报告**——请用[私密漏洞报告](../security/advisories/new)，详见 [SECURITY.md](../blob/main/SECURITY.md)。
+
+        ⚠️ **填写时请勿写入真实微信标识符**：真实的 `wxid`、群 ID、昵称、聊天内容一律用占位符代替（如 `wxid_xxx`、`12345678@chatroom`、`某群`）。
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 发生了什么
+      description: 期望行为与实际行为分别是什么？
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. 配置 groups: ["12345678@chatroom"]
+        2. 运行 npm start
+        3. 观察到 …
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: 版本或提交
+      description: 插件版本（package.json 的 version）或提交短 SHA
+    validations:
+      required: true
+
+  - type: dropdown
+    id: source
+    attributes:
+      label: 读取来源
+      options:
+        - wechat-db（本地库读取）
+        - none（未读取）
+        - 其他
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志与审计片段
+      description: 请先**删掉或替换所有真实标识符与消息内容**再粘贴。
+      render: text
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: 确认
+      options:
+        - label: 我已确认以上内容**不含**真实 wxid / 群 ID / 昵称 / 聊天内容 / 家目录路径
+          required: true

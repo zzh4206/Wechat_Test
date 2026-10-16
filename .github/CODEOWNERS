@@ -1,0 +1,16 @@
+# 代码所有者
+#
+# 说明：规则集要求 status check 通过，单人维护的项目不设 approval 要求
+# （GitHub 不允许自己批准自己的 PR，设了会把仓库锁死）。
+# 本文件的作用是：当将来有协作者时，让安全相关文件的改动自动请求 owner 复核。
+#
+# 语法注意：最后一个匹配的模式优先级最高；写错的行会被静默跳过，不会报错。
+
+# 默认所有文件归维护者
+*                                   @zzh4206
+
+# 安全与隐私相关：这些文件定义或验证"读取边界"，改动需格外谨慎
+/SECURITY.md                        @zzh4206
+/scripts/check-sensitive.sh         @zzh4206
+/.github/workflows/                 @zzh4206
+/docs/SECURITY-TEST-PLAN.md         @zzh4206
