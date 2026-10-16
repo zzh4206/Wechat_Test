@@ -23,6 +23,14 @@ cordis.local.yml
 *.local.json
 *.local.md
 
+# —— 本地过程性记录：本地环境细节 / 日志上下文 / 时序（前后关系）——一律不入库 ——
+# 现有文件由上面的具体规则覆盖。**今后这类新文件请放 `docs/local/`**：
+# 该目录整体被忽略，不必再逐条加规则，也不会误伤 living doc。
+# 下面两条按文件名兜底，防止文件被随手写在别处。
+docs/local/
+LOGS-*.md
+*-logs.md
+
 # 环境变量
 .env
 .env.*

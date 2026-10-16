@@ -48,6 +48,7 @@ Conventional Commits，type 只取 `build chore ci docs feat fix perf refactor r
 
 - 测试**全离线**：不得连接网络、不得读取真实微信库、不得 spawn 真实 python CLI（注入 mock）
 - `sec-tests/` 是本地对抗样本目录（**不入库**）；新增常规测试放 `tests/`，文件名 `<主题>.test.mjs`
+- **本地过程性记录一律不入库**：描述"本机发生了什么"的文档（本地环境细节、运行日志摘录、事件时序与前后关系）放 **`docs/local/`**——该目录整体被 `.gitignore` 忽略。兜底规则：`LOGS-*.md`、`*-logs.md`、`*.local.md`。别把这类内容写进 living doc（`README.md`/`RUNBOOK.md`/`PROGRESS.md`）
 - 改代码同步更新文档：README 配置表 / `docs/RUNBOOK.md` / `docs/` 下设计文档；`CHANGELOG.md` 在 `[Unreleased]` 累加（小节名只用 Keep a Changelog 的六个，空小节删掉）
 - 文档索引：新增文档后更新 [docs/README.md](docs/README.md)
 
