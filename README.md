@@ -67,6 +67,7 @@ pnpm add --config.auto-install-peers=false git+https://github.com/zzh4206/Wechat
 | `bufferSize` | `60` | 每群环形缓冲 |
 | `distillEveryMessages` | `25` | 每攒 N 条触发一次 LLM 提炼 |
 | `distillIntervalMin` | `15` | 定时提炼间隔（分钟） |
+| `retentionDays` | `90` | **消息留存天数**：`store.db` 中 `ts` 早于该天数的 messages 行会被滚动删除（`events`/`tasks`/`promises`/`files` 不受影响）。**数据最小化入口**——本地存的是真实聊天记录，不需要留 90 天就调小 |
 | `persona` | `default` | 默认人格名 |
 | `groupPersonas` | `{}` | 按群人格覆盖：chatId → 人格名 |
 | `stateDir` | `DSH_HOME/dsh-group-lurker` | 状态目录 |
