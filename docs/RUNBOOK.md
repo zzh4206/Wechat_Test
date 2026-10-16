@@ -53,7 +53,11 @@ pnpm add file:/path/to/2水群
 
 ## 4. 配置（profile 的 cordis.patch.yml）
 
-在 `~/.dsh/profiles/desktop/cordis.patch.yml` 的 `insert:` 列表加一段。**以下全部路径均为占位，必须替换为本机小号实际路径；仓库内 cordis.patch.yml 是本地运行配置，不入库。**
+在 `~/.dsh/profiles/desktop/cordis.patch.yml` 加一段**配置覆盖**（该 profile 里注册由插件包自带的 `insert` 完成，这里只放 `config`）。**以下全部路径与群 ID 均为占位，必须替换为本机实际值。**
+
+> ⚠️ **真实值只写在 profile 的 `cordis.patch.yml`，或仓库内被忽略的 `cordis.local.yml`。**
+> **仓库自带的 `cordis.patch.yml` 只有 `insert` 骨架，不放配置**——配置写进仓库会把真实群 ID 与 wxid
+> 一起推到公开仓库（本仓库历史上正是这样泄露过一次，历史已被人工清理）。提交前跑 `./scripts/check-sensitive.sh` 自检。
 
 ```yaml
 - id: group-lurker
@@ -322,7 +326,22 @@ rm -rf /path/to/macos-wechat-export/.wechat-local
 2. **切勿**把旧机器的 `.wechat-local/` 拷过去：旧签名快照会让 `bootstrap_keys.py` 的原版签名对照（第 101 行）误判"原版被改动"而中止；旧 keys.json 对新环境的库也不适用；
 3. 取钥成功后插件侧只需核对 `sourceDbRoot`/`sourceToolDir` 指向无误，游标（stateDir/cursor.json）与新库位点不一致时会自动按新库重新对齐（最坏情况：少量近期消息重复投递，下游幂等消化）。
 
-## 12.5 filehelper 发送 worker（发送原语：键盘模拟 + DB 回读验证，2026-10-15 重写）
+## 12.5 filehelper 发送 worker（发送原语：键盘模拟 + 定位闸 + DB 回读验证，2026-10-16 增补定位闸）
+
+> **2026-10-16 定位闸上线（HANDOFF-sender-autotarget 交付）**：键序前置一档
+> `wechat-ui open --chat '文件传输助手'`（侧栏 Vision OCR 精确定位 + 合成点击 + 标题核验）——
+> **废除"文件传输助手必须常驻当前会话"的 P0 级前提**。定位闸语义：
+> - 工具侧流程：主窗解析（多窗口态重试加固）→ 激活并确认**真实前台**（防坐标点击落进别的应用/
+>   别的 Space）→ SCStream 截窗 → 侧栏（左 340pt）OCR **唯一精确命中才点击**（缺失/重名/多义
+>   绝不点击；可滚动收集虚拟化列表）→ 点击行中心 → 标题核验确认打开；目标已打开时走
+>   `already_open` 幂等路径零点击；
+> - 插件侧语义：失败 → `deferred` 不发**不计 attempts**（下轮自动重试），审计
+>   `result='locate_deferred'` + reason 四分类：`target_missing`（侧栏未唯一命中——绝不模糊点击）/
+>   `env_unavailable`（熄屏/锁屏/非前台/多窗口解析失败——环境等待）/ `ui_tool_missing` /
+>   `tcc_denied`（部署/权限，确定性不重试）；
+> - 顺序保证：交互闸（系统空闲 <10s 跳过）仍在定位闸上游——定位的合成点击只会在用户空闲时发生；
+> - 背景：微信 4.1.13（macOS 26）AX 内容树不暴露（Qt a11y 桥缺席，三激活入口全部未实现，
+>   详见 `docs/REPORT-sender-autotarget-research.md`），侧栏 OCR 是当前唯一被实证可行的定位通道。
 
 > 红线（2026-10-14 用户批准，不变）：**仅允许 `filehelper` 一个受控出口**。通道白名单在
 > `src/sender.ts` 代码级硬编码（`ALLOWED_CHANNELS = ['filehelper']`），其他 channel 永不发送；
@@ -333,17 +352,25 @@ rm -rf /path/to/macos-wechat-export/.wechat-local
 > 验证从截图/OCR 换成 **wechat_db.py 只读回读**。发送原语抽为可替换接口 `SendPrimitive`：
 > `sendMethod: 'keyboard'`（默认）/ `'wechat-ui'`（旧实现保留在 `WechatUiSender`，可随时切回）。
 
-### 发送键序（KeyboardSender，简化版——2026-10-15 二次实测：搜索定位整段删除）
+### 发送键序（KeyboardSender——2026-10-16 E2E 定论改版：deliver 原语）
 
-1. osascript 激活微信（`tell application "WeChat" to activate`）+ 确认前台（非前台直接放弃，防按键落到别的应用）；
-2. 保存当前剪贴板内容（发送后恢复——礼貌且防用户数据丢失）；
-3. **【dry_run 到此为止】**：确认前台后直接结束——不碰输入框不回车（实测教训：干跑时的粘贴也可能落进当前会话输入框被误发）；
-4. 剪贴板设为消息文本（`【lurker】… + #l<id 前 8 位>` 特征串）→ **Cmd+V** → 延迟 300ms → **Return**（发送）；
-5. 恢复剪贴板原内容（失败仅 warn，不阻塞）。
+1. osascript 激活微信 + 确认前台（非前台放弃——防按键落到别的应用；dry_run 到此为止）；
+2. 保存当前剪贴板（发送后恢复）；
+3. 剪贴板设为消息文本（`【lurker】… + #l<id 前 8 位>` 特征串）；
+4. spawn **`wechat-ui deliver --chat '文件传输助手'`**（工具侧一条龙）：
+   定位打开（幂等 already_open）→ OCR 锚定"发送"按钮 → 焦点点击输入区（面板左半安全区，
+   避开悬浮窗遮挡）→ 合成 Cmd+V（实证可靠）→ OCR 复核草稿在场（2x 放大 OCR）→ 点击发送按钮
+   → 轮询草稿清空 → `delivered_ui`；
+5. 恢复剪贴板 → DB 回读验证兜底（不变）。
+
+> **合成 Return 已证死（E2E 五连验证）**：微信 4.x 输入框吞掉一切合成 Enter/Cmd+Return（真人
+> Enter 正常）——HID post / postToPid / 真实事件源三种方式全灭。发送动作唯一可靠原语 =
+> OCR 定位"发送"按钮 + 合成点击（E2E 2/2 + deliver 子命令全链成功）。附带发现：SCStream 1x
+> 窗图的小字条带 OCR 不出，须 2x 上采样；坐标永远当次截图求取（E2E 中窗口 1300→853pt 缩放）。
 
 > **搜索定位废除（三轮实测演进）**：Cmd+F 打开的是"搜一搜"网页面板 → 改点击搜索框 + ↓ 选中
-> （时灵时不灵）→ 最终实测"前台 + 粘贴 + 回车"直接发进当前会话一次成功，且搜索词有落进
-> 聊天输入框被误发的风险——定位整段删除。目标会话由"用户当前打开的会话"决定。
+> （时灵时不灵）→ 最终"前台 + 粘贴 + 回车"直发当前会话（2026-10-16 再度废除——回车失效且
+> 依赖常驻前提）→ 现为 deliver 定位原语。
 
 **运行前提（P0 级）**：发送前"文件传输助手"必须是微信**当前打开的会话**（开一次微信点开文件
 传输助手即记住），发送期间勿切换会话。发送后 DB 回读验证兜底：未命中特征串 = 内容可能落进

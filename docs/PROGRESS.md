@@ -1,10 +1,12 @@
 # dsh-group-lurker（群聊水友引擎）
 
-一个独立的 DeepSeek Harness（DSH）Cordis 插件：**只读旁听群聊，按群维护独立上下文与人格，提炼关键信息并生成日志。MVP 不发送任何消息。**
+一个独立的 DeepSeek Harness（DSH）Cordis 插件：**只读旁听群聊，按群维护独立上下文与人格，提炼关键信息并生成日志。默认零读取、零发送。**
 
-- 产品需求：[docs/PRD.md](docs/PRD.md)
-- 技术设计：[docs/TECH-DESIGN.md](docs/TECH-DESIGN.md)
-- 工作拆分（供分派编码 agent）：[docs/WORKBREAKDOWN.md](docs/WORKBREAKDOWN.md)
+- 文档索引（从这里进）：[README.md](README.md)
+- 产品需求：[PRD.md](PRD.md)
+- 技术设计：[TECH-DESIGN.md](TECH-DESIGN.md)
+- 工作拆分（供分派编码 agent）：[WORKBREAKDOWN.md](WORKBREAKDOWN.md)
+- 安全红线总纲：[SECURITY-TEST-PLAN.md](SECURITY-TEST-PLAN.md)
 
 ## 与 im-connect 的关系（重要约定）
 
@@ -16,7 +18,10 @@
   - `vendor/` 不安装依赖、不进构建路径、不出现在插件发布产物中；
   - 若将来必须改动 im-connect 才能拿到群消息，走 GitHub fork / 上游 PR，不在本地 vendor 上改。
 - 本插件自身永远不持有任何消息发送通道（验收见 PRD §5 与 WP1 的 `no-send` 测试）。
-- **（2026-10-11 转向）** 微信消息源改为本地库读取（wx-chatbot 路线），im-connect 解耦、补丁已回滚；新实施计划见 [docs/REPORT-wechat-db-plan.md](docs/REPORT-wechat-db-plan.md)。
+  > **【已被取代 2026-10-16】** 该条升级为红线 R1「受控单出口」（用户确认批准）：发送**仅允许** `src/sender.ts`
+  > 一个模块、仅 filehelper 一个通道，四道闸默认全关（`senderEnabled=false` + `sendDryRun=true`）。
+  > `no-send` 哨兵语义随之从"零发送原语"变为"发送原语只允许出现在 sender.ts"。见 [SECURITY-TEST-PLAN.md](SECURITY-TEST-PLAN.md) §0。
+- **（2026-10-11 转向）** 微信消息源改为本地库读取（wx-chatbot 路线），im-connect 解耦、补丁已回滚；新实施计划见 [REPORT-wechat-db-plan.md](REPORT-wechat-db-plan.md)。
 
 ## 运行前提
 
@@ -61,3 +66,6 @@ MVP「只观察」规划完成，即将进入开发。工作包 WP0–WP5 见 WO
 | 2026-10-13 | RUNBOOK 增补 §9 换机/重装不迁移 .wechat-local（b944ba8）；macos-wechat-export 移除上游 remote（转纯本地仓库） |
 | 2026-10-13 | **M1 群数据空间与调度底座完成并验收（D2 开工）**：T1.1 每群 SQLite 数据桶+迁移（89c8f17）、T1.0 RUNBOOK 小号边界（ff9cf59）、T1.3/T1.4 调度器+通知通道 dry_run（0387851）、T1.5 掉线积压追赶补读（插件 a866aad + 工具 d5eda50 `--before-id`）。合并态 build 干净、92/92 测试绿、工具仓库 29/29。账号模型确认：大号只拉人入群，读取只走小号库 |
 | 2026-10-13 | W5 管线合流完成并验收：source→`bus.ingest`→buffer→distiller→journal 端到端接通；修复 cordis 服务暴露（`ctx.provide`，Proxy 直赋抛错）与 CLI 子进程 cwd（keys.json 相对路径）；64 pass / 0 fail。本地 profile 观察模式运行（patch.yml 含机器路径不入库）。RUNBOOK 待补 |
+| 2026-10-16 | **HANDOFF-sender-autotarget 交付：定位闸（locate gate）落地**。广泛调研（REPORT-sender-autotarget-research.md）判死 AX 路线（本机 macOS 26.6.2 + 微信 4.1.13：hit-test -25208、focused 元素空——Qt a11y 桥三激活入口全部未实现；-25208/-25205 系 Chromium 机制指纹属预期），实证 B1 路线（截图+OCR 侧栏定位）闭环通过（负对照设计：切走→OCR 定位点击→闸转绿）。工具侧 wechat-ui 新增 `open` 子命令（Send.swift：主窗解析加固/真实前台确认/侧栏 340pt OCR 唯一精确命中才点击/滚动收集/already_open 幂等/标题核验）；插件侧 sender.ts 新增 locateGate（先于合规闸，deferred 不计 attempts，审计 locate_deferred 四分类 reason）。T1 实验过程产出 4 个生产级发现（多窗口主窗解析脆弱/后台 activate 不切 Space 点击必须验证前置/Retina 2x 换算/侧栏虚拟化）。379/379 测试绿 + build 干净。待：E2E 实战验收（PM 协调）后恢复 senderEnabled |
+| 2026-10-16 | **E2E 实战验收通过**：负对照态起始 → wechat-ui open 定位（OCR conf=1.0→点击→标题核验 opened，~3s）→ 粘贴 → 发送 → DB 回读命中（server_id=6515714820362366659，#le2e2a424）。新增 2 个发送段发现：① 本机微信 Enter/Cmd+Return 均不触发发送（"按 Enter 发送"设置关闭），实证解法 = OCR 定位"发送"按钮点击（一次成功）；② 窗口几何须实时求取（E2E 中主窗 1300→853pt 缩放致固定坐标失效）。上线前二选一：用户开启微信"按 Enter 键发送"（零代码）或 KeyboardSender 改发送按钮点击键序 |
+| 2026-10-16 | **发送段改版定稿（E2E 五连验证）**：合成 Return 对微信 4.x 输入框无效（真人 Enter 正常，HID post/postToPid/真实事件源全被吞）——KeyboardSender 真发段改为剪贴板 + spawn `wechat-ui deliver`（定位打开→OCR 锚定发送按钮→焦点点击输入区→Cmd+V→草稿复核→点击发送→清空轮询，deliver 子命令 E2E 全链成功 server_id=77053724277547179）。附带修复：SCStream 1x 小字条带须 2x 上采样 OCR；no-send 黑名单豁免 sender.ts（唯一受控出口）。379/379 绿 + build 干净。剩余：PM 恢复 senderEnabled 后实战观察一轮 |

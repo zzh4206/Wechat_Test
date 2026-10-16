@@ -9,9 +9,25 @@ vendor/*
 .npm-cache/
 spikes/
 sec-tests/
-# 安全经理工作线资产（审计台账，不入产品仓库）
-SECURITY-*.md
-ERROR-REFERENCE.md
+# 安全经理工作线资产：只为**审计台账**（含本地环境细节与真实群名）设置忽略，
+# 模式收窄到 SECURITY-REPORT-*，避免误伤 docs/SECURITY-TEST-PLAN.md——
+# 后者是五条红线的总纲与验收依据，属公开契约，应在仓库内（被 SECURITY.md 与 CODEOWNERS 引用）。
 SECURITY-REPORT-*.md
+ERROR-REFERENCE.md
 docs/SECURITY-REPORT-*.md
 *.tsbuildinfo
+
+# 本地运行配置：含真实群 ID / wxid / 机器路径，只放本地与 DSH profile，永不入库
+cordis.local.yml
+*.local.yml
+*.local.json
+*.local.md
+
+# 环境变量
+.env
+.env.*
+!.env.example
+
+# 编辑器
+.idea/
+.vscode/
