@@ -1,119 +1,163 @@
 # @zzh4206/dsh-group-lurker
 
-一个独立可复用的 [DeepSeek Harness（DSH）](https://github.com/deepseek-ai) Cordis 插件：**只读旁听微信群聊，按群维护独立上下文与人格，提炼关键信息并生成日志。**
+**简体中文** ｜ [English](README.en.md)
 
-> 仅支持 macOS 微信 4.x（本地 SQLCipher 库读取路线）。
-> **默认零读取、零发送**：白名单为空即拒绝启动；发送能力为「受控单出口」，默认关闭（详见[安全模型](#安全模型红线)）。
+[![CI](https://github.com/zzh4206/Wechat_Test/actions/workflows/ci.yml/badge.svg)](https://github.com/zzh4206/Wechat_Test/actions/workflows/ci.yml)
+[![MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Node](https://img.shields.io/badge/node-%E2%89%A524-brightgreen.svg)](package.json)
 
-## 特性
+只读旁听微信群聊的 [DSH](https://github.com/deepseek-ai) Cordis 插件：**按群维护独立人格，提炼话题 / 人物 / 金句，产出结构化日志与 Markdown 日报。**
 
-- **只读为默认**：经只读子进程读取微信本地库，永不写微信数据、永不动微信进程；`no-send` 静态哨兵扫描源码与编译产物，钉死"发送原语只允许出现在 `src/sender.ts`"
-- **受监管读取（管控三原则）**：
-  1. 默认全拒——`groups` 白名单为空即拒绝启动读取（fail-closed）
-  2. 白名单外的群在适配器层零子进程调用（测试断言）
-  3. 读取行为全程审计（`audit.log` 仅记元数据：时间、群、条数、成败，绝无消息内容）
-- **每群独立**：独立消息缓冲、独立人格（`personas/<name>.md`，可按群覆盖）
-- **昵称解析**：群消息自动映射 wxid → 群内显示名（备注名优先）
-- **增量游标**：持久化去重窗口，重启不重投、不漏新；默认不回灌历史
-- **日志产出**：`insights.jsonl`（话题摘要/人物/金句）+ 每日 Markdown 日报
+只支持 **macOS + 微信 4.x**（读取本地 SQLCipher 库）。
+
+**[30 秒速览](#30-秒速览)** ｜ [快速开始](#快速开始) ｜ [配置](#配置参考) ｜ [产出](#你会得到什么) ｜ [安全模型](#安全模型五条红线) ｜ [文档](#文档)
+
+---
+
+## 30 秒速览
+
+| | |
+|---|---|
+| **做什么** | 读你**自己电脑上已登录**的微信本地库 → 按群提炼 → `insights.jsonl` + 每日 Markdown 日报 |
+| **不做什么** | 不写微信数据、不动微信进程、不逆向通信协议、不读取密钥文件、默认不发消息 |
+| **默认状态** | 白名单为空即**拒绝启动**（fail-closed）；发送四道闸默认全关 |
+| **你需要** | macOS、微信 4.x、`sqlcipher`、取钥工具、DSH ≥ 0.2.0-rc.2 |
+| **产出在哪** | `$DSH_HOME/dsh-group-lurker/`（见[产出](#你会得到什么)） |
+
+## 设计原则
+
+1. **默认全拒** —— `groups` 白名单为空即拒绝启动；白名单外的群在适配器层**零子进程调用**（有测试断言钉死）
+2. **只读** —— 经只读子进程读取，永不写微信数据、永不动微信进程
+3. **每群独立** —— 独立消息缓冲 + 独立人格（`personas/<name>.md`，可按群覆盖）
+4. **全程可审计** —— `audit.log` 只记元数据（时间、群、条数、成败），**绝无消息内容**
 
 ## 前提条件
 
 | 依赖 | 说明 |
 |---|---|
-| DSH ≥ 0.2.0-rc.2 | 宿主 |
-| macOS 微信 4.x | 桌面客户端保持目标账号登录（读取其本地库） |
-| sqlcipher | `brew install sqlcipher` |
-| [macos-wechat-export](https://github.com/DaneelOlivaw1/macos-wechat-export) | 只读复用其取钥与读取 CLI；克隆后先跑 `bootstrap_keys.py` 完成取钥（产物 `.wechat-local/keys.json`，0600） |
+| DSH ≥ `0.2.0-rc.2` | 宿主 |
+| macOS 微信 4.x | 桌面客户端保持目标账号登录（读的是它的本地库） |
+| `sqlcipher` | `brew install sqlcipher` |
+| 取钥工具 | [macos-wechat-export](https://github.com/DaneelOlivaw1/macos-wechat-export)：只读复用其取钥与读取 CLI。克隆后先跑 `bootstrap_keys.py` 完成取钥，产物 `.wechat-local/keys.json`（`0600`） |
 
-## 安装
+## 快速开始
 
-在 DSH profile 目录（如 `~/.dsh/profiles/desktop`）：
+**1 · 装依赖**
+
+```bash
+brew install sqlcipher
+```
+
+**2 · 取本地库密钥**（产物 `.wechat-local/keys.json`，权限应为 `0600`）
+
+```bash
+git clone https://github.com/DaneelOlivaw1/macos-wechat-export.git
+cd macos-wechat-export && python3 bootstrap_keys.py
+```
+
+**3 · 装插件** —— 在 DSH profile 目录（如 `~/.dsh/profiles/desktop`）：
 
 ```bash
 pnpm add --config.auto-install-peers=false file:/path/to/dsh-group-lurker
-# 或从 git：
+# 或直接从 git：
 pnpm add --config.auto-install-peers=false git+https://github.com/zzh4206/Wechat_Test.git
 ```
 
-然后在 profile 的 `cordis.patch.yml` 追加：
+**4 · 写配置，重启 DSH** —— 在 profile 的 `cordis.patch.yml` 追加：
 
 ```yaml
 - id: group-lurker
   name: "@zzh4206/dsh-group-lurker"
   config:
     groups:
-      - "12345678@chatroom"   # 白名单：群 chatId（用工具的 resolve <群名> 查）
+      - "12345678@chatroom"          # 白名单：群 chatId（用取钥工具的 resolve <群名> 查）
     source: wechat-db
-    sourceToolDir: /path/to/macos-wechat-export   # 必填，无默认值
+    sourceToolDir: /path/to/macos-wechat-export                        # 必填，无默认值
     sourceDbRoot: ~/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/<wxid_hash>/db_storage  # 必填，无默认值
-    sourcePython: /opt/homebrew/bin/python3.14    # 建议绝对路径
+    sourcePython: /opt/homebrew/bin/python3               # 建议绝对路径
 ```
 
-重启 DSH（或等 patch 热加载）即生效。插件状态目录默认 `DSH_HOME/dsh-group-lurker/`。
+重启 DSH（或等 patch 热加载）即生效。
+
+> **`source` 的语义**：`none`（默认，不读取任何东西）／`wechat-db`（读本地库）。选后者必须显式配置 `sourceToolDir`、`sourceDbRoot`、`sourcePython` 三项——**没有隐式默认值，缺一项就启动失败**，这是刻意的。
 
 ## 配置参考
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `groups` | `[]` | **白名单**。空 = 拒绝读取（fail-closed） |
-| `source` | `none` | `none`（不读取）\| `wechat-db`（本地库读取）。选后者必须显式配置下列三项 |
-| `sourceToolDir` | —（必填） | macos-wechat-export 工具目录 |
+| `source` | `none` | `none`（不读取）｜`wechat-db`（本地库读取） |
+| `sourceToolDir` | —（必填） | 取钥工具目录 |
 | `sourceDbRoot` | —（必填） | 微信 `db_storage` 绝对路径 |
 | `sourcePython` | `python3` | python 解释器 |
 | `pollIntervalSec` | `10` | 轮询间隔（秒） |
 | `readLimit` | `50` | 每次读取条数 |
-| `backfillOnStart` | `0` | 启动回灌条数（受监管原则：默认不回灌） |
+| `backfillOnStart` | `0` | 启动回灌条数（受监管原则：默认不回灌历史） |
 | `bufferSize` | `60` | 每群环形缓冲 |
 | `distillEveryMessages` | `25` | 每攒 N 条触发一次 LLM 提炼 |
 | `distillIntervalMin` | `15` | 定时提炼间隔（分钟） |
-| `retentionDays` | `90` | **消息留存天数**：`store.db` 中 `ts` 早于该天数的 messages 行会被滚动删除（`events`/`tasks`/`promises`/`files` 不受影响）。**数据最小化入口**——本地存的是真实聊天记录，不需要留 90 天就调小 |
+| `retentionDays` | `90` | **消息留存天数**：`store.db` 中 `ts` 早于该天数的 messages 行滚动删除（`events`/`tasks`/`promises`/`files` 不受影响）。**数据最小化入口**——本地存的是真实聊天记录，不需要留 90 天就调小 |
 | `persona` | `default` | 默认人格名 |
-| `groupPersonas` | `{}` | 按群人格覆盖：chatId → 人格名 |
+| `groupPersonas` | `{}` | 按群人格覆盖：`chatId → 人格名` |
 | `stateDir` | `DSH_HOME/dsh-group-lurker` | 状态目录 |
 
-状态目录内容：`insights.jsonl`（提炼结果）、`report-YYYY-MM-DD.md`（日报）、`audit.log`（读取审计）、`cursor.json`（增量游标）、`personas/`（人格）。
+## 你会得到什么
 
-## 成本可观测（T9）
+状态目录（默认 `$DSH_HOME/dsh-group-lurker/`）：
 
-每份报告的末尾统计行写明本次生成用了什么模型、花了多少 token、多少钱：
-
-```
-> 统计：批 2（失败 0）· 最大批耗时 31.4 s · 缓存命中 0 · LLM 调用 3 次 / 45.2 s · 模型 glm-5.3 · 输入 ~12.3k / 输出 ~4.5k tok · ≈¥0.0223
-```
-
-- **数据来源**：每次 `llm.complete` 落一行结构化 JSON 到 `groups/<chatId>/llm-calls.jsonl`（含 `model / inTokens / outTokens / costCny / tokensEst` 五个成本字段）；报告尾统计行 = 当次生成的累计。
-- **token 计量口径**：宿主 LLM 回传 usage 时用真实值（此时统计行不带 `~`）；当前生产路径（complete/chat → stream → openai 兼容 fetch）只回传纯文本、拿不到 usage，因此默认按智谱官方换算估算——**GLM token : 汉字 ≈ 1 : 1.6，即 tokens ≈ 字符数 ÷ 1.6**。估算值一律带 `tokensEst: true` 标记、统计行带 `~`，与真实值可区分。
-- **费用口径**：`costCny = 输入 tokens/1M × input 价 + 输出 tokens/1M × output 价`，保留 4 位小数（日级费用常在分厘级）；费用恒带 `≈`（价格表可能滞后于供应商调价）。未知模型费用记 0 并 warn 提示一次"未配置价格"。
-- **价格表配置 `llmPricing`**（键 = 模型名，值 = 元/百万 tokens；**调价只改配置，不动代码**）：
-
-```yaml
-llmPricing:
-  glm-5.3: { input: 8, output: 28 }        # 智谱官方定价页 2026-10 抓取
-  glm-5.3-flash: { input: 0.8, output: 2.8 }
+```text
+├── audit.log                      读取审计：时间 / 群 / 条数 / 成败（无消息内容）
+├── cursor.json                    增量游标：重启不重投、不漏新
+├── groups/<chatId>/
+│   ├── insights.jsonl             提炼结果（话题 / 人物 / 金句）
+│   ├── llm-calls.jsonl            每次 LLM 调用的成本记录
+│   └── store.db                   消息库（受 retentionDays 滚动清理）
+├── reports/<chatId>/YYYY-MM-DD.md 每日日报（含尾部成本统计行）
+├── outbox.jsonl                   出站队列：草稿与通知落这里，发送闸门默认全关 → 只入队不发出
+├── notify/ retention/ scheduler/  通知审计 / 留存审计 / 调度状态
+└── wechat-db.lock                 读取互斥锁
 ```
 
-默认值即上表；**以供应商页面为准**：[智谱官方定价页](https://docs.bigmodel.cn/cn/guide/start/pricing)。模型名取自 `llmModel` 配置（空 = `glm-5.3`）。
+日报末尾自带成本统计行，模型、token、花费一目了然：
 
-**费用汇总**：`node scripts/llm-cost.mjs`（默认本月；`--month` / `--day` / `--chat` / `--state` 过滤）输出每群 × 每日费用表 + 合计。费用按未命中缓存价计 = 保守上界（实际命中 prompt cache 时更低）。更多示例见 RUNBOOK §7.11。
+```text
+> 统计：窗口 2026-10-16 至 2026-10-16，消息 2 条，话题 0 个，引用 2 条。
+> 统计：批 1（失败 0）· 最大批耗时 0.0 s · 缓存命中 0 · LLM 调用 1 次 / 5.6 s · 模型 glm-5.3 · 输入 ~618 / 输出 ~178 tok · ≈¥0.0099
+```
 
-### 两段式生成实验开关（T8 `schemaTwoStage`）
+- **token 口径**：宿主回传 usage 时用真实值；拿不到 usage 时按 GLM 官方换算估算（**汉字 : token ≈ 1 : 1.6**），估算值带 `~` 前缀与 `tokensEst: true` 标记，可与真实值区分
+- **费用口径**：`costCny = 输入/1M × input 价 + 输出/1M × output 价`，恒带 `≈`（价格表可能滞后于供应商调价）
+- **调价不改代码**：改 `llmPricing` 配置即可（键 = 模型名，值 = 元/百万 token），默认值取自[智谱官方定价页](https://docs.bigmodel.cn/cn/guide/start/pricing)
+- **费用汇总**：`node scripts/llm-cost.mjs`（默认本月；`--month` / `--day` / `--chat` / `--state` 过滤）
+- 计费细节与两段式生成实验开关（`schemaTwoStage`）：[docs/RUNBOOK.md](docs/RUNBOOK.md) §7.11、[docs/TECH-DESIGN-llm-overload-mitigation.md](docs/TECH-DESIGN-llm-overload-mitigation.md)
 
-报告生成的每次 LLM 调用默认是"一步出 JSON"——金字塔 schema + 字段断言属强格式约束。实验依据（EMNLP 2024 Industry《Let Me Speak Freely?》）：格式约束越严，模型推理性能下降越大。开关打开后（默认 `false` = 零变化），report 生成路径（map 批 / merge 合并 / refine 段）的每次调用拆两步：第一步输出**无 schema 约束的自由文本归纳**（保留消息序号 n 供溯源），第二步独立调用把自由文本**格式化为既有 schema**（小输入、无超时风险），再走既有断言与降级链路。两步都进 `llm-calls.jsonl` 与报告尾统计行（phase 沿用原值），成本天然可见——**如何对比观察**：同一窗口分别在 `schemaTwoStage: false / true` 下生成（或结合 `reportPipeline: 'ab'` 双跑），对照报告尾"LLM 调用次数/费用"行与归纳质量（连贯性、evidence 溯源命中率）人工评审；开关仅作用于 report，distiller 不受影响。
+## 安全模型：五条红线
 
-## 安全模型（红线）
-
-五条红线，任何一条被测试击穿即为 **P0 事故**、必须停止发版。完整基线、威胁模型与验收矩阵见 **[docs/SECURITY-TEST-PLAN.md](docs/SECURITY-TEST-PLAN.md)**。
+任何一条被测试击穿即为 **P0 事故**，必须停止发版。完整基线、威胁模型与验收矩阵见 **[docs/SECURITY-TEST-PLAN.md](docs/SECURITY-TEST-PLAN.md)**。
 
 | # | 红线 | 实现锚点 |
 |---|---|---|
-| **R1** | **受控单出口**：微信发送仅允许 `src/sender.ts` 一个模块、仅 filehelper 一个通道（`ALLOWED_CHANNELS` 代码级硬编码）；四道闸 = 总闸 `senderEnabled`（默认 `false`）+ `sendDryRun`（默认 `true`）+ 通道闸 + 交互闸（前台 + 用户空闲）+ 合规闸（OCR 核验当前会话）；另有频控 `maxSendsPerDay`、重试 ≤3 防风暴、审计只记元数据。**sender.ts 以外任何模块出现发送原语 = P0** | `src/sender.ts` + `no-send` 哨兵 |
+| **R1** | **受控单出口**：发送仅允许 `src/sender.ts` 一个模块、仅 filehelper 一个通道（代码级硬编码）。四道闸 = 总闸（`senderEnabled` 默认 `false` + `sendDryRun` 默认 `true`）、通道闸、交互闸（前台 + 用户空闲）、合规闸（OCR 核验当前会话）；另有频控与重试上限防风暴，审计只记元数据。**`sender.ts` 以外任何模块出现发送原语 = P0** | `src/sender.ts` + `no-send` 哨兵 |
 | **R2** | **默认全拒**：白名单为空或未列出的群 → 零读取、零子进程调用 | `src/source/wechat-db.ts` 构造闸门 + `gate()` |
-| **R3** | **路径围栏**：所有 fs 写入必须落在 `stateDir` 内 | `src/guard.ts` `assertInsideState()` + `src/store.ts` 唯一写入点 |
-| **R4** | **注入隔离**：消息原文永远只是数据，不是指令 | `src/guard.ts` `sanitize()` + distiller 指令区/数据区分离 |
+| **R3** | **路径围栏**：所有 fs 写入必须落在 `stateDir` 内 | `assertInsideState()` + `src/store.ts` 唯一写入点 |
+| **R4** | **注入隔离**：消息原文永远只是数据，不是指令 | `sanitize()` + 指令区/数据区分离 |
 | **R5** | **密钥零接触**：不读取、不复制、不打印 `keys.json`，不写微信数据 | 子进程经外部 CLI，密钥由工具自解析；解密经 stdin（不进命令行参数） |
 
-其它边界：不逆向微信通信协议；不修改微信客户端；UI 自动化发送仅走上面 R1 的受控通道。
+其它边界：不逆向微信通信协议、不修改微信客户端；UI 自动化发送仅走 R1 的受控通道。
+
+## 文档
+
+| 文档 | 内容 |
+|---|---|
+| [docs/README.md](docs/README.md) | **文档索引，从这里进** |
+| [docs/RUNBOOK.md](docs/RUNBOOK.md) | 安装 / 授权 / 白名单 / 审计 / 卸载 / 排障 |
+| [docs/SECURITY-TEST-PLAN.md](docs/SECURITY-TEST-PLAN.md) | 五条红线的总纲与验收矩阵 |
+| [SECURITY.md](SECURITY.md) | 安全政策与漏洞上报 |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | 贡献方式与提交规范 |
+| [AGENTS.md](AGENTS.md) | 给本仓库 AI agent 的硬性约束（提交前必跑什么、不能碰什么） |
+| [CHANGELOG.md](CHANGELOG.md) / [docs/PROGRESS.md](docs/PROGRESS.md) | 版本变更 / 开发进度日志 |
+
+> 历史：第一代 `im-connect` 路线的 vendor 副本已于 2026-10-13 删除（路线淘汰）；`vendor/` 现仅保留 `macos-wechat-export` 的已提交快照（见 `vendor/VENDOR-NOTE.md`）。
 
 ## 开发
 
@@ -125,13 +169,18 @@ npm test        # node --test，379 例，全离线 mock，不碰真实库
 
 > 测试导入的是**编译产物 `lib/`**，所以改完 `src/` 必须先 `npm run build` 再 `npm test`。
 
-- **文档索引（从这里进）**：[docs/README.md](docs/README.md)
-- 安装 / 授权 / 白名单 / 审计 / 卸载：[docs/RUNBOOK.md](docs/RUNBOOK.md)
-- 安全政策与漏洞上报：[SECURITY.md](SECURITY.md)
-- 贡献方式与提交规范：[CONTRIBUTING.md](CONTRIBUTING.md)
-- 版本变更：[CHANGELOG.md](CHANGELOG.md)
-- 开发进度日志：[docs/PROGRESS.md](docs/PROGRESS.md)
-- 历史：第一代 im-connect 路线的 vendor 参考副本已于 2026-10-13 删除（路线淘汰）
+提交前**必须**先跑敏感信息扫描，否则 CI 会拦：
+
+```bash
+./scripts/check-sensitive.sh
+```
+
+## 免责声明
+
+- 本工具仅用于**读取你自己有权限访问的本地数据**，供**个人备份与研究**使用
+- 请遵守微信用户协议与所在地法律；不得用于监控他人、抓取第三方数据或任何未经授权的场景
+- 本工具**不包含**破解通信协议、绕过鉴权或伪造登录态的能力；读取依赖你本机已登录的客户端与本地库密钥
+- 使用本工具产生的一切后果由使用者自行承担
 
 ## License
 
