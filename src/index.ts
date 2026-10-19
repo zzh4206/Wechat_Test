@@ -9,9 +9,11 @@
  */
 import type { Context } from '@deepseek-ai/cordis'
 import Schema from '@deepseek-ai/schemastery'
-import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { existsSync as fsExistsSync, readdirSync as fsReaddirSync, statSync as fsStatSync } from 'node:fs'
+import { execFile } from 'node:child_process'
 import { Store } from './store.js'
+import { defaultDbPath } from './db/mirror.js'
 import type { StoreLogger } from './store.js'
 import { PersonaService } from './persona.js'
 import { TokenBucket } from './guard.js'
@@ -46,6 +48,8 @@ import { ReminderService } from './reminder.js'
 import { PromiseRecognitionService, PromiseReminderService } from './promise-track.js'
 import type { PromiseEvent } from './promise-track.js'
 import { FileIndexService, linkFilesToEvents } from './file-index.js'
+import { createAccountGate, listAccounts, sampleAccount, diffActivity, wxidFromDbRoot, XWECHAT_FILES_REL, type FsLike } from './account-probe.js'
+import { homedir } from 'node:os'
 // M6：保留期清理（T1.1 遗留）+ A/B 脚手架类型（新增行，不动他人行）
 import { RetentionService } from './retention.js'
 import { WechatDbSource } from './source/wechat-db.js'
@@ -125,6 +129,8 @@ export interface PluginConfig {
   followupDraftEnabled: boolean
   /** M6-T1：messages 滚动保留天数（默认 90；长期表 events/tasks/promises/files 不动） */
   retentionDays: number
+  /** v0.3 SQLite 知识库镜像路径；'' = 默认 ~/WeChat/1数据/knowledge.db，'off' = 关闭镜像 */
+  sqlitePath: string
   /** M6-T5：提炼落地形式标签（'fused' | 'split'；仅作 A/B 对比脚手架的记录标签） */
   distillMode: string
   /** M6-T4：识别 confidence 门槛（默认 0 = 现行为全落库待确认；只作用于 events） */
@@ -163,6 +169,8 @@ export interface PluginConfig {
   allowTakeFocus: boolean
   idleSkipBelowSec: number
   batchThreshold: number
+  accountWhitelist: string[]
+  allowAutoRekey: boolean
   /** T4：自适应批大小（默认 true：timeout 压缩 ×0.7 / 连续成功扩张 ×1.2，按群按 kind 持久化；false = 固定 batchThreshold 回退通道） */
   adaptiveBatch: boolean
   /** T7：报告归纳管线（'map-reduce' | 'refine' | 'ab'；默认 'map-reduce' 安全默认，BooookScore 修正案不预设 B 优） */
@@ -227,6 +235,7 @@ export const Config: Schema<PluginConfig> = Schema.object({
   fileIndexEnabled: Schema.boolean().default(false).description('M5 文件索引（默认关）：文件类消息入库 + 类型归类 + 上下文摘要 + 版本链 + 星标'),
   followupDraftEnabled: Schema.boolean().default(false).description('M5 逾期催办草稿（默认关）：生成得体话术草稿落 outbox 供复制，绝不发送'),
   retentionDays: Schema.number().default(90).description('M6 messages 滚动保留天数（默认 90）：每日清理一次，长期表（事件/任务/承诺/文件）不动'),
+  sqlitePath: Schema.string().default('').description("v0.3 SQLite 知识库镜像路径（JSONL 仍为事实源；镜像写失败只 warn 不影响主流程）。留空 = ~/WeChat/1数据/knowledge.db；'off' = 关闭镜像"),
   distillMode: Schema.string().default('fused').description("M6 提炼落地形式标签：fused | split（仅记录标签供 A/B 对比；切换决策待运行期定夺）"),
   minTaskConfidence: Schema.number().default(0).description('M6 识别 confidence 门槛（默认 0 = 现行为：全部落库待确认；低于门槛的事件识别丢弃）'),
   fulfilConfidence: Schema.number().default(0.5).description('M6 承诺兑现软关联 confidence 阈值（默认 0.5 = 现行为；低于只提示不自动置已兑现）'),
@@ -250,7 +259,10 @@ export const Config: Schema<PluginConfig> = Schema.object({
     verifyRetries: Schema.number().default(4).description('DB 回读验证尝试次数（默认 4；穷尽仍未命中才判 failed_wrong_target）'),
   chatVerifyRetries: Schema.number().default(2).description('发送前合规闸（wechat-ui read 标题核验，防误发）失败重试次数（默认 2 = 共 3 次；全失败 deferred 不发不计 attempts）'),
   allowTakeFocus: Schema.boolean().default(false).description('抢前台模式（默认 false = 微信非前台跳过本轮，人在电脑前模式）。true = 全自动无人值守：自动激活微信前台发送，但系统空闲 <10s（用户正在打字/操作）仍让路跳过'),
-  idleSkipBelowSec: Schema.number().default(10).description('用户空闲让路阈值秒（默认 10 = 系统空闲 <10s 视为正在操作→跳过本轮让路；0 = 不让路，空闲检测失效直接抢前台发送。日常单日报场景可设 0——每天一次的抢前台可接受；频繁发送建议保持 10）'),
+  accountWhitelist: Schema.array(Schema.string()).default([]).description('账号白名单 wxid 数组（账号生命周期自动化，fail-closed 同 groups 语义：白名单外账号活跃 → sender 全面挂起+取钥硬阻断）。空 = 仅允许 sourceDbRoot 派生的默认账号'),
+    activeAccountWxid: Schema.string().default('').description('配置账号 wxid（账号生命周期自动化；空 = 从 sourceDbRoot 路径派生 wxid 段；派生不出且未显式配置 = 探针关闭零变化）'),
+  allowAutoRekey: Schema.boolean().default(false).description('小号回归自动取钥（默认 false：只通知人工执行 bootstrap_keys.py）。true = 自动执行取钥+验证。开启前必须人工成功手跑一次取钥（两段式安全条件，见 RUNBOOK）'),
+    idleSkipBelowSec: Schema.number().default(10).description('用户空闲让路阈值秒（默认 10 = 系统空闲 <10s 视为正在操作→跳过本轮让路；0 = 不让路，空闲检测失效直接抢前台发送。日常单日报场景可设 0——每天一次的抢前台可接受；频繁发送建议保持 10）'),
   maxSendsPerDay: Schema.number().default(20).description('每日发送上限（默认 20；超限的当日 pending 标 skipped_quota 防风暴）'),
   wechatUiPath: Schema.string().default('wechat-ui').description('wechat-ui 可执行文件（PATH 解析；建议绝对路径，如 /path/to/macos-wechat-export/wechat-ui）'),
   composerTop: Schema.number().default(0.7).description('wechat-ui --composer-top（默认 0.70；务必按 UI_GUIDE 用 read --snapshot 实测校准）'),
@@ -327,7 +339,10 @@ export function apply(ctx: Context, config: PluginConfig): void {
   const logger = ctx.logger(name)
   const stateDir = resolveStateDir(config.stateDir ?? '')
 
-  const store = new Store(stateDir, logger)
+  // v0.3 双写镜像：SQLite 是查询层、JSONL 仍是事实源；镜像写失败只 warn，绝不影响主流程。
+  // 'off' 显式关闭；路径打开失败时 createSqliteMirror 自降级为 null（零镜像）。
+  const mirrorPath = config.sqlitePath === 'off' ? undefined : (config.sqlitePath || defaultDbPath())
+  const store = new Store(stateDir, logger, mirrorPath)
   // 初始化即建目录；失败只记日志，不阻断宿主。
   store.ensureDir('.')
 
@@ -360,6 +375,52 @@ export function apply(ctx: Context, config: PluginConfig): void {
   // —— 红线升级（2026-10-14）：filehelper 发送 worker（默认 senderEnabled=false 零活动；
   //    sendDryRun=true 只定位不发送；通道白名单在 sender.ts 代码级硬编码为 filehelper；
   //    sendMethod 默认 'keyboard'（wx-chatbot 式键盘模拟 + DB 回读验证，TCC 只需辅助功能）。 ——
+  // 账号生命周期闸（白名单制，fail-closed 同 groups 语义）：
+  // accountWhitelist 显式配置优先；空 = 仅允许 sourceDbRoot 派生的默认账号（向后兼容）。
+  // 都派生不出 = 探针关闭零变化。红线：取钥 db-root 代码级锁定配置账号目录（∈ 白名单才建闸）。
+  const defaultWxid = wxidFromDbRoot(config.sourceDbRoot ?? '')
+  const accountWhitelist = config.accountWhitelist.length > 0 ? config.accountWhitelist : defaultWxid ? [defaultWxid] : []
+  const rekeyWxid = defaultWxid ?? (accountWhitelist[0] ?? '')
+  const accountGate = accountWhitelist.length > 0 && rekeyWxid !== ''
+    ? createAccountGate({
+        root: join(homedir(), XWECHAT_FILES_REL),
+        whitelist: accountWhitelist,
+        accountDir: join(homedir(), XWECHAT_FILES_REL, rekeyWxid),
+        fs: { existsSync: fsExistsSync, readdirSync: fsReaddirSync, statSync: fsStatSync },
+        allowAutoRekey: config.allowAutoRekey,
+        windowMs: 2000,
+        sleepMs: (ms) => new Promise<void>((r) => setTimeout(r, ms)),
+        notify: (message) => logger.warn(`notify: ${message}`),
+        warn: (message) => logger.warn(message),
+        error: (message) => logger.error(message),
+        runRekey: (dbRoot) =>
+          new Promise((resolve2, reject2) => {
+            execFile(
+              config.sourcePython ?? 'python3',
+              [join(config.sourceToolDir ?? '', 'bootstrap_keys.py'), '--acknowledge-debug-copy', '--db-root', dbRoot],
+              { timeout: 15 * 60_000 },
+              (error: unknown, stdout: string, stderr: string) => {
+                if (error && (error as { code?: number | string }).code === undefined) reject2(error)
+                else resolve2({ code: Number((error as { code?: number })?.code ?? 0), stdout: String(stdout), stderr: String(stderr) })
+              },
+            )
+          }),
+        runVerify: (dbRoot) =>
+          new Promise((resolve2, reject2) => {
+            execFile(
+              config.sourcePython ?? 'python3',
+              [join(config.sourceToolDir ?? '', 'wechat_db.py'), '--db-root', dbRoot, '--key-file', join(config.sourceToolDir ?? '', '.wechat-local/keys.json'), 'verify'],
+              { timeout: 60_000 },
+              (error: unknown, stdout: string, stderr: string) => {
+                if (error && (error as { code?: number | string }).code === undefined) reject2(error)
+                else resolve2({ code: Number((error as { code?: number })?.code ?? 0), stdout: String(stdout), stderr: String(stderr) })
+              },
+            )
+          }),
+      })
+    : null
+
+
   const sender = new SenderService({
     outbox,
     store,
@@ -376,6 +437,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
     systemIdleSec: defaultSystemIdleSec,
     allowTakeFocus: config.allowTakeFocus,
     idleSkipBelowSec: config.idleSkipBelowSec,
+    accountGate: accountGate ?? undefined,
     intervalSec: config.sendIntervalSec,
     verifyDelaySec: config.verifyDelaySec,
     verifyRetries: config.verifyRetries,

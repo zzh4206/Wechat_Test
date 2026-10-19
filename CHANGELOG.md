@@ -10,6 +10,7 @@
 
 - schema v0.4（会话维度 + media 表）：`report` 增列 `chat_id`（`'aggregate'`=跨群聚合），冲突键改三元组 `(period_type, period_start, chat_id)`；新增 `media` 元数据表（媒体本体永不入库，`path_kind`、status 三态、`source_key` 幂等键）；`KnowledgeDao` 增 `upsertMedia` / `listMediaByChat`，`upsertReport` 带 `chatId`
 - schema 自动迁移（`db.ts openDb`）：`user_version` 3→4 单事务幂等（report 重建回填 `chat_id='aggregate'`、建 media 表），0=全新建 v4，>4 报错拒开，与 Python 侧逻辑一致
+- 双写镜像接入主入口（`index.ts apply`）：新增配置 `sqlitePath`（留空 = 默认 `~/WeChat/1数据/knowledge.db`；`'off'` 关闭）。SQLite 为查询层、JSONL 仍为事实源，镜像写失败只 warn 不影响主流程
 
 ### Changed
 
