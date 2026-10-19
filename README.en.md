@@ -148,21 +148,21 @@ Other boundaries: the wire protocol is never reversed and the WeChat client is n
 
 ## Knowledge-base template and local data
 
-This repository also carries a self-contained knowledge-base template, [`0数据格式/`](0数据格式/README.md): a three-layer SQLite schema (documents `doc` + journal `report`/`entry` + chat digests `chat_digest`) with three tools — `make_template.py` (idempotently builds the template and a synthetic sample), `report_cli.py` (entries / daily-weekly-monthly reports / document management) and `export_md.py` (Markdown export tree).
+This repository also carries a self-contained knowledge-base template, [`0数据格式/`](0数据格式/README.md): a three-layer SQLite schema (documents `doc` + journal `report`/`entry` + chat digests `chat_digest`) with three tools — `make_template.py` (idempotently builds the template), `report_cli.py` (entries / daily-weekly-monthly reports / document management) and `export_md.py` (Markdown export tree). **No data is ever entered into the template itself** — data entry happens only in the local `1数据/`.
 
-**Its whole purpose is leak prevention** — real data and the publishable template are physically separated:
+**Its whole purpose is leak prevention** — the template and the data are physically separated, and writing happens exclusively in `1数据/`:
 
 | Location | Contents | Git status |
 |---|---|---|
-| `0数据格式/` | Template schema, tools, **synthetic sample data** (`sample.db`) | Published with this repo ✓ |
-| `1数据/` (local machine only) | **Where real data lands** — schema reuses the template, stored locally only | **Never committed** (ignored; do not `git init` it either) |
+| `0数据格式/` | **Pure template**: schema, tools, documentation. **Nothing is ever entered into it** — `.db` files are local build artifacts and are not committed | Published with this repo ✓ |
+| `1数据/` (local machine only) | **The only place data is ever entered** — schema reuses the template, real data stays local | **Never committed** (ignored; do not `git init` it either) |
 
 Rules (full red lines in [`0数据格式/PRIVACY.md`](0数据格式/PRIVACY.md)):
 
 - Real wxids, chat records and exports may **only** live in `1数据/`; never copy them anywhere inside the repository
 - `chat_digest` stores distilled **points only**, never raw chat text; `source_key` provides idempotent deduplication
 - External writers must follow: frozen field names, `PRAGMA foreign_keys = ON`, short transactions, **single-writer principle**
-- As a result, **cloning this repository is safe for anyone** — all you get is the template and synthetic data
+- As a result, **cloning this repository is safe for anyone** — it contains only the schema, tools and documentation, never any data files
 
 ## Documentation
 
