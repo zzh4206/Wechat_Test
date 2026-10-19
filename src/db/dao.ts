@@ -1,0 +1,313 @@
+/**
+ * dao.ts：知识库 CRUD（冻结 schema 上的薄封装）。
+ * 幂等语义：
+ * - upsertDoc：content_hash 命中已有行 → 返回已有 id、不覆盖（DESIGN 修订2「拒绝重复」语义）；
+ * - upsertReport：(period_type, period_start) 命中 → UPDATE 正文等（修订1「UPDATE 而非删建」）；
+ * - insertChatDigest：source_key 命中 → UPDATE（schema UNIQUE 幂等键）。
+ * 全部写路径失败只 warn 返回 null/false，不抛致命错误。
+ */
+import type { DatabaseSync } from 'node:sqlite'
+import { createHash } from 'node:crypto'
+import { normalizeText, withTransaction, type DbLogger } from './db.js'
+import type {
+  ChatDigestInput,
+  ChatDigestRow,
+  DocInput,
+  DocRow,
+  EntryInput,
+  EntryRow,
+  ReportFullRow,
+  ReportInput,
+  ReportRow,
+} from './types.js'
+
+export { normalizeText }
+
+/** 归一化后取 SHA-256 hex（去 BOM、CRLF→LF、strip；DESIGN.md 修订2） */
+export function contentHash(text: string): string {
+  return createHash('sha256').update(normalizeText(text), 'utf8').digest('hex')
+}
+
+/** 8 位短哈希（外部 source_key 用，如 'topic:2026-01-05:ab12cd34'） */
+export function hash8(text: string): string {
+  return contentHash(text).slice(0, 8)
+}
+
+export class KnowledgeDao {
+  constructor(
+    private readonly db: DatabaseSync,
+    private readonly logger: DbLogger,
+  ) {}
+
+  private now(): number {
+    return Date.now()
+  }
+
+  // ---------- doc ----------
+
+  /** 幂等插入资料：content_hash 命中 → 返回已有 id；非法输入/写失败 → null */
+  upsertDoc(input: DocInput): number | null {
+    if (!input.title) return null
+    const contentMd = input.contentMd?.trim() ? input.contentMd : null
+    const hash = contentMd ? contentHash(contentMd) : null
+    try {
+      if (hash) {
+        const hit = this.db
+          .prepare('SELECT id FROM doc WHERE content_hash = ? LIMIT 1')
+          .get(hash) as { id: number } | undefined
+        if (hit) return hit.id
+      }
+      const now = input.createdAt ?? this.now()
+      const res = this.db
+        .prepare(
+          `INSERT INTO doc (title, category, source_type, source_ref, file_path, content_md, content_hash, status, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          input.title,
+          input.category ?? null,
+          input.sourceType ?? 'manual',
+          input.sourceRef ?? null,
+          input.filePath ?? null,
+          contentMd,
+          hash,
+          input.status ?? 'active',
+          now,
+          now,
+        )
+      return Number(res.lastInsertRowid)
+    } catch (error) {
+      this.logger.warn(`dao.upsertDoc failed: ${String(error)}`)
+      return null
+    }
+  }
+
+  getDoc(id: number): DocRow | null {
+    try {
+      return (this.db.prepare('SELECT * FROM doc WHERE id = ?').get(id) as DocRow | undefined) ?? null
+    } catch {
+      return null
+    }
+  }
+
+  /** 给资料打标签（tag/doc_tag 幂等：INSERT OR IGNORE） */
+  tagDoc(docId: number, tagName: string): boolean {
+    try {
+      this.db.prepare('INSERT OR IGNORE INTO tag (name) VALUES (?)').run(tagName)
+      const tag = this.db.prepare('SELECT id FROM tag WHERE name = ?').get(tagName) as { id: number }
+      this.db.prepare('INSERT OR IGNORE INTO doc_tag (doc_id, tag_id) VALUES (?, ?)').run(docId, tag.id)
+      return true
+    } catch (error) {
+      this.logger.warn(`dao.tagDoc failed: ${String(error)}`)
+      return false
+    }
+  }
+
+  /** 按标签查资料 */
+  listDocsByTag(tagName: string): DocRow[] {
+    try {
+      return this.db
+        .prepare(
+          `SELECT d.* FROM doc d
+           JOIN doc_tag dt ON dt.doc_id = d.id
+           JOIN tag t ON t.id = dt.tag_id
+           WHERE t.name = ? ORDER BY d.id`,
+        )
+        .all(tagName) as unknown as DocRow[]
+    } catch {
+      return []
+    }
+  }
+
+  // ---------- entry ----------
+
+  insertEntry(input: EntryInput): number | null {
+    try {
+      const res = this.db
+        .prepare(
+          `INSERT INTO entry (ts, kind, content_md, report_id, doc_id, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(input.ts, input.kind ?? 'note', input.contentMd, input.reportId ?? null, input.docId ?? null, input.createdAt ?? this.now())
+      return Number(res.lastInsertRowid)
+    } catch (error) {
+      this.logger.warn(`dao.insertEntry failed: ${String(error)}`)
+      return null
+    }
+  }
+
+  /** entry 无业务唯一键；导入器等幂等场景用 (ts, kind, content_md) 精确查重 */
+  findEntry(ts: number, kind: string, contentMd: string): EntryRow | null {
+    try {
+      return (
+        (this.db
+          .prepare('SELECT * FROM entry WHERE ts = ? AND kind = ? AND content_md = ? LIMIT 1')
+          .get(ts, kind, contentMd) as EntryRow | undefined) ?? null
+      )
+    } catch {
+      return null
+    }
+  }
+
+  /** 未归档条目（report_id IS NULL，走部分索引） */
+  listEntriesPending(limit = 200): EntryRow[] {
+    try {
+      return this.db
+        .prepare('SELECT * FROM entry WHERE report_id IS NULL ORDER BY ts LIMIT ?')
+        .all(limit) as unknown as EntryRow[]
+    } catch {
+      return []
+    }
+  }
+
+  /** 按周期（起止日期，含端点）取条目 */
+  listEntriesByRange(startTs: number, endTs: number): EntryRow[] {
+    try {
+      return this.db
+        .prepare('SELECT * FROM entry WHERE ts >= ? AND ts < ? ORDER BY ts')
+        .all(startTs, endTs) as unknown as EntryRow[]
+    } catch {
+      return []
+    }
+  }
+
+  // ---------- report ----------
+
+  /** 幂等 upsert：UNIQUE(period_type, period_start) 冲突 → UPDATE 正文 */
+  upsertReport(input: ReportInput): number | null {
+    try {
+      const now = input.createdAt ?? this.now()
+      const res = this.db
+        .prepare(
+          `INSERT INTO report (period_type, period_start, period_end, title, content_md, status, doc_ids_hint, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (period_type, period_start) DO UPDATE SET
+             period_end = excluded.period_end,
+             title = excluded.title,
+             content_md = excluded.content_md,
+             status = excluded.status,
+             doc_ids_hint = excluded.doc_ids_hint,
+             updated_at = excluded.updated_at`,
+        )
+        .run(
+          input.periodType,
+          input.periodStart,
+          input.periodEnd,
+          input.title,
+          input.contentMd,
+          input.status ?? 'draft',
+          input.docIdsHint ?? null,
+          now,
+          now,
+        )
+      const row = this.getReport(input.periodType, input.periodStart)
+      return row?.id ?? Number(res.lastInsertRowid)
+    } catch (error) {
+      this.logger.warn(`dao.upsertReport failed: ${String(error)}`)
+      return null
+    }
+  }
+
+  getReport(periodType: string, periodStart: string): ReportRow | null {
+    try {
+      return (
+        (this.db
+          .prepare('SELECT * FROM report WHERE period_type = ? AND period_start = ?')
+          .get(periodType, periodStart) as ReportRow | undefined) ?? null
+      )
+    } catch {
+      return null
+    }
+  }
+
+  /** 视图查询：报告全文 + 条目数 */
+  listReportsByRange(periodType: string, startDay: string, endDay: string): ReportFullRow[] {
+    try {
+      return this.db
+        .prepare('SELECT * FROM v_report_full WHERE period_type = ? AND period_start >= ? AND period_start <= ? ORDER BY period_start')
+        .all(periodType, startDay, endDay) as unknown as ReportFullRow[]
+    } catch {
+      return []
+    }
+  }
+
+  // ---------- chat_digest ----------
+
+  /** 幂等：source_key 冲突 → UPDATE（digest_md / happened_on / doc_id） */
+  insertChatDigest(input: ChatDigestInput): number | null {
+    if (!input.chatTopic || !input.digestMd || !input.sourceKey) return null
+    try {
+      const now = input.createdAt ?? this.now()
+      const res = this.db
+        .prepare(
+          `INSERT INTO chat_digest (chat_topic, digest_md, happened_on, doc_id, source_key, created_by, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (source_key) DO UPDATE SET
+             chat_topic = excluded.chat_topic,
+             digest_md = excluded.digest_md,
+             happened_on = excluded.happened_on,
+             doc_id = excluded.doc_id`,
+        )
+        .run(
+          input.chatTopic,
+          input.digestMd,
+          input.happenedOn ?? null,
+          input.docId ?? null,
+          input.sourceKey,
+          input.createdBy ?? 'cli',
+          now,
+        )
+      const row = this.db.prepare('SELECT id FROM chat_digest WHERE source_key = ?').get(input.sourceKey) as
+        | { id: number }
+        | undefined
+      return row?.id ?? Number(res.lastInsertRowid)
+    } catch (error) {
+      this.logger.warn(`dao.insertChatDigest failed: ${String(error)}`)
+      return null
+    }
+  }
+
+  getChatDigestBySourceKey(sourceKey: string): ChatDigestRow | null {
+    try {
+      return (
+        (this.db.prepare('SELECT * FROM chat_digest WHERE source_key = ?').get(sourceKey) as ChatDigestRow | undefined) ??
+        null
+      )
+    } catch {
+      return null
+    }
+  }
+
+  listChatDigestsByDay(day: string): ChatDigestRow[] {
+    try {
+      return this.db.prepare('SELECT * FROM chat_digest WHERE happened_on = ? ORDER BY id').all(day) as unknown as ChatDigestRow[]
+    } catch {
+      return []
+    }
+  }
+
+  // ---------- 批量 ----------
+
+  /** 多条写入走 BEGIN IMMEDIATE 短事务（外部写入规约，DESIGN 修订4） */
+  bulkWrite(fn: () => void): boolean {
+    return withTransaction(this.db, this.logger, fn)
+  }
+
+  /** 单标量统计（导入器 / 测试断言行数用） */
+  count(table: 'doc' | 'tag' | 'doc_tag' | 'report' | 'entry' | 'chat_digest'): number {
+    try {
+      const row = this.db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }
+      return Number(row.n)
+    } catch {
+      return -1
+    }
+  }
+
+  close(): void {
+    try {
+      this.db.close()
+    } catch {
+      /* 已关闭则忽略 */
+    }
+  }
+}

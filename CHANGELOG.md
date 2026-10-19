@@ -8,6 +8,9 @@
 
 ### Added
 
+- SQLite 知识库数据层（`src/db/`，node:sqlite `DatabaseSync`，零 npm 依赖）：冻结 schema v0.2.1 内嵌 DDL、`KnowledgeDao`（doc/entry/report/chat_digest，`source_key` 与 `(period_type, period_start)` 幂等 upsert）、`BEGIN IMMEDIATE` 短事务、写失败只 warn 不致命
+- 可选 SQLite 镜像：`Store` 构造函数新增 `sqlitePath?`——传入即把 `groups/<chatId>/insights.jsonl`（→ `chat_digest`/`entry`）与 `reports/<chatId>/YYYY-MM-DD.md`（→ `report`）镜像进知识库；JSONL 仍是事实源，镜像失败静默降级
+- 一次性导入器 `scripts/import-state-to-sqlite.mjs`：`--state-dir`（只读）+ `--db`（默认 `<home>/WeChat/1数据/knowledge.db`），可重复运行（`source_key` 内容哈希幂等）
 - `sender` 发送前**定位闸**：keyboard 模式先 `wechat-ui open --chat` 精确锁定目标会话（侧栏 OCR 唯一命中才点击），免除"文件传输助手须常驻前台"这一使用前提；失败按 `target_missing` / `env_unavailable` / `ui_tool_missing` / `tcc_denied` 分类延迟处理并落审计（`result='locate_deferred'`），**不计入失败重试次数**
 - 发送段改用 `wechat-ui deliver --chat`：定位打开 → 点焦点 → 合成 Cmd+V → OCR 复核草稿 → OCR 锚定"发送"按钮 → 轮询草稿清空（替代对微信 4.x 输入框无效的合成 Return）
 - 仓库防线：`scripts/check-sensitive.sh` 与 CI `sensitive-scan` job，阻止真实 `wxid` / 群 ID / 家目录路径 / 密钥再次进入仓库

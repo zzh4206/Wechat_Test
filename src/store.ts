@@ -7,6 +7,7 @@
 import { mkdirSync, appendFileSync, writeFileSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { assertInsideState } from './guard.js'
+import { createSqliteMirror, type SqliteMirror } from './db/mirror.js'
 
 export interface StoreLogger {
   warn(message: string): unknown
@@ -14,10 +15,17 @@ export interface StoreLogger {
 }
 
 export class Store {
+  /** 可选 SQLite 镜像（JSONL 仍是事实源；镜像写失败绝不影响主流程） */
+  private readonly mirror: SqliteMirror | null
+
   constructor(
     private readonly baseDir: string,
     private readonly logger: StoreLogger,
-  ) {}
+    /** 传入路径即启用知识库镜像；undefined/初始化失败则不启用（行为与旧版一致） */
+    sqlitePath?: string,
+  ) {
+    this.mirror = createSqliteMirror(sqlitePath, logger)
+  }
 
   /** 相对 baseDir 创建目录（rel 传 '.' 即 baseDir 本身） */
   ensureDir(rel: string): boolean {
@@ -33,7 +41,9 @@ export class Store {
 
   /** 追加一行 JSON 到 .jsonl 文件 */
   appendJsonl(rel: string, entry: unknown): boolean {
-    return this.appendText(rel, `${JSON.stringify(entry)}\n`)
+    const ok = this.appendText(rel, `${JSON.stringify(entry)}\n`)
+    if (ok) this.mirror?.mirrorJsonl(rel, entry)
+    return ok
   }
 
   /** 覆写文本文件（WP4 日报整文件重写用）；同样先过 assertInsideState */
@@ -42,6 +52,7 @@ export class Store {
     try {
       assertInsideState(this.baseDir, target)
       writeFileSync(target, text, 'utf8')
+      this.mirror?.mirrorText(rel, text)
       return true
     } catch (error) {
       this.logger.warn(`store.writeText failed (${rel}): ${String(error)}`)
