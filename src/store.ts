@@ -7,7 +7,7 @@
 import { mkdirSync, appendFileSync, writeFileSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { assertInsideState } from './guard.js'
-import { createSqliteMirror, type MediaSourceFile, type SqliteMirror } from './db/mirror.js'
+import { createSqliteMirror, type MediaSourceFile, type ReportKindName, type SqliteMirror } from './db/mirror.js'
 
 export interface StoreLogger {
   warn(message: string): unknown
@@ -25,6 +25,18 @@ export class Store {
     sqlitePath?: string,
   ) {
     this.mirror = createSqliteMirror(sqlitePath, logger)
+  }
+
+  /**
+   * 报告落盘显式通道（缺口 G1/G2）：kind 由代码给出，镜像按 reportPeriodOf 推导 period，
+   * 周报/月报不再被路径正则错标为 daily。文件布局零破坏（reports/<chatId>/<dateKey>.md）。
+   * chatId='aggregate' = 跨群汇总（reports/summary/<dateKey>.md）。
+   */
+  writeReport(kind: ReportKindName, chatId: string, dateKey: string, md: string): boolean {
+    const rel = chatId === 'aggregate' ? `reports/summary/${dateKey}.md` : `reports/${chatId}/${dateKey}.md`
+    const ok = this.writeText(rel, md)
+    if (ok) this.mirror?.mirrorReport(kind, chatId, dateKey, md)
+    return ok
   }
 
   /** media 镜像透传（v0.4：file-index 扫描后由接线层调用；未启用镜像时零开销） */

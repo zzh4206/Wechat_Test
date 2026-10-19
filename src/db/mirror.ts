@@ -23,6 +23,40 @@ import { openDb } from './db.js'
 import { KnowledgeDao, hash8 } from './dao.js'
 import type { DbLogger } from './db.js'
 
+/** 报告类型（与 report.ts 的 ReportKind 同名集；此处独立定义避免依赖循环） */
+export type ReportKindName = 'daily' | 'weekly' | 'monthly'
+
+export interface ReportPeriod {
+  periodStart: string
+  periodEnd: string
+}
+
+/**
+ * kind → period 起止（单一实现，镜像/导入器两处引用——杜绝口径漂移，缺口 G1/G4）：
+ * - daily = (dateKey, dateKey)；
+ * - weekly = (该周周一, 周一+6 天)——dateKey 是周报触发的周一；
+ * - monthly = (当月 1 号, 当月月末)——dateKey 是 1 号；
+ * - dateKey 非法（非 YYYY-MM-DD 或解析不出）→ null（调用方跳过并 warn）。
+ */
+export function reportPeriodOf(kind: ReportKindName, dateKey: string): ReportPeriod | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateKey)
+  if (!m) return null
+  const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]))
+  if (Number.isNaN(d.getTime()) || d.getDate() !== Number(m[3]) || d.getMonth() !== Number(m[2]) - 1) return null
+  const p = (x: Date): string => `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, '0')}-${String(x.getDate()).padStart(2, '0')}`
+  if (kind === 'daily') return { periodStart: dateKey, periodEnd: dateKey }
+  if (kind === 'weekly') {
+    const dowMon = (d.getDay() + 6) % 7 // 周一=0
+    const monday = new Date(d.getFullYear(), d.getMonth(), d.getDate() - dowMon)
+    const sunday = new Date(monday.getFullYear(), monday.getMonth(), monday.getDate() + 6)
+    return { periodStart: p(monday), periodEnd: p(sunday) }
+  }
+  // monthly：1 号 → 月末
+  if (d.getDate() !== 1) return null // 月报 dateKey 约定为 1 号；否则视为非法跳过
+  const last = new Date(d.getFullYear(), d.getMonth() + 1, 0)
+  return { periodStart: p(d), periodEnd: p(last) }
+}
+
 /** media 镜像源行：groupStore files 表（FileRow）所需子集，解耦避免依赖循环 */
 export interface MediaSourceFile {
   fileId: string
@@ -72,6 +106,12 @@ export interface SqliteMirror {
    * source_key = `<chatId>:<fileId>`（file_id 稳定派生键，重扫幂等）。
    */
   mirrorMedia(chatId: string, files: ReadonlyArray<MediaSourceFile>): void
+  /**
+   * 报告类型显式通道（缺口 G1/G2 修复）：writeReport 落盘后调用——kind 由代码给出而非
+   * 从路径猜测；period 起止由 reportPeriodOf 推导（dateKey 非法 → warn 跳过）。
+   * chatId='aggregate' 为跨群汇总（schema report.chat_id='aggregate'）。
+   */
+  mirrorReport(kind: ReportKindName, chatId: string, dateKey: string, md: string): void
   close(): void
 }
 
@@ -167,26 +207,35 @@ export function createSqliteMirror(sqlitePath: string | undefined, logger: DbLog
       }
     },
 
-    mirrorText(rel, text) {
-      const m = DAILY_REPORT_RE.exec(rel)
-      if (!m) {
-        logger.debug?.(`mirror: no mapping for text ${rel}, skipped`)
+    mirrorReport(kind, chatId, dateKey, md) {
+      const period = reportPeriodOf(kind, dateKey)
+      if (!period) {
+        logger.warn(`mirror: report dateKey 非法（${kind} ${dateKey}）——跳过镜像（不猜测类型）`)
         return
       }
-      const [, chatId, day] = m
-      // v0.4：report 镜像带真实 chat_id（rel 路径 reports/<chatId>/ 已含群 ID；解析不出时上面正则已不匹配）
+      const titleKind = kind === 'daily' ? '日报' : kind === 'weekly' ? '周报' : '月报'
       safe(() =>
         dao.upsertReport({
-          periodType: 'daily',
-          periodStart: day,
-          periodEnd: day,
-          title: `日报 ${chatId} ${day}`,
-          contentMd: text,
+          periodType: kind,
+          periodStart: period.periodStart,
+          periodEnd: period.periodEnd,
+          title: `${titleKind} ${chatId} ${dateKey}`,
+          contentMd: md,
           status: 'draft',
           chatId,
           docIdsHint: null,
         }),
       )
+    },
+
+    mirrorText(rel, text) {
+      // 报告已改走 writeReport → mirrorReport（kind 显式通道，缺口 G1）。
+      // 路径侧不再猜测类型（旧正则会把周/月报错标为 daily）——遇到报告路径直接跳过。
+      if (DAILY_REPORT_RE.test(rel) || /^reports\/summary\//.test(rel)) {
+        logger.debug?.(`mirror: report ${rel} 应经 writeReport 显式通道入镜像，路径侧跳过`)
+        return
+      }
+      logger.debug?.(`mirror: no mapping for text ${rel}, skipped`)
     },
 
     close() {

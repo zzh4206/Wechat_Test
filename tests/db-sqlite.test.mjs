@@ -120,14 +120,32 @@ test('镜像：insight/report 写入映射进库；未映射路径跳过；库�
   assert.ok(store.appendJsonl('audit/something.jsonl', { x: 1 }), '未映射路径不影响主流程')
   assert.equal(dao.count('chat_digest') + dao.count('entry'), 1, '未映射路径不写库')
 
+  // 报告显式通道（缺口 G1）：writeReport 按 kind 推导 period，路径侧不再猜测
   const md = '# 日报\n\n正文'
-  store.ensureDir('reports/12345678@chatroom') // appendJsonl/writeText 不建父目录（既有行为）
-  assert.equal(store.writeText('reports/12345678@chatroom/2026-01-05.md', md), true)
+  store.ensureDir('reports/12345678@chatroom') // writeText 不建父目录（既有行为）
+  assert.equal(store.writeReport('daily', '12345678@chatroom', '2026-01-05', md), true)
   assert.equal(dao.count('report'), 1)
-  // v0.4：镜像 report 带真实 chat_id（从 rel 路径解析）
   const mirrored = dao.getReport('daily', '2026-01-05', '12345678@chatroom')
   assert.match(mirrored.content_md, /正文/)
   assert.equal(mirrored.chat_id, '12345678@chatroom')
+
+  // G1：周报/月报按 kind 推导 period（不再错标 daily）
+  assert.equal(store.writeReport('weekly', '12345678@chatroom', '2026-01-05', '# 周报'), true)
+  const weekly = dao.getReport('weekly', '2026-01-05', '12345678@chatroom')
+  assert.equal(weekly.period_start, '2026-01-05', '2026-01-05 是周一')
+  assert.equal(weekly.period_end, '2026-01-11', 'period_end = 周一+6 天')
+  assert.equal(store.writeReport('monthly', '12345678@chatroom', '2026-02-01', '# 月报'), true)
+  const monthly = dao.getReport('monthly', '2026-02-01', '12345678@chatroom')
+  assert.equal(monthly.period_start, '2026-02-01')
+  assert.equal(monthly.period_end, '2026-02-28', '2026 非闰年，月末 28 日')
+  // 错键拒绝：月报 dateKey 非 1 号 → 跳过镜像（不猜测）
+  assert.equal(store.writeReport('monthly', '12345678@chatroom', '2026-02-15', '# 月报?'), true)
+  assert.equal(dao.count('report'), 3, '非法键不入库')
+  // G2：summary 聚合行 chat_id='aggregate'
+  store.ensureDir('reports/summary')
+  assert.equal(store.writeReport('daily', 'aggregate', '2026-01-05', '# 跨群汇总'), true)
+  const agg = dao.getReport('daily', '2026-01-05', 'aggregate')
+  assert.equal(agg.chat_id, 'aggregate')
 
   // 镜像库路径指向一个不可打开的目标（如目录）：appendJsonl 仍返回 true
   const badDir = mkdtempSync(join(tmpdir(), 'lurker-baddb-'))
@@ -338,12 +356,14 @@ test('导入器 v0.4：reports/<chatId>/ 按群落行；既有 aggregate 行不�
   const stateDir = mkdtempSync(join(tmpdir(), 'lurker-imp4-state-'))
   const { path: dbPath, dir: dbDir } = tmpDb('imp4')
 
-  // 两个群同一天的日报 + 一个群多一天
+  // 两个群同一天的日报 + 一个群多一天 + 周报/月报各一（G4：混合类型识别）
   for (const chat of ['12345678@chatroom', '1234567890@chatroom']) {
     mkdirSync(join(stateDir, 'reports', chat), { recursive: true })
     writeFileSync(join(stateDir, 'reports', chat, '2026-01-05.md'), `# 日报 ${chat}\n\n内容`)
   }
-  writeFileSync(join(stateDir, 'reports', '12345678@chatroom', '2026-01-06.md'), '# 0206')
+  writeFileSync(join(stateDir, 'reports', '12345678@chatroom', '2026-01-06.md'), '# 0206') // 无类型标题 → 回退 daily 计数
+  writeFileSync(join(stateDir, 'reports', '12345678@chatroom', '2026-01-05.md').replace('2026-01-05', '2026-01-12'), '# 周报 12345678@chatroom 2026-01-12\n\n周内容')
+  writeFileSync(join(stateDir, 'reports', '12345678@chatroom', '2026-02-01.md'), '# 月报 12345678@chatroom 2026-02-01\n\n月内容')
 
   // 先建 v4 库并写入 1 行 aggregate（模拟迁移回填），验证导入器不删不改
   const pre = openDb(dbPath, { logger })
@@ -356,17 +376,25 @@ test('导入器 v0.4：reports/<chatId>/ 按群落行；既有 aggregate 行不�
 
   const out1 = run()
   const out2 = run()
-  assert.match(out1, /按群落 report 行 3/)
-  assert.match(out2, /按群落 report 行 3/, '第二遍同样全部命中（幂等）')
+  assert.match(out1, /报告文件 5：report 行 5（daily=3 weekly=1 monthly=1/)
+  assert.match(out1, /回退 daily=1/, "'# 0206' 无标题 → 回退 daily 并计数")
+  assert.match(out2, /report 行 5/, '第二遍同样全部命中（幂等）')
 
   const db = openDb(dbPath, { logger })
   const dao = new KnowledgeDao(db, logger)
-  assert.equal(dao.count('report'), 4, 'aggregate 1 行 + 两群 3 行')
+  assert.equal(dao.count('report'), 6, 'aggregate 1 行 + 5 行报告')
   const agg = dao.getReport('daily', '2026-01-05')
   assert.equal(agg.chat_id, 'aggregate')
   assert.match(agg.content_md, /迁移回填/, 'aggregate 行未被导入器改写')
   assert.match(dao.getReport('daily', '2026-01-05', '12345678@chatroom').content_md, /内容/)
   assert.match(dao.getReport('daily', '2026-01-06', '12345678@chatroom').content_md, /0206/)
+  // G4：周/月报按标题识别 → period 推导正确（不再错标 daily）
+  const weekly = dao.getReport('weekly', '2026-01-12', '12345678@chatroom')
+  assert.equal(weekly.period_start, '2026-01-12', '周一')
+  assert.equal(weekly.period_end, '2026-01-18')
+  const monthly = dao.getReport('monthly', '2026-02-01', '12345678@chatroom')
+  assert.equal(monthly.period_start, '2026-02-01')
+  assert.equal(monthly.period_end, '2026-02-28')
   db.close()
 
   rmSync(stateDir, { recursive: true, force: true })

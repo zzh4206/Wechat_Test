@@ -20,7 +20,7 @@ import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { join, basename } from 'node:path'
 import { openDb, normalizeText } from '../lib/db/db.js'
 import { KnowledgeDao, contentHash, hash8 } from '../lib/db/dao.js'
-import { defaultDbPath } from '../lib/db/mirror.js'
+import { defaultDbPath, reportPeriodOf } from '../lib/db/mirror.js'
 
 // ---- 参数解析（无外部依赖） ----
 function parseArgs(argv) {
@@ -116,7 +116,22 @@ const stats = {
   entries: 0,
   reportFiles: 0,
   reportsMapped: 0,
+  reportsByKind: { daily: 0, weekly: 0, monthly: 0 },
+  reportsUnknownKind: 0, // 标题识别不出 kind → 回退 daily 并计数（G4 口径上报）
+  invalidPeriodSkipped: 0, // dateKey 与 kind 推导不出合法 period（跳过不入库）
   otherFiles: 0,
+}
+
+/**
+ * 标题行识别报告 kind（缺口 G4：文件名无类型信息）——与渲染层标题同源：
+ * `# 日报 ·` / `# 周报 ·` / `# 月报 ·`。识别不出回退 'daily' 并计数上报。
+ */
+function detectReportKind(md) {
+  const head = md.slice(0, 200)
+  if (head.includes('# 周报')) return 'weekly'
+  if (head.includes('# 月报')) return 'monthly'
+  if (head.includes('# 日报')) return 'daily'
+  return 'daily'
 }
 
 // reports/<x>/YYYY-MM-DD.md 按群逐文件收集（v0.4：每 (chatId, day) 一行，不再跨群聚合）
@@ -164,11 +179,22 @@ for (const name of readdirSync(args.stateDir)) {
 // 按群逐行 upsert（冲突键三元组 (daily, day, chatId) → 重复运行天然幂等；
 // aggregate 旧行不受影响——键不同不会命中）
 for (const [chatId, day, md] of reportFiles) {
+  const kind = detectReportKind(md)
+  if (kind === 'daily' && !md.includes('# 日报')) stats.reportsUnknownKind++
+  stats.reportsByKind[kind] += 1
+  const period = reportPeriodOf(kind, day)
+  if (!period) {
+    // dateKey 与 kind 推导不出合法 period（如月报键非 1 号）——跳过并计数，绝不猜测错标
+    stats.invalidPeriodSkipped++
+    logger.warn(`report ${chatId}/${day} kind=${kind} period 推导失败——跳过`)
+    continue
+  }
+  const titleKind = kind === 'daily' ? '日报' : kind === 'weekly' ? '周报' : '月报'
   const id = dao.upsertReport({
-    periodType: 'daily',
-    periodStart: day,
-    periodEnd: day,
-    title: `日报 ${chatId} ${day}`,
+    periodType: kind,
+    periodStart: period.periodStart,
+    periodEnd: period.periodEnd,
+    title: `${titleKind} ${chatId} ${day}`,
     contentMd: normalizeText(md),
     status: 'draft',
     chatId,
@@ -181,7 +207,7 @@ const before = dao.count('report')
 console.log('导入完成：')
 console.log(`  db=${args.db}`)
 console.log(`  insights 行 ${stats.insightLines}：映射 ${stats.mappedInsight}（digest ${stats.digests} + entry ${stats.entries}），未映射 ${stats.unmappedInsight}，写失败 ${stats.failedInsight}`)
-console.log(`  日报文件 ${stats.reportFiles}：按群落 report 行 ${stats.reportsMapped}`)
+console.log(`  报告文件 ${stats.reportFiles}：report 行 ${stats.reportsMapped}（daily=${stats.reportsByKind.daily} weekly=${stats.reportsByKind.weekly} monthly=${stats.reportsByKind.monthly}；标题识别不出回退 daily=${stats.reportsUnknownKind}；period 非法跳过=${stats.invalidPeriodSkipped}）`)
 console.log(`  未映射的 state 子目录：${stats.otherFiles}`)
 console.log(`  库内计数：doc=${dao.count('doc')} report=${before} entry=${dao.count('entry')} chat_digest=${dao.count('chat_digest')}`)
 console.log(`  内容指纹示例（首条 digest 源键即 insight:<type>:<hash8>；doc.content_hash 归一化=去 BOM/CRLF→LF/strip 后 sha256）`)

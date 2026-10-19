@@ -818,7 +818,7 @@ export class ReportService {
       lines.push(`- ${g.chatId}: reports/${g.chatId}/${win.dateKey}.md`)
     }
     lines.push('', '（本期文件索引 / 条目变更记录：M4/M5 接入后回填）', '')
-    const ok = this.options.store.writeText(rel, lines.join('\n'))
+    const ok = this.options.store.writeReport('daily', 'aggregate', win.dateKey, lines.join('\n'))
     return { path: ok ? rel : null, groupsIncluded: top.length, groupsSkipped: rest.length }
   }
 
