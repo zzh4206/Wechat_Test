@@ -33,7 +33,13 @@ export class Store {
    * chatId='aggregate' = 跨群汇总（reports/summary/<dateKey>.md）。
    */
   writeReport(kind: ReportKindName, chatId: string, dateKey: string, md: string): boolean {
-    const rel = chatId === 'aggregate' ? `reports/summary/${dateKey}.md` : `reports/${chatId}/${dateKey}.md`
+    // 路径按 kind 分目录（热修：weekly dateKey=周一与当天 daily 互撞覆盖后写）：
+    // daily → reports/<chatId>/<dateKey>.md（向后兼容）；weekly/monthly → 子目录 weekly//monthly/；
+    // aggregate → reports/summary[/kind]/<dateKey>.md。与 knowledge.db 的 kind 路由对齐。
+    const sub = kind === 'weekly' ? 'weekly/' : kind === 'monthly' ? 'monthly/' : ''
+    const rel = chatId === 'aggregate' ? `reports/summary/${sub}${dateKey}.md` : `reports/${chatId}/${sub}${dateKey}.md`
+    const parent = rel.slice(0, rel.lastIndexOf('/'))
+    if (parent) this.ensureDir(parent) // weekly/monthly 子目录可能不存在（writeText 不建父目录）
     const ok = this.writeText(rel, md)
     if (ok) this.mirror?.mirrorReport(kind, chatId, dateKey, md)
     return ok

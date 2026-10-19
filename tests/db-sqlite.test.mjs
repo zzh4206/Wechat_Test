@@ -4,7 +4,7 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync } from 'node:fs'
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { execFileSync } from 'node:child_process'
@@ -399,4 +399,43 @@ test('导入器 v0.4：reports/<chatId>/ 按群落行；既有 aggregate 行不�
 
   rmSync(stateDir, { recursive: true, force: true })
   rmSync(dbDir, { recursive: true, force: true })
+})
+
+test('writeReport 路径按类型分目录：daily 不变；weekly/monthly 子目录；周一双触发不互覆', () => {
+  const { path, dir } = tmpDb('wr-path')
+  const stateDir = mkdtempSync(join(tmpdir(), 'lurker-wr-'))
+  const store = new Store(stateDir, logger, path)
+  store.ensureDir('reports/12345678@chatroom')
+  store.ensureDir('reports/summary')
+
+  // daily 路径不变
+  assert.equal(store.writeReport('daily', '12345678@chatroom', '2026-01-05', '日报 20:30'), true)
+  const dailyPath = join(stateDir, 'reports', '12345678@chatroom', '2026-01-05.md')
+  assert.ok(existsSync(dailyPath), 'daily 维持 reports/<chatId>/<dateKey>.md')
+  // weekly 新路径（同 dateKey=周一）
+  assert.equal(store.writeReport('weekly', '12345678@chatroom', '2026-01-05', '周报 20:40'), true)
+  const weeklyPath = join(stateDir, 'reports', '12345678@chatroom', 'weekly', '2026-01-05.md')
+  assert.ok(existsSync(weeklyPath), 'weekly → reports/<chatId>/weekly/<dateKey>.md')
+  // 周一双触发不互覆：两文件都在且内容各自正确
+  assert.match(readFileSync(dailyPath, 'utf8'), /日报 20:30/)
+  assert.match(readFileSync(weeklyPath, 'utf8'), /周报 20:40/)
+  // monthly 新路径
+  assert.equal(store.writeReport('monthly', '12345678@chatroom', '2026-01-01', '月报'), true)
+  assert.ok(existsSync(join(stateDir, 'reports', '12345678@chatroom', 'monthly', '2026-01-01.md')))
+  // aggregate：daily 语义维持 summary 根；weekly/monthly 聚合走子目录
+  assert.equal(store.writeReport('daily', 'aggregate', '2026-01-05', 'summary-d'), true)
+  assert.ok(existsSync(join(stateDir, 'reports', 'summary', '2026-01-05.md')))
+  assert.equal(store.writeReport('weekly', 'aggregate', '2026-01-05', 'summary-w'), true)
+  assert.ok(existsSync(join(stateDir, 'reports', 'summary', 'weekly', '2026-01-05.md')))
+  assert.equal(store.writeReport('monthly', 'aggregate', '2026-02-01', 'summary-m'), true)
+  assert.ok(existsSync(join(stateDir, 'reports', 'summary', 'monthly', '2026-02-01.md')))
+
+  const db = openDb(path, { logger })
+  const dao = new KnowledgeDao(db, logger)
+  // DB 行靠 kind 区分无误（回归断言）
+  assert.equal(dao.getReport('daily', '2026-01-05', '12345678@chatroom').content_md, '日报 20:30')
+  assert.equal(dao.getReport('weekly', '2026-01-05', '12345678@chatroom').content_md, '周报 20:40')
+  db.close()
+  rmSync(dir, { recursive: true, force: true })
+  rmSync(stateDir, { recursive: true, force: true })
 })
