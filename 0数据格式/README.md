@@ -100,6 +100,6 @@ python3 export_md.py --db sample.db --out ./exports
 ## 路线图
 
 - [x] v0.2.1 schema 冻结（含评审修订 6 条）+ Python CLI + Markdown 导出
-- [ ] TS 数据层：`src/db/`（db.ts / dao.ts / mirror.ts）+ store.ts 双写钩子
-- [ ] JSONL 历史数据一次性导入器（幂等，可重跑）
+- [x] TS 数据层：`src/db/`（db / dao / mirror）+ store.ts 双写钩子（2水群 仓库 `2d764f0`，386 测试全过）
+- [x] JSONL 历史数据一次性导入器（幂等，实测映射率 ≈100%，重跑行数不变）
 - [ ] FTS5 中文全文索引；report_doc 关联表；媒体附件表；category 字典表；前端查询接口
