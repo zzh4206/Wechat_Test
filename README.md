@@ -97,9 +97,20 @@ python3 export_md.py --db sample.db --out ./exports
 实施进度见下方「路线图」。Python CLI（`report_cli.py` / `export_md.py`）与 TS 镜像**共存通用**：
 两边写的是同一个 schema 的同一个库。
 
+## v0.4 增补（会话维度 + media 表）
+
+- `report` 增列 `chat_id`（`'aggregate'`=跨群聚合），冲突键改三元组 `(period_type, period_start, chat_id)`；
+  新增 `media` 表：媒体本体永不入库，只存地址与元数据（path_kind / status 三态 / source_key 幂等键）。
+- schema 版本 `user_version` 3→4：Python（report_cli 打开库时）与 TS（db.ts openDb）双实现自动迁移，
+  单事务、幂等、数据零丢失；全新库直接建 v4，>4 拒开。
+- CLI：`report gen --chat-id <chatId>`（缺省 aggregate，标题不带群后缀）；`report list/show` 输出 chat_id；
+  `export_md.py` 非 aggregate 行导出至 `reports/<chatId>/` 子目录。
+- sample.db 合成假数据升级：同日双群两份 daily + 1 份聚合 daily + 1 份聚合 weekly + media 三态合成行。
+
 ## 路线图
 
 - [x] v0.2.1 schema 冻结（含评审修订 6 条）+ Python CLI + Markdown 导出
 - [x] TS 数据层：`src/db/`（db / dao / mirror）+ store.ts 双写钩子（2水群 仓库 `2d764f0`，386 测试全过）
 - [x] JSONL 历史数据一次性导入器（幂等，实测映射率 ≈100%，重跑行数不变）
-- [ ] FTS5 中文全文索引；report_doc 关联表；媒体附件表；category 字典表；前端查询接口
+- [x] v0.4 会话维度（report.chat_id 三元组冲突键）+ media 表 + 3→4 幂等迁移（Python/TS 双实现）
+- [ ] FTS5 中文全文索引；report_doc 关联表；category 字典表；前端查询接口

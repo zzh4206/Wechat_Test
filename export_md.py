@@ -3,7 +3,8 @@
 
 用法:
     python3 export_md.py --db PATH --out DIR
-        out/reports/YYYY/YYYY-MM-DD.md | YYYY-Www.md | YYYY-MM.md   （按周期类型）
+        out/reports/YYYY/YYYY-MM-DD.md | YYYY-Www.md | YYYY-MM.md   （aggregate 聚合报告，按周期类型）
+        out/reports/<chatId>/YYYY-MM-DD.md | ...                    （v0.4 非聚合报告，带会话段目录）
         out/docs/<category>/<标题>.md
 文件名经消毒（替换路径非法字符）。已存在同名文件会被覆盖。默认只导出全部；合成库可直接演示。
 """
@@ -36,6 +37,14 @@ def frontmatter(meta: dict) -> str:
 def report_path(r) -> str:
     start = dt.date.fromisoformat(r["period_start"])
     y, w, _ = start.isocalendar()
+    if r["chat_id"] != "aggregate":
+        # v0.4 非聚合报告：reports/<chatId>/ 平铺（与导入器读取路径 reports/<chatId>/YYYY-MM-DD.md 对齐）
+        cid = sanitize(r["chat_id"])
+        if r["period_type"] == "daily":
+            return os.path.join("reports", cid, f"{start.isoformat()}.md")
+        if r["period_type"] == "weekly":
+            return os.path.join("reports", cid, f"{y:04d}-W{w:02d}.md")
+        return os.path.join("reports", cid, f"{start.strftime('%Y-%m')}.md")
     if r["period_type"] == "daily":
         return os.path.join("reports", f"{y:04d}", f"{start.isoformat()}.md")
     if r["period_type"] == "weekly":
@@ -60,6 +69,7 @@ def main() -> None:
         body = frontmatter({
             "type": "report", "id": r["id"], "period_type": r["period_type"],
             "period_start": r["period_start"], "period_end": r["period_end"],
+            "chat_id": r["chat_id"] if "chat_id" in r.keys() else "aggregate",
             "title": r["title"], "status": r["status"],
             "doc_ids_hint": r["doc_ids_hint"], "entry_count": r["entry_count"],
             "created_at": r["created_at"], "updated_at": r["updated_at"],

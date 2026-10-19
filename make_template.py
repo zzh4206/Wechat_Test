@@ -92,32 +92,62 @@ def make_sample(path: str) -> None:
             "INSERT INTO doc_tag(doc_id, tag_id) VALUES (?,?)",
             [(doc_ids[di], t + 1) for t in tids])
 
-    # 2 份 report：daily + weekly
+    # 4 份 report（v0.4）：同日双群两份 daily + 1 份聚合 daily + 1 份聚合 weekly
     reports = [
-        ("daily", "2026-01-05", "2026-01-05", "日报 2026-01-05"),
-        ("weekly", "2026-01-05", "2026-01-11", "周报 2026-W02"),
+        # (period_type, start, end, title, chat_id)
+        ("daily", "2026-01-05", "2026-01-05", "日报 2026-01-05", "aggregate"),
+        ("daily", "2026-01-05", "2026-01-05", "日报 2026-01-05 demo-chat-1", "demo-chat-1"),
+        ("daily", "2026-01-05", "2026-01-05", "日报 2026-01-05 demo-chat-2", "demo-chat-2"),
+        ("weekly", "2026-01-05", "2026-01-11", "周报 2026-W02", "aggregate"),
     ]
     report_ids = {}
-    for pt, ps, pe, title in reports:
+    for pt, ps, pe, title, cid in reports:
         body = (f"# {title}\n\n> 合成示例报告，内容为占位文本。\n\n"
                 "## 本期要点\n\n- " + LOREM_ZH + "\n")
         cur.execute(
             "INSERT INTO report(period_type, period_start, period_end, title,"
-            " content_md, status, doc_ids_hint, created_at, updated_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?)",
-            (pt, ps, pe, title, body, "draft", "[1,2]", NOW - 2 * DAY, NOW - 2 * DAY))
-        report_ids[pt] = cur.lastrowid
+            " content_md, status, chat_id, doc_ids_hint, created_at, updated_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (pt, ps, pe, title, body, "draft", cid, "[1,2]", NOW - 2 * DAY, NOW - 2 * DAY))
+        report_ids[(pt, cid)] = cur.lastrowid
 
-    # 10 条 entry（部分挂日报，部分未归档）
+    # 10 条 entry（部分挂聚合日报，部分未归档）
     kinds = ["note", "todo", "done", "idea", "issue"]
+    daily_aggregate_id = report_ids[("daily", "aggregate")]
     for i in range(10):
-        rid = report_ids["daily"] if i < 4 else None
+        rid = daily_aggregate_id if i < 4 else None
         cur.execute(
             "INSERT INTO entry(ts, kind, content_md, report_id, doc_id, created_at)"
             " VALUES (?,?,?,?,?,?)",
             (NOW - (10 - i) * 3600, kinds[i % 5],
              f"（合成示例条目 {i + 1}）" + LOREM_ZH, rid,
              doc_ids[i % len(doc_ids)], NOW - (10 - i) * 3600))
+
+    # media 合成行（v0.4 修订8）：available / pending / missing 三态各若干；本体永不入库
+    media_rows = [
+        # (chat_id, media_type, file_name, ext, size, md5, path, path_kind, status, source_key, source_ts)
+        ("demo-chat-1", "image", "demo-photo-10001", "jpg", 204800,
+         "a1b2c3d4e5f60718293a4b5c6d7e8f90", "archive/demo-chat-1/10001.jpg", "archive",
+         "available", "demo-chat-1:10001", NOW - 3 * DAY),
+        ("demo-chat-1", "file", "demo-doc-10002", "pdf", 1048576,
+         "b2c3d4e5f60718293a4b5c6d7e8f90a1", None, None,
+         "pending", "demo-chat-1:10002", NOW - 2 * DAY),
+        ("demo-chat-1", "video", "demo-clip-10003", "mp4", 8388608,
+         "c3d4e5f60718293a4b5c6d7e8f90a1b2", "archive/demo-chat-1/10003.mp4", "archive",
+         "available", "demo-chat-1:10003", NOW - DAY),
+        ("demo-chat-2", "voice", "demo-voice-20001", "silk", 65536,
+         "d4e5f60718293a4b5c6d7e8f90a1b2c3", None, None,
+         "missing", "demo-chat-2:20001", NOW - DAY),
+        ("demo-chat-2", "image", "demo-photo-20002", "png", 40960,
+         "e5f60718293a4b5c6d7e8f90a1b2c3d4", "archive/demo-chat-2/20002.png", "archive",
+         "available", "demo-chat-2:20002", NOW - 3600),
+    ]
+    for m in media_rows:
+        cur.execute(
+            "INSERT INTO media(chat_id, media_type, file_name, ext, size, md5, path,"
+            " path_kind, status, source_key, source_ts, created_at, updated_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (*m, NOW - 2 * DAY, NOW - 2 * DAY))
 
     # 3 条 chat_digest（只存要点，不存原文；带 source_key 验证幂等）
     digests = [

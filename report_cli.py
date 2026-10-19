@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""report_cli.py — 微信知识库 CLI（entry / report / doc），schema v0.2.1。
+"""report_cli.py — 微信知识库 CLI（entry / report / doc），schema v0.4。
 
 用法:
     python3 report_cli.py [--db PATH] entry add --kind note --text "..." [--doc-id N]
-    python3 report_cli.py [--db PATH] report gen --period daily|weekly|monthly --date YYYY-MM-DD
+    python3 report_cli.py [--db PATH] report gen --period daily|weekly|monthly --date YYYY-MM-DD [--chat-id ID]
     python3 report_cli.py [--db PATH] report show --id N
     python3 report_cli.py [--db PATH] report list
     python3 report_cli.py [--db PATH] report finalize --id N
     python3 report_cli.py [--db PATH] doc add --title T [--category C] [--file PATH] [--tag a,b]
 
 --db 默认 ./knowledge.db。所有写操作都会更新 updated_at（entry 除外，其用 created_at）。
+打开库时自动执行 schema 迁移（user_version 3→4 幂等、单事务；0=全新建 v4；>4 报错拒开）。
 """
 import argparse
 import datetime as dt
@@ -19,6 +20,107 @@ import os
 import re
 import sqlite3
 import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SCHEMA_SQL_PATH = os.path.join(HERE, "schema.sql")
+
+SCHEMA_VERSION = 4
+
+# v0.4 report 表重建 DDL（与 schema.sql 逐字一致）；迁移按列名显式回填 chat_id='aggregate'
+MIGRATE_3_TO_4_SQL = """
+DROP VIEW IF EXISTS v_report_full;   -- report 重建期间视图悬空，末尾重建
+CREATE TABLE report_new (
+  id           INTEGER PRIMARY KEY,
+  period_type  TEXT NOT NULL CHECK (period_type IN ('daily','weekly','monthly')),
+  period_start TEXT NOT NULL,
+  period_end   TEXT NOT NULL,
+  title        TEXT NOT NULL,
+  content_md   TEXT NOT NULL,
+  status       TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','final')),
+  chat_id      TEXT NOT NULL DEFAULT 'aggregate'
+               CHECK (length(chat_id) BETWEEN 1 AND 128),
+  doc_ids_hint TEXT,
+  created_at   INTEGER NOT NULL,
+  updated_at   INTEGER NOT NULL,
+  UNIQUE (period_type, period_start, chat_id),
+  CHECK (period_start GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+  CHECK (period_end   GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+  CHECK (period_end >= period_start),
+  CHECK (period_type <> 'daily'   OR (period_end = period_start)),
+  CHECK (period_type <> 'weekly'  OR (strftime('%w', period_start) = '1'
+                                      AND period_end = date(period_start, '+6 days'))),
+  CHECK (period_type <> 'monthly' OR (strftime('%d', period_start) = '01'
+                                      AND period_end = date(period_start, '+1 month', '-1 day')))
+);
+INSERT INTO report_new (id, period_type, period_start, period_end, title,
+                        content_md, status, chat_id, doc_ids_hint, created_at, updated_at)
+  SELECT id, period_type, period_start, period_end, title,
+         content_md, status, 'aggregate', doc_ids_hint, created_at, updated_at FROM report;
+DROP TABLE report;
+ALTER TABLE report_new RENAME TO report;
+CREATE INDEX idx_report_period ON report(period_type, period_start);
+CREATE INDEX idx_report_status ON report(status);
+CREATE INDEX idx_report_chat   ON report(chat_id, period_start);
+CREATE TABLE media (
+  id         INTEGER PRIMARY KEY,
+  chat_id    TEXT NOT NULL CHECK (length(chat_id) BETWEEN 1 AND 128),
+  media_type TEXT NOT NULL CHECK (media_type IN ('image','video','file','voice')),
+  file_name  TEXT,
+  ext        TEXT CHECK (ext IS NULL OR (ext = lower(ext) AND ext NOT LIKE '%.%' AND length(ext) BETWEEN 1 AND 16)),
+  size       INTEGER CHECK (size IS NULL OR size >= 0),
+  md5        TEXT CHECK (md5 IS NULL OR length(md5) = 32),
+  path       TEXT,
+  path_kind  TEXT CHECK (path_kind IN ('local','archive')),
+  status     TEXT NOT NULL DEFAULT 'available'
+             CHECK (status IN ('available','pending','missing')),
+  source_key TEXT UNIQUE,
+  source_ts  INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  CHECK (status <> 'available' OR path IS NOT NULL)
+);
+CREATE INDEX idx_media_chat    ON media(chat_id, media_type);
+CREATE INDEX idx_media_created ON media(created_at);
+CREATE INDEX idx_media_status  ON media(status);
+CREATE VIEW v_report_full AS
+SELECT r.*, (SELECT COUNT(*) FROM entry e WHERE e.report_id = r.id) AS entry_count
+FROM report r
+ORDER BY r.period_type, r.period_start DESC;
+"""
+
+
+def user_version(conn: sqlite3.Connection) -> int:
+    return int(conn.execute("PRAGMA user_version").fetchone()[0])
+
+
+def ensure_schema(conn: sqlite3.Connection) -> None:
+    """schema 迁移（幂等、自动）：3→4 单事务重建 report + 建 media；0=全新建 v4；>4 拒开。
+    任何一步失败整体回滚，user_version 最后置（在事务内）。"""
+    v = user_version(conn)
+    if v == SCHEMA_VERSION:
+        return
+    if v > SCHEMA_VERSION:
+        sys.exit(f"[错误] 库 schema 版本 v{v} 高于本工具支持的 v{SCHEMA_VERSION}，拒绝打开")
+    if v not in (0, 3):
+        sys.exit(f"[错误] 不支持的 schema 版本 v{v}（仅支持 0/3/{SCHEMA_VERSION}）")
+    try:
+        if v == 0:
+            with open(SCHEMA_SQL_PATH, encoding="utf-8") as f:
+                conn.executescript(f.read())  # 全量 v0.4 DDL（含 PRAGMA user_version=4）
+            if user_version(conn) != SCHEMA_VERSION:
+                raise RuntimeError("全新建库后 user_version != 4")
+            return
+        # executescript 会隐式提交挂起事务，故把事务写进脚本文本（单事务、可整体回滚）。
+        # DROP report 前须关外键（SQLite 迁移规约），否则 entry 子行引用会阻断 DROP。
+        conn.execute("PRAGMA foreign_keys = OFF")
+        script = ("BEGIN;\n" + MIGRATE_3_TO_4_SQL
+                  + f"\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n")
+        conn.executescript(script)
+    except Exception as e:
+        conn.rollback()
+        sys.exit(f"[错误] schema 迁移失败（已回滚）: {e}")
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
 
 
 def now() -> int:
@@ -35,6 +137,7 @@ def connect(path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    ensure_schema(conn)
     return conn
 
 
@@ -105,12 +208,15 @@ def build_content_md(r: sqlite3.Row, entries: list) -> str:
 
 
 def report_gen(a) -> None:
-    start, end, title = period_range(a.period, a.date)
+    chat_id = a.chat_id or "aggregate"
+    start, end, base_title = period_range(a.period, a.date)
+    # v0.4：非聚合报告标题带会话段（如「周报 2026-W02 demo-chat-1」）；聚合不加后缀
+    title = base_title if chat_id == "aggregate" else f"{base_title} {chat_id}"
     conn = connect(a.db)
     t = now()
     row = conn.execute(
-        "SELECT id FROM report WHERE period_type = ? AND period_start = ?",
-        (a.period, start)).fetchone()
+        "SELECT id FROM report WHERE period_type = ? AND period_start = ? AND chat_id = ?",
+        (a.period, start, chat_id)).fetchone()
     if row:                                    # 修订1：重新生成走 UPDATE，不删建
         rid = row["id"]
         conn.execute(
@@ -122,9 +228,9 @@ def report_gen(a) -> None:
     else:
         cur = conn.execute(
             "INSERT INTO report (period_type, period_start, period_end, title,"
-            " content_md, status, doc_ids_hint, created_at, updated_at)"
-            " VALUES (?, ?, ?, ?, '', 'draft', NULL, ?, ?)",
-            (a.period, start, end, title, t, t))
+            " content_md, status, chat_id, doc_ids_hint, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, '', 'draft', ?, NULL, ?, ?)",
+            (a.period, start, end, title, chat_id, t, t))
         rid = cur.lastrowid
         action = f"created report #{rid}"
 
@@ -151,8 +257,8 @@ def report_show(a) -> None:
     r = conn.execute("SELECT * FROM v_report_full WHERE id = ?", (a.id,)).fetchone()
     if not r:
         sys.exit(f"[错误] report #{a.id} 不存在")
-    keys = ["id", "period_type", "period_start", "period_end", "title", "status",
-            "doc_ids_hint", "entry_count"]
+    keys = ["id", "period_type", "period_start", "period_end", "chat_id", "title",
+            "status", "doc_ids_hint", "entry_count"]
     print("=" * 60)
     for k in keys:
         print(f"{k:14}: {r[k]}")
@@ -164,13 +270,13 @@ def report_show(a) -> None:
 def report_list(a) -> None:
     conn = connect(a.db)
     rows = conn.execute(
-        "SELECT id, period_type, period_start, period_end, title, status, entry_count"
+        "SELECT id, period_type, period_start, period_end, chat_id, title, status, entry_count"
         " FROM v_report_full ORDER BY period_start DESC").fetchall()
     if not rows:
         print("(无报告)")
     for r in rows:
         print(f"#{r['id']:<3} {r['period_type']:<7} {r['period_start']}~{r['period_end']}"
-              f"  {r['title']}  [{r['status']}]  entries={r['entry_count']}")
+              f"  [{r['chat_id']}]  {r['title']}  [{r['status']}]  entries={r['entry_count']}")
     conn.close()
 
 
@@ -249,6 +355,8 @@ def main() -> None:
     g = rs.add_parser("gen")
     g.add_argument("--period", required=True, choices=["daily", "weekly", "monthly"])
     g.add_argument("--date", required=True)
+    g.add_argument("--chat-id", default="aggregate",
+                   help="会话维度 id；缺省 aggregate（跨群聚合，标题不带后缀）")
     g.set_defaults(func=report_gen)
     s = rs.add_parser("show"); s.add_argument("--id", type=int, required=True)
     s.set_defaults(func=report_show)
