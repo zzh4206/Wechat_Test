@@ -139,3 +139,24 @@ FROM report r ORDER BY r.period_type, r.period_start DESC;
 - 驱动：Node 24 内置 `node:sqlite`（DatabaseSync），零 npm 依赖。
 - 历史：一次性导入器，JSONL→doc/report/entry/chat_digest，按 content_hash / (period_type,period_start) / source_key 幂等。
 - 真实库路径：本地 1数据/knowledge.db（gitignore）。
+
+## 7. v0.4 增补（会话维度 + media 表，2026-10 定案，TECH-v0.4.md 为实施依据）
+
+- report 表重建：增列 `chat_id TEXT NOT NULL DEFAULT 'aggregate'`（status 之后），冲突键改三元组
+  `UNIQUE(period_type, period_start, chat_id)`；新增索引 `idx_report_chat(chat_id, period_start)`；
+  周期一致性 CHECK 与日期 GLOB 防线原文保留。
+- 新增 media 表：媒体本体永不入库，只存地址与元数据；`path_kind ∈ local/archive`、
+  `status ∈ available/pending/missing`、`source_key` 幂等键、`CHECK(status<>'available' OR path IS NOT NULL)`。
+- 迁移机制：`PRAGMA user_version` 3→4 单事务幂等（Python report_cli 与 TS db.ts openDb 双实现，逻辑一致）；
+  全新库（0）直接建 v4；>4 拒开。
+- 写入方适配：report_cli `report gen --chat-id`（缺省 aggregate，标题不带群后缀）、export_md 非 aggregate
+  行导出至 `reports/<chatId>/`；TS dao upsertReport 带 chatId、upsertMedia/listMediaByChat、
+  mirror 与导入器按群落 report 行（`reports/<chatId>/YYYY-MM-DD.md` → chat_id=目录名群 ID）。
+- 二期规划更新：媒体附件表本期已落（media）；FTS5 / report_doc / uuid / category 仍不做。
+
+## 8. v0.4 增补（会话维度 + media 表，2026-10-19 定稿）
+
+- `report` 重建：新增 `chat_id`（默认 'aggregate'），UNIQUE 改 `(period_type, period_start, chat_id)`，双群同日日报可共存；`user_version` 3→4，两端（Python/TS）openDb 自动幂等迁移。
+- 新增 `media` 表：媒体**地址与元数据**登记（本体永不入库），`source_key` 幂等、`path_kind` 区分本机/归档、`available` 必有 path；TS 插件为唯一写入方。
+- 导入器口径：`reports/<chatId>/YYYY-MM-DD.md` 按群落行；非 @chatroom 目录（如 summary）以目录名为伪会话维度落行，属**确认行为**；既有 aggregate 行永不删除。
+- 依据：REQUIREMENT-v0.4 / REPLY-v0.4 / TECH-v0.4（同目录）。

@@ -1,12 +1,12 @@
 -- ============================================================
--- 微信知识库 · SQLite 模板 DDL（DESIGN.md v0.2 §2 + 设计评审修订 v0.2.1，接口冻结）
+-- 微信知识库 · SQLite 模板 DDL（DESIGN.md v0.2 §2 + v0.2.1 评审修订 + v0.4 会话维度/media 表）
 -- 表名/字段名与 DESIGN.md 完全一致，修订点见文件尾「修订记录」。
 -- 适用：template.db（空模板）与 sample.db（合成假数据）。
 -- ============================================================
 
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
-PRAGMA user_version = 3;   -- schema 版本 v0.2.1
+PRAGMA user_version = 4;   -- schema 版本 v0.4
 
 -- ------------------------------------------------------------
 -- 2.1 资料：一切沉淀的知识单元
@@ -52,21 +52,25 @@ CREATE INDEX idx_doc_tag_tag ON doc_tag(tag_id);   -- 修订5：反查某 tag �
 
 -- ------------------------------------------------------------
 -- 2.3 日志：日 / 周 / 月报告
--- 修订3：周期一致性 CHECK；修订6：日期格式 GLOB 防线
+-- v0.4（修订7）：重建加 chat_id（'aggregate'=跨群聚合；冲突键改三元组
+-- UNIQUE(period_type, period_start, chat_id)）；周期一致性 CHECK 与
+-- 日期格式 GLOB 防线（修订3/修订6）原文保留。
 -- ------------------------------------------------------------
 CREATE TABLE report (
   id           INTEGER PRIMARY KEY,
   period_type  TEXT NOT NULL CHECK (period_type IN ('daily','weekly','monthly')),
   period_start TEXT NOT NULL,
   period_end   TEXT NOT NULL,
-  title        TEXT NOT NULL,              -- 如「周报 2026-W42」
+  title        TEXT NOT NULL,              -- 如「周报 2026-W42」；聚合报告不带群后缀
   content_md   TEXT NOT NULL,              -- Markdown 正文
   status       TEXT NOT NULL DEFAULT 'draft'
                CHECK (status IN ('draft','final')),
+  chat_id      TEXT NOT NULL DEFAULT 'aggregate'
+               CHECK (length(chat_id) BETWEEN 1 AND 128),   -- 修订7：'aggregate'=跨群聚合
   doc_ids_hint TEXT,                       -- 引用资料 id 列表（JSON 数组）。仅提示用、可失效（二期以 report_doc 关联表替代）
   created_at   INTEGER NOT NULL,
   updated_at   INTEGER NOT NULL,
-  UNIQUE (period_type, period_start),
+  UNIQUE (period_type, period_start, chat_id),
   CHECK (period_start GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
   CHECK (period_end   GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
   CHECK (period_end >= period_start),
@@ -78,6 +82,33 @@ CREATE TABLE report (
 );
 CREATE INDEX idx_report_period ON report(period_type, period_start);
 CREATE INDEX idx_report_status ON report(status);
+CREATE INDEX idx_report_chat   ON report(chat_id, period_start);   -- 修订7
+
+-- ------------------------------------------------------------
+-- 2.3.1 media 媒体元数据表（v0.4 修订8，新增）
+-- 媒体本体永不入库：只存地址与元数据。path_kind 区分本机地址 / 归档地址。
+-- ------------------------------------------------------------
+CREATE TABLE media (
+  id         INTEGER PRIMARY KEY,
+  chat_id    TEXT NOT NULL CHECK (length(chat_id) BETWEEN 1 AND 128),
+  media_type TEXT NOT NULL CHECK (media_type IN ('image','video','file','voice')),
+  file_name  TEXT,
+  ext        TEXT CHECK (ext IS NULL OR (ext = lower(ext) AND ext NOT LIKE '%.%' AND length(ext) BETWEEN 1 AND 16)),
+  size       INTEGER CHECK (size IS NULL OR size >= 0),
+  md5        TEXT CHECK (md5 IS NULL OR length(md5) = 32),
+  path       TEXT,
+  path_kind  TEXT CHECK (path_kind IN ('local','archive')),          -- 修订8
+  status     TEXT NOT NULL DEFAULT 'available'
+             CHECK (status IN ('available','pending','missing')),
+  source_key TEXT UNIQUE,
+  source_ts  INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  CHECK (status <> 'available' OR path IS NOT NULL)   -- available 必须有地址
+);
+CREATE INDEX idx_media_chat    ON media(chat_id, media_type);
+CREATE INDEX idx_media_created ON media(created_at);
+CREATE INDEX idx_media_status  ON media(status);
 
 -- ------------------------------------------------------------
 -- 2.4 日志条目：面向报告的原子素材
@@ -120,7 +151,7 @@ CREATE TABLE chat_digest (
 CREATE INDEX idx_digest_day ON chat_digest(happened_on);
 
 -- ------------------------------------------------------------
--- 2.6 视图：周期日志全文 + 条目数
+-- 2.6 视图：周期日志全文 + 条目数（r.* 通配，自动带出 chat_id）
 -- ------------------------------------------------------------
 CREATE VIEW v_report_full AS
 SELECT r.*, (SELECT COUNT(*) FROM entry e WHERE e.report_id = r.id) AS entry_count
@@ -128,7 +159,8 @@ FROM report r
 ORDER BY r.period_type, r.period_start DESC;
 
 -- ============================================================
--- 修订记录（v0.2.1，设计评审采纳，已回写 DESIGN.md「修订记录」）
+-- 修订记录
+-- （v0.2.1，设计评审采纳，已回写 DESIGN.md「修订记录」）
 -- 1. entry.report_id / entry.doc_id / chat_digest.doc_id 外键 ON DELETE SET NULL。
 -- 2. content_hash：仅 content_md 非空时写；归一化后 SHA-256；部分索引 idx_doc_hash；
 --    CLI 命中提示「已存在相同内容（id=N）」并拒绝。
@@ -136,5 +168,13 @@ ORDER BY r.period_type, r.period_start DESC;
 -- 4. chat_digest 增列 source_key TEXT UNIQUE 与 created_by TEXT NOT NULL DEFAULT 'cli'。
 -- 5. 补索引：idx_entry_pending、idx_entry_doc、idx_doc_tag_tag。
 -- 6. 日期格式防线 CHECK（GLOB YYYY-MM-DD）：happened_on、report.period_start/period_end。
--- 二期规划（本期不做）：FTS5 全文索引、report_doc 关联表、uuid 业务键、媒体附件表、category 表。
+-- （v0.4，会话维度 + media 表，TECH-v0.4.md 定稿）
+-- 7. report 重建：加 chat_id TEXT NOT NULL DEFAULT 'aggregate'（位于 status 之后），
+--    冲突键改 UNIQUE(period_type, period_start, chat_id)；新增索引 idx_report_chat；
+--    迁移（user_version 3→4）：建 report_new → 按列名回填 chat_id='aggregate' →
+--    DROP report → RENAME，单事务。GLOB/周期 CHECK 原文保留。
+-- 8. 新增 media 表（媒体元数据，本体永不入库）：path_kind ∈ local/archive、
+--    status ∈ available/pending/missing、source_key 幂等键、
+--    CHECK(status<>'available' OR path IS NOT NULL)；补索引 idx_media_chat/created/status。
+-- 二期规划（本期不做）：FTS5 全文索引、report_doc 关联表、uuid 业务键、category 表。
 -- ============================================================
