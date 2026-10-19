@@ -10,7 +10,7 @@ A read-only [DSH](https://github.com/deepseek-ai) Cordis plugin that silently fo
 
 **macOS + WeChat 4.x only** (it reads the local SQLCipher database).
 
-**[30-second overview](#30-second-overview)** ｜ [Quick start](#quick-start) ｜ [Configuration](#configuration) ｜ [Output](#what-you-get) ｜ [Security model](#security-model-five-red-lines) ｜ [Docs](#documentation)
+**[30-second overview](#30-second-overview)** ｜ [Quick start](#quick-start) ｜ [Configuration](#configuration) ｜ [Output](#what-you-get) ｜ [Security model](#security-model-five-red-lines) ｜ [Knowledge-base template](#knowledge-base-template-and-local-data) ｜ [Docs](#documentation)
 
 ---
 
@@ -145,6 +145,24 @@ Breaking any one of them is a **P0 incident** and blocks release. The full basel
 | **R5** | **Zero key contact**: `keys.json` is never read, copied or printed; WeChat data is never written | Subprocesses go through the external CLI, which resolves keys itself; decryption goes over stdin (never as a command-line argument) |
 
 Other boundaries: the wire protocol is never reversed and the WeChat client is never modified; any UI-automation sending goes through R1's controlled channel only.
+
+## Knowledge-base template and local data
+
+This repository also carries a self-contained knowledge-base template, [`0数据格式/`](0数据格式/README.md): a three-layer SQLite schema (documents `doc` + journal `report`/`entry` + chat digests `chat_digest`) with three tools — `make_template.py` (idempotently builds the template and a synthetic sample), `report_cli.py` (entries / daily-weekly-monthly reports / document management) and `export_md.py` (Markdown export tree).
+
+**Its whole purpose is leak prevention** — real data and the publishable template are physically separated:
+
+| Location | Contents | Git status |
+|---|---|---|
+| `0数据格式/` | Template schema, tools, **synthetic sample data** (`sample.db`) | Published with this repo ✓ |
+| `1数据/` (local machine only) | **Where real data lands** — schema reuses the template, stored locally only | **Never committed** (ignored; do not `git init` it either) |
+
+Rules (full red lines in [`0数据格式/PRIVACY.md`](0数据格式/PRIVACY.md)):
+
+- Real wxids, chat records and exports may **only** live in `1数据/`; never copy them anywhere inside the repository
+- `chat_digest` stores distilled **points only**, never raw chat text; `source_key` provides idempotent deduplication
+- External writers must follow: frozen field names, `PRAGMA foreign_keys = ON`, short transactions, **single-writer principle**
+- As a result, **cloning this repository is safe for anyone** — all you get is the template and synthetic data
 
 ## Documentation
 
