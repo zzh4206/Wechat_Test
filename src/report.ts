@@ -89,6 +89,13 @@ export interface ReportWindow {
  *   end 含（≤触发时刻）。dateKey 不变（报告仍按触发日命名）。
  * - weekly/monthly：日历语义不变（本周一 00:00 / 本月 1 日 00:00 → 当日 24:00）。
  */
+/** 'YYYY-MM-DD' → 当日本地 00:00 epoch ms（非法返回 null） */
+function parseLocalDayStart(dateKey: string): number | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateKey)
+  if (!m) return null
+  return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])).getTime()
+}
+
 export function reportWindow(kind: ReportKind, asOfTs: number): ReportWindow {
   const d = new Date(asOfTs)
   const dayStart = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime()
@@ -590,12 +597,25 @@ export class ReportService {
    * 手动触发与调度触发共用同一自然周期窗口，手动不改后续节奏。
    * 同 chatId+kind+date 并发调用合并为一次执行。
    */
-  async generateReport(chatId: string, kind: ReportKind, asOf?: number): Promise<GenerateReportResult> {
+  async generateReport(
+    chatId: string,
+    kind: ReportKind,
+    asOf?: number,
+    /** 补发队列用：锚定历史 dateKey 的窗口起点（前一日 20:20），end = 再生成时刻，dateKey = 该历史日 */
+    backfillDateKey?: string,
+  ): Promise<GenerateReportResult> {
     if (!this.options.enabled) return { status: 'disabled', path: null, judgmentCount: 0, topicCount: 0, messageCount: 0 }
     if (!REPORT_KINDS.includes(kind)) throw new Error(`report: illegal kind ${JSON.stringify(kind)}`)
     if (!CHAT_ID_RE.test(chatId)) throw new Error(`report: illegal chatId rejected: ${JSON.stringify(chatId)}`)
     const ts = asOf ?? this.now()
-    const win = reportWindow(kind, ts)
+    let win = reportWindow(kind, ts)
+    if (kind === 'daily' && backfillDateKey) {
+      // 覆盖窗口：[dateKey 前一日 20:20, 再生成时刻]——把正号登录后同步进库的消息全部纳入
+      const dayStart = parseLocalDayStart(backfillDateKey)
+      if (dayStart !== null) {
+        win = { start: dayStart - 86_400_000 + 20 * 3600_000 + 20 * 60_000, end: ts, dateKey: backfillDateKey }
+      }
+    }
     const key = `${chatId}\u0000${kind}\u0000${win.dateKey}`
     const existing = this.inFlight.get(key)
     if (existing) return existing
