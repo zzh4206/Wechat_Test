@@ -119,3 +119,11 @@ v_report_full 保持 `report.*` 通配（自动带出新列）。
 3. TS 侧 schema.ts / dao.ts / mirror.ts / 导入器 + 测试 → 全量回归
 4. 真实库迁移冒烟（迁移前自动备份 knowledge.db → knowledge.db.bak-v3）
 5. 提交：2水群 本地 commit（不 push）；0数据格式 更新（schema.sql/DESIGN/README/REPLY/TECH 入库）
+
+## 附录 A.1（v0.4.1 报告类型显式通道，2026-10-19 由报告系统侧代为回填）
+
+- TS 侧：`store.writeReport(kind, chatId, dateKey, md)` → `mirrorReport(kind, …)`；
+  `reportPeriodOf(kind, dateKey)` 为 kind→period 唯一推导实现（mirror.ts 导出，
+  镜像与 `scripts/import-state-to-sqlite.mjs` 两处引用）。
+- 导入器：标题行识别 kind（周报/月报/日报；未知回退 daily 计数上报）；period 推导失败
+  跳过并 warn。DB 无 schema 变更（report 表 v0.4 结构与 CHECK 原文保留）。

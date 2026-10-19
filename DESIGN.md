@@ -153,3 +153,23 @@ FROM report r ORDER BY r.period_type, r.period_start DESC;
   行导出至 `reports/<chatId>/`；TS dao upsertReport 带 chatId、upsertMedia/listMediaByChat、
   mirror 与导入器按群落 report 行（`reports/<chatId>/YYYY-MM-DD.md` → chat_id=目录名群 ID）。
 - 二期规划更新：媒体附件表本期已落（media）；FTS5 / report_doc / uuid / category 仍不做。
+
+## 8. v0.4 增补（会话维度 + media 表，2026-10-19 定稿）
+
+- `report` 重建：新增 `chat_id`（默认 'aggregate'），UNIQUE 改 `(period_type, period_start, chat_id)`，双群同日日报可共存；`user_version` 3→4，两端（Python/TS）openDb 自动幂等迁移。
+- 新增 `media` 表：媒体**地址与元数据**登记（本体永不入库），`source_key` 幂等、`path_kind` 区分本机/归档、`available` 必有 path；TS 插件为唯一写入方。
+- 导入器口径：`reports/<chatId>/YYYY-MM-DD.md` 按群落行；非 @chatroom 目录（如 summary）以目录名为伪会话维度落行，属**确认行为**；既有 aggregate 行永不删除。
+- 依据：REQUIREMENT-v0.4 / REPLY-v0.4 / TECH-v0.4（同目录）。
+
+## 9. v0.4.1 增补（报告类型显式通道，2026-10-19，由报告系统侧代为回填）
+
+- 背景：报告文件布局 `reports/<chatId>/<dateKey>.md` 不含类型信息，路径侧镜像/导入器只能
+  猜测类型——周报（dateKey=周一）与月报（dateKey=1 号）能通过 daily 的 CHECK 校验，
+  被**静默错标为 daily**（缺口 G1/G2）。
+- 约定：报告引擎落盘改走显式通道 `store.writeReport(kind, chatId, dateKey, md)`（kind 由
+  代码给出；文件布局零破坏）；镜像按 `kind→period` 推导入库：
+  daily=(d,d)、weekly=(该周周一, 周一+6 天)、monthly=(当月 1 号, 当月月末)；
+  dateKey 非法（月报非 1 号 / 非日期）→ 跳过并 warn，**绝不猜测错标**。
+- 导入器同口径：文件系统侧无 kind 信息，按报告标题行（`# 日报 / 周报 / 月报`）识别；
+  识别不出回退 daily 并在导入汇总中计数上报；period 推导与镜像共用同一实现（单一事实源）。
+- 路径侧镜像不再从 `reports/…` 路径写入 report 行（避免与显式通道双重写入/口径漂移）。
