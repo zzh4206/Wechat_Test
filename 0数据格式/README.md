@@ -82,6 +82,24 @@ python3 export_md.py --db sample.db --out ./exports
 - chat_digest 增 source_key（UNIQUE 幂等键）与 created_by（默认 'cli'）；外部写入规约见 PRIVACY.md。
 - 补索引：idx_entry_pending、idx_entry_doc、idx_doc_tag_tag。
 
-## 二期规划（本期不做）
+## 与 TypeScript 项目的关系（v0.3 定案）
 
-- FTS5 全文索引；report_doc 关联表（替代 doc_ids_hint）；uuid 业务键；媒体附件表；category 表。
+本 schema 是 Wechat_Test 主项目（TypeScript 微信群报告系统）的**正式查询数据层**：
+该项目此前只落 JSONL/文本文件（`src/store.ts` 是唯一写入点），不便查看与开发前端，
+现约定「**JSONL 仍是事实源 + SQLite 镜像双写**」：
+
+- 驱动：Node 24 内置 `node:sqlite`（零 npm 依赖），短事务 + `busy_timeout` + WAL；
+- 写入：`store.ts` 增加可选镜像钩子，SQLite 写失败只记 logger，绝不影响主流程；
+- 历史：一次性导入器把既有 state 目录数据迁入 `doc/report/entry/chat_digest`（可重复运行，幂等）；
+- 查询：前端/人工一律走本库（视图 `v_report_full`、`idx_entry_pending` 等已就绪）；
+- `chat_digest` 从此由 TS 项目写入，`source_key` 幂等键 + 单写者规约（见 [PRIVACY.md](PRIVACY.md)）。
+
+实施进度见下方「路线图」。Python CLI（`report_cli.py` / `export_md.py`）与 TS 镜像**共存通用**：
+两边写的是同一个 schema 的同一个库。
+
+## 路线图
+
+- [x] v0.2.1 schema 冻结（含评审修订 6 条）+ Python CLI + Markdown 导出
+- [ ] TS 数据层：`src/db/`（db.ts / dao.ts / mirror.ts）+ store.ts 双写钩子
+- [ ] JSONL 历史数据一次性导入器（幂等，可重跑）
+- [ ] FTS5 中文全文索引；report_doc 关联表；媒体附件表；category 字典表；前端查询接口

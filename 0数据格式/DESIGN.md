@@ -131,3 +131,11 @@ FROM report r ORDER BY r.period_type, r.period_start DESC;
 6. **日期格式防线**：`happened_on`、`report.period_start/period_end` 加 `CHECK (x IS NULL OR x GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]')`。
 
 **二期规划（本期不做）**：FTS5 全文索引、report_doc 关联表（暂保留 doc_ids_hint，仅提示、可失效）、uuid 业务键、媒体附件表、category 表。
+
+## 6. v0.3 增补（TypeScript 数据层整合，2026-10-19 定案）
+
+- 定位变更：本 schema 为主项目（TS 微信群报告系统）的正式查询数据层，非独立知识库。
+- 同步模式：**JSONL 仍为事实源 + SQLite 镜像双写**（store.ts 可选钩子；SQLite 写失败只记 logger）。
+- 驱动：Node 24 内置 `node:sqlite`（DatabaseSync），零 npm 依赖。
+- 历史：一次性导入器，JSONL→doc/report/entry/chat_digest，按 content_hash / (period_type,period_start) / source_key 幂等。
+- 真实库路径：本地 1数据/knowledge.db（gitignore）。
