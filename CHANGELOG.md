@@ -8,6 +8,15 @@
 
 ### Added
 
+- schema v0.4（会话维度 + media 表）：`report` 增列 `chat_id`（`'aggregate'`=跨群聚合），冲突键改三元组 `(period_type, period_start, chat_id)`；新增 `media` 元数据表（媒体本体永不入库，`path_kind`、status 三态、`source_key` 幂等键）；`KnowledgeDao` 增 `upsertMedia` / `listMediaByChat`，`upsertReport` 带 `chatId`
+- schema 自动迁移（`db.ts openDb`）：`user_version` 3→4 单事务幂等（report 重建回填 `chat_id='aggregate'`、建 media 表），0=全新建 v4，>4 报错拒开，与 Python 侧逻辑一致
+
+### Changed
+
+- 镜像与导入器按群落 report 行：`reports/<chatId>/YYYY-MM-DD.md` → `chat_id=<群 ID>`（不再跨群聚合分节）；既有 aggregate 行不删不改
+
+### Added
+
 - SQLite 知识库数据层（`src/db/`，node:sqlite `DatabaseSync`，零 npm 依赖）：冻结 schema v0.2.1 内嵌 DDL、`KnowledgeDao`（doc/entry/report/chat_digest，`source_key` 与 `(period_type, period_start)` 幂等 upsert）、`BEGIN IMMEDIATE` 短事务、写失败只 warn 不致命
 - 可选 SQLite 镜像：`Store` 构造函数新增 `sqlitePath?`——传入即把 `groups/<chatId>/insights.jsonl`（→ `chat_digest`/`entry`）与 `reports/<chatId>/YYYY-MM-DD.md`（→ `report`）镜像进知识库；JSONL 仍是事实源，镜像失败静默降级
 - 一次性导入器 `scripts/import-state-to-sqlite.mjs`：`--state-dir`（只读）+ `--db`（默认 `<home>/WeChat/1数据/knowledge.db`），可重复运行（`source_key` 内容哈希幂等）

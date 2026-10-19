@@ -2,11 +2,12 @@
  * dao.ts：知识库 CRUD（冻结 schema 上的薄封装）。
  * 幂等语义：
  * - upsertDoc：content_hash 命中已有行 → 返回已有 id、不覆盖（DESIGN 修订2「拒绝重复」语义）；
- * - upsertReport：(period_type, period_start) 命中 → UPDATE 正文等（修订1「UPDATE 而非删建」）；
- * - insertChatDigest：source_key 命中 → UPDATE（schema UNIQUE 幂等键）。
+ * - upsertReport：(period_type, period_start, chat_id) 三元组命中 → UPDATE 正文等（修订1「UPDATE 而非删建」）；
+ * - insertChatDigest：source_key 命中 → UPDATE（schema UNIQUE 幂等键）；
+ * - upsertMedia：source_key 命中 → UPDATE（媒体重扫幂等，updated_at 刷新）。
  * 全部写路径失败只 warn 返回 null/false，不抛致命错误。
  */
-import type { DatabaseSync } from 'node:sqlite'
+import type { DatabaseSync, SQLInputValue } from 'node:sqlite'
 import { createHash } from 'node:crypto'
 import { normalizeText, withTransaction, type DbLogger } from './db.js'
 import type {
@@ -16,6 +17,8 @@ import type {
   DocRow,
   EntryInput,
   EntryRow,
+  MediaInput,
+  MediaRow,
   ReportFullRow,
   ReportInput,
   ReportRow,
@@ -173,15 +176,16 @@ export class KnowledgeDao {
 
   // ---------- report ----------
 
-  /** 幂等 upsert：UNIQUE(period_type, period_start) 冲突 → UPDATE 正文 */
+  /** 幂等 upsert：UNIQUE(period_type, period_start, chat_id) 三元组冲突 → UPDATE 正文 */
   upsertReport(input: ReportInput): number | null {
+    const chatId = input.chatId ?? 'aggregate'
     try {
       const now = input.createdAt ?? this.now()
       const res = this.db
         .prepare(
-          `INSERT INTO report (period_type, period_start, period_end, title, content_md, status, doc_ids_hint, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT (period_type, period_start) DO UPDATE SET
+          `INSERT INTO report (period_type, period_start, period_end, title, content_md, status, chat_id, doc_ids_hint, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (period_type, period_start, chat_id) DO UPDATE SET
              period_end = excluded.period_end,
              title = excluded.title,
              content_md = excluded.content_md,
@@ -196,11 +200,12 @@ export class KnowledgeDao {
           input.title,
           input.contentMd,
           input.status ?? 'draft',
+          chatId,
           input.docIdsHint ?? null,
           now,
           now,
         )
-      const row = this.getReport(input.periodType, input.periodStart)
+      const row = this.getReport(input.periodType, input.periodStart, chatId)
       return row?.id ?? Number(res.lastInsertRowid)
     } catch (error) {
       this.logger.warn(`dao.upsertReport failed: ${String(error)}`)
@@ -208,12 +213,13 @@ export class KnowledgeDao {
     }
   }
 
-  getReport(periodType: string, periodStart: string): ReportRow | null {
+  /** chatId 缺省时按 aggregate 语义查（v0.4 唯一键三元组） */
+  getReport(periodType: string, periodStart: string, chatId = 'aggregate'): ReportRow | null {
     try {
       return (
         (this.db
-          .prepare('SELECT * FROM report WHERE period_type = ? AND period_start = ?')
-          .get(periodType, periodStart) as ReportRow | undefined) ?? null
+          .prepare('SELECT * FROM report WHERE period_type = ? AND period_start = ? AND chat_id = ?')
+          .get(periodType, periodStart, chatId) as ReportRow | undefined) ?? null
       )
     } catch {
       return null
@@ -226,6 +232,77 @@ export class KnowledgeDao {
       return this.db
         .prepare('SELECT * FROM v_report_full WHERE period_type = ? AND period_start >= ? AND period_start <= ? ORDER BY period_start')
         .all(periodType, startDay, endDay) as unknown as ReportFullRow[]
+    } catch {
+      return []
+    }
+  }
+
+  // ---------- media ----------
+
+  /** 幂等 upsert：source_key 冲突 → UPDATE 全字段并刷新 updated_at（媒体重扫幂等） */
+  upsertMedia(m: MediaInput): number | null {
+    if (!m.chatId || !m.mediaType || !m.sourceKey || !m.status) return null
+    try {
+      const now = m.createdAt ?? this.now()
+      const res = this.db
+        .prepare(
+          `INSERT INTO media (chat_id, media_type, file_name, ext, size, md5, path, path_kind, status, source_key, source_ts, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (source_key) DO UPDATE SET
+             chat_id = excluded.chat_id,
+             media_type = excluded.media_type,
+             file_name = excluded.file_name,
+             ext = excluded.ext,
+             size = excluded.size,
+             md5 = excluded.md5,
+             path = excluded.path,
+             path_kind = excluded.path_kind,
+             status = excluded.status,
+             source_ts = excluded.source_ts,
+             updated_at = excluded.updated_at`,
+        )
+        .run(
+          m.chatId,
+          m.mediaType,
+          m.fileName ?? null,
+          m.ext ?? null,
+          m.size ?? null,
+          m.md5 ?? null,
+          m.path ?? null,
+          m.pathKind ?? null,
+          m.status,
+          m.sourceKey,
+          m.sourceTs ?? null,
+          now,
+          now,
+        )
+      const row = this.db.prepare('SELECT id FROM media WHERE source_key = ?').get(m.sourceKey) as
+        | { id: number }
+        | undefined
+      return row?.id ?? Number(res.lastInsertRowid)
+    } catch (error) {
+      this.logger.warn(`dao.upsertMedia failed: ${String(error)}`)
+      return null
+    }
+  }
+
+  /** 按会话查媒体元数据（可选按类型/状态过滤，走 idx_media_chat） */
+  listMediaByChat(chatId: string, filter?: { mediaType?: string; status?: string }): MediaRow[] {
+    try {
+      const conds = ['chat_id = ?']
+      const args: SQLInputValue[] = [chatId]
+      if (filter?.mediaType) {
+        conds.push('media_type = ?')
+        args.push(filter.mediaType)
+      }
+      if (filter?.status) {
+        conds.push('status = ?')
+        args.push(filter.status)
+      }
+      args.push(500)
+      return this.db
+        .prepare(`SELECT * FROM media WHERE ${conds.join(' AND ')} ORDER BY created_at LIMIT ?`)
+        .all(...args) as unknown as MediaRow[]
     } catch {
       return []
     }
@@ -294,7 +371,7 @@ export class KnowledgeDao {
   }
 
   /** 单标量统计（导入器 / 测试断言行数用） */
-  count(table: 'doc' | 'tag' | 'doc_tag' | 'report' | 'entry' | 'chat_digest'): number {
+  count(table: 'doc' | 'tag' | 'doc_tag' | 'report' | 'entry' | 'chat_digest' | 'media'): number {
     try {
       const row = this.db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }
       return Number(row.n)

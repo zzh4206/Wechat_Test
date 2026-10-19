@@ -39,8 +39,30 @@ export interface ReportInput {
   periodEnd: string
   title: string
   contentMd: string
+  /** 会话维度 id；缺省 'aggregate'（跨群聚合） */
+  chatId?: string
   status?: ReportStatus
   docIdsHint?: string | null
+  createdAt?: number
+}
+
+export type MediaKind = 'image' | 'video' | 'file' | 'voice'
+export type MediaPathKind = 'local' | 'archive'
+export type MediaStatus = 'available' | 'pending' | 'missing'
+
+/** media 输入：chat_id/media_type/source_key 必填，其余可选（source_key 冲突走 UPDATE） */
+export interface MediaInput {
+  chatId: string
+  mediaType: MediaKind
+  sourceKey: string
+  status: MediaStatus
+  fileName?: string | null
+  ext?: string | null
+  size?: number | null
+  md5?: string | null
+  path?: string | null
+  pathKind?: MediaPathKind | null
+  sourceTs?: number | null
   createdAt?: number
 }
 
@@ -64,7 +86,25 @@ export interface ReportRow {
   title: string
   content_md: string
   status: string
+  chat_id: string
   doc_ids_hint: string | null
+  created_at: number
+  updated_at: number
+}
+
+export interface MediaRow {
+  id: number
+  chat_id: string
+  media_type: string
+  file_name: string | null
+  ext: string | null
+  size: number | null
+  md5: string | null
+  path: string | null
+  path_kind: string | null
+  status: string
+  source_key: string | null
+  source_ts: number | null
   created_at: number
   updated_at: number
 }

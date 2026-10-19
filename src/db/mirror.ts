@@ -13,8 +13,8 @@
  *      happened_on=条目 ts 的本地日，source_key='insight:<type>:<hash8(整行 JSON)>'）
  *    - opportunity → entry(kind='idea')（面向报告的原子素材语义）
  * 2) reports/<chatId>/YYYY-MM-DD.md（report.ts 日报，writeText 覆写）
- *    → report(daily, period_start=period_end=日期, title='日报 <chatId> <日期>')，
- *      同键重复写走 upsertReport UPDATE（幂等）。
+ *    → report(daily, period_start=period_end=日期, chat_id=<chatId>，
+ *      title='日报 <chatId> <日期>')，同键重复写走 upsertReport UPDATE（幂等）。
  * 其余（audit / llm-calls / outbox / person-digest / pipeline 记忆等）不映射。
  */
 import { homedir } from 'node:os'
@@ -120,6 +120,7 @@ export function createSqliteMirror(sqlitePath: string | undefined, logger: DbLog
         return
       }
       const [, chatId, day] = m
+      // v0.4：report 镜像带真实 chat_id（rel 路径 reports/<chatId>/ 已含群 ID；解析不出时上面正则已不匹配）
       safe(() =>
         dao.upsertReport({
           periodType: 'daily',
@@ -128,6 +129,7 @@ export function createSqliteMirror(sqlitePath: string | undefined, logger: DbLog
           title: `日报 ${chatId} ${day}`,
           contentMd: text,
           status: 'draft',
+          chatId,
           docIdsHint: null,
         }),
       )

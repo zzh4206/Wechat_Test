@@ -10,8 +10,9 @@
  * 映射规则（与 src/db/mirror.ts 一致）：
  *   groups/<chatId>/insights.jsonl → chat_digest（topic/viewpoint/quote，source_key 内容 hash8 幂等）
  *                                    + entry（opportunity → kind='idea'）
- *   reports/<chatId>/YYYY-MM-DD.md → report(daily)；同一天多个群合并为一份（schema 唯一键
- *                                    (period_type, period_start) 冻结，正文按群分节拼接）
+ *   reports/<chatId>/YYYY-MM-DD.md → report(daily, chat_id=<群 ID>)；v0.4 起按群各落一行
+ *                                   （冲突键三元组），不再跨群聚合分节；已存在的 aggregate
+ *                                    行（迁移回填）不删不改。
  *   其余文件（audit/cursor/outbox/llm-calls/...）不映射，计入「未映射」统计。
  * 报告/摘要幂等：先聚合再 upsert；doc 表本次 state 中没有对应资料来源，不硬造。
  */
@@ -118,8 +119,8 @@ const stats = {
   otherFiles: 0,
 }
 
-// reports/<x>/YYYY-MM-DD.md 聚合（同一天多群合并，正文分节）
-const reportsByDay = new Map() // day -> Array<[chatId, md]>
+// reports/<x>/YYYY-MM-DD.md 按群逐文件收集（v0.4：每 (chatId, day) 一行，不再跨群聚合）
+const reportFiles = [] // Array<[chatId, day, md]>
 
 for (const name of readdirSync(args.stateDir)) {
   const p = join(args.stateDir, name)
@@ -150,8 +151,7 @@ for (const name of readdirSync(args.stateDir)) {
         if (!/^\d{4}-\d{2}-\d{2}\.md$/.test(f)) continue
         const day = basename(f, '.md')
         const md = readFileSync(join(rp, f), 'utf8')
-        if (!reportsByDay.has(day)) reportsByDay.set(day, [])
-        reportsByDay.get(day).push([sub, md])
+        reportFiles.push([sub, day, md])
         stats.reportFiles++
       }
     }
@@ -161,19 +161,17 @@ for (const name of readdirSync(args.stateDir)) {
   stats.otherFiles++
 }
 
-// 聚合后的报告统一 upsert（先聚合再写 → 重复运行天然幂等）
-for (const [day, parts] of [...reportsByDay.entries()].sort()) {
-  const merged = parts
-    .sort((a, b) => (a[0] < b[0] ? -1 : 1))
-    .map(([chatId, md]) => `## ${chatId}\n\n${normalizeText(md)}`)
-    .join('\n\n')
+// 按群逐行 upsert（冲突键三元组 (daily, day, chatId) → 重复运行天然幂等；
+// aggregate 旧行不受影响——键不同不会命中）
+for (const [chatId, day, md] of reportFiles) {
   const id = dao.upsertReport({
     periodType: 'daily',
     periodStart: day,
     periodEnd: day,
-    title: `日报聚合 ${day}`,
-    contentMd: merged,
+    title: `日报 ${chatId} ${day}`,
+    contentMd: normalizeText(md),
     status: 'draft',
+    chatId,
     docIdsHint: null,
   })
   if (id !== null) stats.reportsMapped++
@@ -183,7 +181,7 @@ const before = dao.count('report')
 console.log('导入完成：')
 console.log(`  db=${args.db}`)
 console.log(`  insights 行 ${stats.insightLines}：映射 ${stats.mappedInsight}（digest ${stats.digests} + entry ${stats.entries}），未映射 ${stats.unmappedInsight}，写失败 ${stats.failedInsight}`)
-console.log(`  日报文件 ${stats.reportFiles}：聚合为 report 行 ${stats.reportsMapped}`)
+console.log(`  日报文件 ${stats.reportFiles}：按群落 report 行 ${stats.reportsMapped}`)
 console.log(`  未映射的 state 子目录：${stats.otherFiles}`)
 console.log(`  库内计数：doc=${dao.count('doc')} report=${before} entry=${dao.count('entry')} chat_digest=${dao.count('chat_digest')}`)
 console.log(`  内容指纹示例（首条 digest 源键即 insight:<type>:<hash8>；doc.content_hash 归一化=去 BOM/CRLF→LF/strip 后 sha256）`)

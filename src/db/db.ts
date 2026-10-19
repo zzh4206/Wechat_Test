@@ -9,7 +9,7 @@
 import { DatabaseSync } from 'node:sqlite'
 import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
-import { SCHEMA_SQL, SCHEMA_VERSION } from './schema.js'
+import { MIGRATE_V3_TO_V4_SQL, SCHEMA_SQL, SCHEMA_VERSION } from './schema.js'
 
 export interface DbLogger {
   warn(message: string): unknown
@@ -18,8 +18,54 @@ export interface DbLogger {
 
 export interface OpenOptions {
   logger: DbLogger
-  /** true（默认）时执行内嵌 DDL（幂等，IF NOT EXISTS）；已建库可传 false 跳过 */
+  /**
+   * true（默认）时执行 schema 校准：v4 库跳过、v3 库单事务迁移到 v4、
+   * user_version=0（全新库）执行全量 DDL、>4 报错拒开。
+   */
   initSchema?: boolean
+}
+
+function getUserVersion(db: DatabaseSync): number {
+  const row = db.prepare('PRAGMA user_version').get() as { user_version?: number } | undefined
+  return row?.user_version ?? 0
+}
+
+/**
+ * schema 校准（幂等、自动；TECH-v0.4 §2）：
+ * - =4：跳过；>4：抛错（调用方拒开）；0（全新库）：执行 v0.4 全量 DDL；
+ * - =3：单事务执行 report 重建 + media 建表，user_version 最后置 4，
+ *   任何一步失败整体回滚（重入安全：失败后仍为 v3，下次打开重试）。
+ */
+function ensureSchema(db: DatabaseSync, logger: DbLogger): void {
+  const version = getUserVersion(db)
+  if (version === SCHEMA_VERSION) return
+  if (version > SCHEMA_VERSION) {
+    throw new Error(`schema version ${version} > supported ${SCHEMA_VERSION}, refusing to open`)
+  }
+  if (version === 3) {
+    // DROP report 前须关外键（SQLite 迁移规约），否则 entry 子行引用会阻断 DROP；
+    // PRAGMA foreign_keys 不参与事务回滚，故在事务外先 OFF、成功后再 ON。
+    db.exec('PRAGMA foreign_keys = OFF;')
+    try {
+      db.exec('BEGIN;')
+      db.exec(MIGRATE_V3_TO_V4_SQL)
+      db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`)
+      db.exec('COMMIT;')
+    } catch (error) {
+      try {
+        db.exec('ROLLBACK;')
+      } catch {
+        /* 事务已不存在（BEGIN 本身失败），忽略 */
+      }
+      throw error
+    } finally {
+      db.exec('PRAGMA foreign_keys = ON;')
+    }
+    logger.debug?.(`db.ensureSchema: migrated user_version 3 -> ${SCHEMA_VERSION}`)
+    return
+  }
+  // version === 0：全新库，直接执行 v0.4 全量 DDL（脚本自带 user_version=4）
+  db.exec(SCHEMA_SQL)
 }
 
 /** 打开（必要时创建）知识库；失败返回 null 并 warn */
@@ -31,8 +77,7 @@ export function openDb(path: string, options: OpenOptions): DatabaseSync | null 
     db.exec('PRAGMA busy_timeout = 5000;')
     db.exec('PRAGMA journal_mode = WAL;')
     if (options.initSchema !== false) {
-      db.exec(SCHEMA_SQL)
-      db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`)
+      ensureSchema(db, options.logger)
     }
     return db
   } catch (error) {
