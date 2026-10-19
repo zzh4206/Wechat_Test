@@ -46,6 +46,7 @@
  */
 import { execFile } from 'node:child_process'
 import { join } from 'node:path'
+import type { AccountGate } from './account-probe.js'
 import type { Outbox, OutboxEntry } from './outbox.js'
 
 /** 通道白名单：硬编码，唯一出口 */
@@ -263,6 +264,8 @@ export interface SenderOptions {
   frontmostWarnAfter?: number
   /** Config.idleSkipBelowSec：空闲低于该秒数视为用户正在操作→让路跳过（默认 10 = 现行为；0 = 不让路直接发） */
   idleSkipBelowSec?: number
+  /** 账号生命周期闸（account-probe）：活跃账号 ≠ 配置账号 → 全面挂起；未注入 = 零变化 */
+  accountGate?: AccountGate
   /** 系统空闲秒数注入（默认 Infinity = 闸不生效；生产由 index.ts 注入 defaultSystemIdleSec） */
   systemIdleSec?: () => Promise<number>
   /** 命令执行注入（测试 mock；默认 node:child_process execFile） */
@@ -508,6 +511,8 @@ export class SenderService {
   private readonly isFrontmostFn: () => Promise<boolean>
   private readonly idleSecFn: () => Promise<number>
   private readonly idleSkipBelowSec: number
+  /** 账号挂起连续轮数（审计节流：首轮 + 每 10 轮记一次） */
+  private wrongAccountRounds = 0
   private readonly sleep: (ms: number) => Promise<void>
   private readonly verifyDelayMs: number
   private readonly verifyRetries: number
@@ -879,6 +884,40 @@ export class SenderService {
   async processOnce(): Promise<SendRoundResult> {
     // ① 总闸：未启用 = 零活动
     if (!this.enabled) return { action: 'disabled', processed: 0 }
+
+    // ⓪ 账号生命周期闸：活跃账号 ≠ 配置账号 → 全面挂起（不激活微信、不敲键、pending 不耗
+    //    attempts）；审计 'wrong_account_suspended' 首轮 + 每 10 轮各记一次（防刷屏）。
+    //    回归边沿（挂起 → 活跃=配置账号）：走取钥恢复流程（触发条件与账号防护见 account-probe）。
+    const acctGate = this.options.accountGate
+    if (acctGate) {
+      const active = await acctGate.activeAccount()
+      if (active !== null && !acctGate.isAllowed(active)) {
+        // 白名单外账号活跃 → sender 全面挂起（零微信交互，pending 不耗 attempts）；
+        // 读取层不挂起（对配置 db 只读无害），但提醒缓存语义。
+        acctGate.setSuspended(true)
+        this.wrongAccountRounds += 1
+        const digest = `${active.slice(0, 8)}…`
+        if (this.wrongAccountRounds === 1 || this.wrongAccountRounds % 10 === 0) {
+          this.audit({ result: 'non_whitelisted_account_suspended', rounds: this.wrongAccountRounds, activeDigest: digest })
+          this.options.logger.warn(`sender: 非白名单账号活跃（${digest}）——sender 全面挂起防误发；读取层读的是缓存数据（第 ${this.wrongAccountRounds} 轮）`)
+        }
+        return { action: 'wrong_account_suspended', processed: 0 }
+      }
+      if (acctGate.wasSuspended()) {
+        const outcome = await acctGate.rekeyAndVerify(active)
+        if (outcome === 'healthy' || outcome === 'rekeyed') {
+          this.audit({ result: 'account_recovered', outcome })
+          this.options.logger.info(`sender: 账号已恢复（${outcome}）——sender 恢复运转，deferred/pending 条目下轮自动补发`)
+        } else {
+          const result = outcome === 'blocked_wrong_account' ? 'rekey_blocked_non_whitelisted' : `rekey_${outcome}`
+          this.audit({ result })
+          this.options.logger.warn(`sender: 账号恢复未完成（${outcome}）——保持挂起`)
+          return { action: 'wrong_account_suspended', processed: 0 }
+        }
+        acctGate.setSuspended(false)
+        this.wrongAccountRounds = 0
+      }
+    }
 
     const all = this.options.outbox.listOutbox()
     // ② 通道闸：白名单外条目直接 skip 并 error 日志（硬编码红线，永不发送）

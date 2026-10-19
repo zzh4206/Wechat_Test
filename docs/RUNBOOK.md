@@ -466,6 +466,17 @@ Accessibility Inspector 确认元素层级）。**实证结论回填此处：___
   低于该阈值才跳过本轮让路（`user_active`）；≥阈值或设 0 → 不让路，直接抢前台发送。
   **日常单日报场景可设 0**（每天一次的抢前台可接受）；默认 10 适合频繁发送场景（绝不打断打字）；
 - **失败重试**：attempts 落盘，≥3 次转 `failed` 不再重试（防风暴）；
+- **账号生命周期自动化（白名单制，2026-10-15）**：探针每轮消费周期对
+  `xwechat_files/wxid_*` 各目录做**双快照活动对比**（间隔 2s；文件数或最新 mtime 变化 =
+  持续写入流 = 活跃；单次快照无判别力）。活跃 ∉ `accountWhitelist` → sender **全面挂起**
+  （零微信交互，pending 不耗 attempts），审计 `non_whitelisted_account_suspended` 首轮+每
+  10 轮各记一次 + 提醒「读取层读的是缓存数据」；读取层不挂起。白名单空 = 仅允许
+  sourceDbRoot 派生的默认账号。**回归恢复三重条件**（同时满足才取钥）：活跃 ∈ 白名单 +
+  `wechat_db.py verify` 确认密钥失效 + `allowAutoRekey=true`；白名单外账号活跃时**绝不取钥**
+  （代码级硬阻断——防把别的账号登进临时副本污染密钥台账）。取钥（每回归周期 ≤1 次）→
+  verify 19/19 → 恢复；用户超时未登录临时副本 → 本轮放弃下轮重试。`allowAutoRekey=false`
+  （默认）只通知人工执行 bootstrap_keys.py；**两段式开启条件**：首次开启前必须人工成功
+  手跑一次取钥。db-root 代码级锁定配置账号目录（派生自 sourceDbRoot）。
 - **media 镜像（v0.4）**：file-index 扫描入库后（同一消息处理周期，无独立定时器），
   groupStore `files` 表全量 upsert 进 knowledge.db `media`：
   `source_key = <chatId>:<file_id>`（幂等）；media_type 图片→image / 视频→video / 其余→file；
