@@ -7,7 +7,7 @@
 import { mkdirSync, appendFileSync, writeFileSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { assertInsideState } from './guard.js'
-import { createSqliteMirror, type SqliteMirror } from './db/mirror.js'
+import { createSqliteMirror, type MediaSourceFile, type SqliteMirror } from './db/mirror.js'
 
 export interface StoreLogger {
   warn(message: string): unknown
@@ -25,6 +25,11 @@ export class Store {
     sqlitePath?: string,
   ) {
     this.mirror = createSqliteMirror(sqlitePath, logger)
+  }
+
+  /** media 镜像透传（v0.4：file-index 扫描后由接线层调用；未启用镜像时零开销） */
+  mirrorMedia(chatId: string, files: ReadonlyArray<MediaSourceFile>): void {
+    this.mirror?.mirrorMedia(chatId, files)
   }
 
   /** 相对 baseDir 创建目录（rel 传 '.' 即 baseDir 本身） */

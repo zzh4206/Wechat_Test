@@ -746,9 +746,18 @@ export function apply(ctx: Context, config: PluginConfig): void {
                     )
                   }
                   if (fileIndex) {
-                    void fileIndex.scanChat(message.chatId).catch((error: unknown) =>
-                      logger.warn(`file-index scan failed: ${String(error)}`),
-                    )
+                    void fileIndex
+                      .scanChat(message.chatId)
+                      .then(() => {
+                        // v0.4 media 镜像：与既有镜像同一消息处理周期（无独立定时器）——
+                        // file-index 入库后把 groupStore files 全量 upsert 进 knowledge.db.media
+                        try {
+                          store.mirrorMedia(message.chatId, groupStore.getFiles(message.chatId, { limit: 1000 }))
+                        } catch (error: unknown) {
+                          logger.warn(`media mirror failed: ${String(error)}`)
+                        }
+                      })
+                      .catch((error: unknown) => logger.warn(`file-index scan failed: ${String(error)}`))
                   }
                   // M6-T3：事件↔文件自动关联（低风险：只写 events.file_ids 关联行，
                   // 不改事件本体；confidence 只进 audit 元数据）

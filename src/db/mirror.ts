@@ -23,6 +23,27 @@ import { openDb } from './db.js'
 import { KnowledgeDao, hash8 } from './dao.js'
 import type { DbLogger } from './db.js'
 
+/** media 镜像源行：groupStore files 表（FileRow）所需子集，解耦避免依赖循环 */
+export interface MediaSourceFile {
+  fileId: string
+  name: string
+  ext: string
+  size: number
+  msgId: string | null
+  wxPath: string
+  hash: string
+  category: string
+  lastSeenTs: number
+  appearances: ReadonlyArray<{ msgId: string; ts: number }>
+}
+
+/** files.category → knowledge media_type（v0.4 CHECK 四类；voice 未采集，兜底 file） */
+function mediaKindOf(category: string): 'image' | 'video' | 'file' | 'voice' {
+  if (category === '图片') return 'image'
+  if (category === '视频') return 'video'
+  return 'file'
+}
+
 /** 未显式传 sqlitePath 时导入器使用的默认库路径（真实数据目录，已 gitignore） */
 export function defaultDbPath(): string {
   return join(homedir(), 'WeChat', '1数据', 'knowledge.db')
@@ -45,6 +66,12 @@ export interface SqliteMirror {
   mirrorJsonl(rel: string, entry: unknown): void
   /** writeText 成功后调用；按入口路径分发，未映射跳过 */
   mirrorText(rel: string, text: string): void
+  /**
+   * media 镜像（v0.4）：groupStore files 表 → knowledge.db media。
+   * 由接线层在 file-index 扫描完成后调用（与既有镜像同一消息处理周期，无独立定时器）。
+   * source_key = `<chatId>:<fileId>`（file_id 稳定派生键，重扫幂等）。
+   */
+  mirrorMedia(chatId: string, files: ReadonlyArray<MediaSourceFile>): void
   close(): void
 }
 
@@ -111,6 +138,33 @@ export function createSqliteMirror(sqlitePath: string | undefined, logger: DbLog
     mirrorJsonl(rel, entry) {
       if (INSIGHTS_RE.test(rel)) safe(() => mirrorInsight(entry))
       else logger.debug?.(`mirror: no mapping for jsonl ${rel}, skipped`)
+    },
+
+    mirrorMedia(chatId, files) {
+      for (const f of files) {
+        if (!f || typeof f.fileId !== 'string' || f.fileId === '') continue
+        const hasPath = typeof f.wxPath === 'string' && f.wxPath !== '' && f.wxPath !== '待下载'
+        const sourceTs =
+          f.lastSeenTs > 0
+            ? f.lastSeenTs
+            : (f.appearances?.[0]?.ts ?? null)
+        safe(() =>
+          dao.upsertMedia({
+            chatId,
+            mediaType: mediaKindOf(f.category),
+            sourceKey: `${chatId}:${f.fileId}`,
+            status: hasPath ? 'available' : 'pending',
+            fileName: f.name,
+            ext: f.ext,
+            size: typeof f.size === 'number' && f.size > 0 ? f.size : null,
+            md5: f.hash || null,
+            path: hasPath ? f.wxPath : null,
+            pathKind: hasPath ? 'local' : null,
+            sourceTs: typeof sourceTs === 'number' && sourceTs > 0 ? sourceTs : null,
+            createdAt: sourceTs ?? undefined,
+          }),
+        )
+      }
     },
 
     mirrorText(rel, text) {

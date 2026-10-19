@@ -466,6 +466,11 @@ Accessibility Inspector 确认元素层级）。**实证结论回填此处：___
   低于该阈值才跳过本轮让路（`user_active`）；≥阈值或设 0 → 不让路，直接抢前台发送。
   **日常单日报场景可设 0**（每天一次的抢前台可接受）；默认 10 适合频繁发送场景（绝不打断打字）；
 - **失败重试**：attempts 落盘，≥3 次转 `failed` 不再重试（防风暴）；
+- **media 镜像（v0.4）**：file-index 扫描入库后（同一消息处理周期，无独立定时器），
+  groupStore `files` 表全量 upsert 进 knowledge.db `media`：
+  `source_key = <chatId>:<file_id>`（幂等）；media_type 图片→image / 视频→video / 其余→file；
+  status 有 path→available(local)、无 path/待下载→pending；md5/ext 按 knowledge CHECK 约束
+  （32 位 hex / 小写 1–16 位）不合规范置空；失败仅 warn 不影响主流程；
 - **日报窗口锚定调度（2026-10-15 决策）**：daily 窗口 = **前一日 20:20 → 触发时刻**（10 分钟
   边界余量）。动机：日报 20:30 定时送达，旧窗口 [当天00:00, 20:30] 会把「昨晚 20:30 之后的消息」
   漏进两份日报的夹缝。新窗口保证 20:30 附近的重要消息必被至少一份日报捕获；20:20–20:30 的重叠
