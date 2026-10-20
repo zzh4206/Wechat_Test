@@ -93,6 +93,56 @@ export class KnowledgeDao {
     }
   }
 
+  /**
+   * tag 按 name 幂等存在即取（SELECT 无则 INSERT），返回 tag id；失败 → null。
+   * 与 Python get_or_create_tag 同语义。
+   */
+  ensureTag(name: string): number | null {
+    if (!name) return null
+    try {
+      const hit = this.db.prepare('SELECT id FROM tag WHERE name = ?').get(name) as { id: number } | undefined
+      if (hit) return hit.id
+      this.db.prepare('INSERT INTO tag (name) VALUES (?)').run(name)
+      const row = this.db.prepare('SELECT id FROM tag WHERE name = ?').get(name) as { id: number }
+      return row.id
+    } catch (error) {
+      this.logger.warn(`dao.ensureTag failed: ${String(error)}`)
+      return null
+    }
+  }
+
+  /**
+   * 全库 content_md 已含该 URL → 返回已有 doc id（与 Python 脚本查重 2 同口径：
+   * `content_md LIKE '%<url>%'`），未命中/失败 → null。
+   */
+  findDocIdByUrl(url: string): number | null {
+    if (!url) return null
+    try {
+      // instr() 精确子串（URL 常含 _ 等 LIKE 通配符，不用 LIKE 以免口径漂移；与 Python `u in m` 等价）
+      const row = this.db
+        .prepare('SELECT id FROM doc WHERE instr(content_md, ?) > 0 LIMIT 1')
+        .get(url) as { id: number } | undefined
+      return row?.id ?? null
+    } catch (error) {
+      this.logger.warn(`dao.findDocIdByUrl failed: ${String(error)}`)
+      return null
+    }
+  }
+
+  /** content_hash 精确命中 → 返回已有 doc id（文件索引行指纹查重），未命中/失败 → null */
+  findDocByHash(hash: string): number | null {
+    if (!hash) return null
+    try {
+      const row = this.db.prepare('SELECT id FROM doc WHERE content_hash = ? LIMIT 1').get(hash) as
+        | { id: number }
+        | undefined
+      return row?.id ?? null
+    } catch (error) {
+      this.logger.warn(`dao.findDocByHash failed: ${String(error)}`)
+      return null
+    }
+  }
+
   /** 给资料打标签（tag/doc_tag 幂等：INSERT OR IGNORE） */
   tagDoc(docId: number, tagName: string): boolean {
     try {

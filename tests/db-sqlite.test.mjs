@@ -439,3 +439,155 @@ test('writeReport 路径按类型分目录：daily 不变；weekly/monthly 子�
   rmSync(dir, { recursive: true, force: true })
   rmSync(stateDir, { recursive: true, force: true })
 })
+
+// ==================== mirrorDocsFromReport：报告 → doc 非对话资料提取 ====================
+
+const GITHUB_URL = 'https://github.com/example-org/example-repo'
+const WEB_URL = 'https://example.com/some/page'
+
+/** 报告 md 样例：含 GitHub 引用行、普通 URL、「### 本期文件索引」区段 */
+function sampleReportMd() {
+  return [
+    '# 日报',
+    '',
+    '> 「example-repo 挺好用」 ' + GITHUB_URL,
+    '> 看看这个 ' + WEB_URL + '。',
+    '',
+    '### 本期文件索引',
+    '',
+    '- demo-report.pdf（2.1MB，来自 synth-0001）',
+    '（本期无新文件）', // 占位行不该另建 doc（下方区段里故意混排验证跳过）
+    '',
+    '### 其他',
+  ].join('\n')
+}
+
+function docsOf(db) {
+  return db.prepare('SELECT id, title, category, source_type, source_ref, content_md FROM doc ORDER BY id').all()
+}
+
+test('doc 提取：报告落盘→URL/file doc 自动生成 + 双标签（来自报告/github）', () => {
+  const { path, dir } = tmpDb('docs')
+  const stateDir = mkdtempSync(join(tmpdir(), 'lurker-docs-'))
+  const store = new Store(stateDir, logger, path)
+  store.ensureDir('reports/12345678@chatroom')
+
+  assert.equal(store.writeReport('daily', '12345678@chatroom', '2026-01-05', sampleReportMd()), true)
+
+  const db = new DatabaseSync(path)
+  const rows = docsOf(db)
+  // 2 个 URL doc + 1 个文件索引 doc（占位行「本期无新文件」被跳过）
+  assert.equal(rows.length, 3, `应 3 条 doc，实际：${JSON.stringify(rows, null, 2)}`)
+
+  const gh = rows.find((r) => r.content_md.includes(GITHUB_URL))
+  const web = rows.find((r) => r.content_md.includes(WEB_URL))
+  const file = rows.find((r) => r.category === 'file')
+  assert.ok(gh && web && file)
+
+  // 口径：title / category / source_type / source_ref
+  assert.equal(gh.title, '资源：example-repo', 'GitHub 取引用行中的仓库名')
+  assert.equal(web.title, '资源：example.com', '非 GitHub 无可读描述 → 域名兜底')
+  for (const r of [gh, web]) {
+    assert.equal(r.category, 'web')
+    assert.equal(r.source_type, 'web')
+    assert.equal(r.source_ref, '报告 2026-01-05 · 12345678@chatroom')
+    assert.match(r.content_md, /^- URL：/)
+    assert.match(r.content_md, /- 语境：/)
+    assert.match(r.content_md, /- 提及：报告 2026-01-05 · 12345678@chatroom/)
+  }
+  assert.equal(file.title, 'demo-report.pdf（2.1MB，来自 synth-0001）')
+  assert.equal(file.source_type, 'file_import')
+  assert.equal(file.source_ref, '报告 2026-01-05 · 12345678@chatroom')
+
+  // 双标签：GitHub doc 挂「来自报告」+「github」；其余只挂「来自报告」
+  const tags = (docId) =>
+    db
+      .prepare('SELECT t.name FROM tag t JOIN doc_tag dt ON dt.tag_id = t.id WHERE dt.doc_id = ? ORDER BY t.name')
+      .all(docId)
+      .map((r) => r.name)
+  assert.deepEqual(tags(gh.id), ['github', '来自报告'])
+  assert.deepEqual(tags(web.id), ['来自报告'])
+  assert.deepEqual(tags(file.id), ['来自报告'])
+
+  db.close()
+  rmSync(dir, { recursive: true, force: true })
+  rmSync(stateDir, { recursive: true, force: true })
+})
+
+test('doc 提取：同一报告重写 → doc 不重复；同一 URL 两份报告 → 1 条 doc 且 source_ref 保持首建', () => {
+  const { path, dir } = tmpDb('docs-idem')
+  const stateDir = mkdtempSync(join(tmpdir(), 'lurker-docs2-'))
+  const store = new Store(stateDir, logger, path)
+  store.ensureDir('reports/12345678@chatroom')
+  store.ensureDir('reports/1234567890@chatroom')
+
+  const md = sampleReportMd()
+  store.writeReport('daily', '12345678@chatroom', '2026-01-05', md)
+  // 同键重写（upsert 同一报告）→ 资料提取再跑一遍也不重复
+  store.writeReport('daily', '12345678@chatroom', '2026-01-05', md)
+
+  // 第二份报告（不同 chat/日期）含同一 GitHub URL → 只 1 条 doc，source_ref 保持首建不覆盖
+  store.writeReport('daily', '1234567890@chatroom', '2026-01-06', `> 转发 ${GITHUB_URL}\n`)
+
+  const db = new DatabaseSync(path)
+  const rows = docsOf(db)
+  const gh = rows.filter((r) => r.content_md.includes(GITHUB_URL))
+  assert.equal(gh.length, 1, '同一 URL 跨报告只 1 条 doc')
+  // 口径（与 Python「命中即跳过」一致）：保持首建 source_ref，不并提不覆盖
+  assert.equal(gh[0].source_ref, '报告 2026-01-05 · 12345678@chatroom')
+  // 第二份报告的新 URL 正常建；文件行在两份报告中原文不同（提及行不同）但行指纹同 → 仍不重复
+  const fileDocs = rows.filter((r) => r.category === 'file')
+  assert.equal(fileDocs.length, 1, '文件索引行原文相同 → 不重复建')
+  assert.equal(rows.length, 3)
+  db.close()
+  rmSync(dir, { recursive: true, force: true })
+  rmSync(stateDir, { recursive: true, force: true })
+})
+
+test('doc 提取：与 Python 批量脚本并存防重——content_md 已含 URL 的既有 doc（如 Python 所建）命中即跳过', () => {
+  const { path, dir } = tmpDb('docs-py')
+  const db = openDb(path, { logger })
+  const dao = new KnowledgeDao(db, logger)
+
+  // 模拟 Python 脚本先建的 doc：content_md 含该 URL（格式与 Python 输出一致）
+  const pyBody = `- URL：${GITHUB_URL}\n- 语境：> 「example-repo」 ${GITHUB_URL}\n- 提及：报告 2025-12-01 · 12345678@chatroom\n`
+  const pyId = dao.upsertDoc({ title: '资源：example-repo', category: 'web', sourceType: 'web', contentMd: pyBody })
+  assert.ok(pyId)
+
+  const stateDir = mkdtempSync(join(tmpdir(), 'lurker-docs3-'))
+  const store = new Store(stateDir, logger, path)
+  store.ensureDir('reports/12345678@chatroom')
+  store.writeReport('daily', '12345678@chatroom', '2026-01-05', sampleReportMd())
+
+  // TS 侧只新建 Python 未覆盖的 2 条（web_url + 文件行），不与 Python 侧重复
+  const after = new DatabaseSync(path)
+  const rows = docsOf(after)
+  assert.equal(rows.filter((r) => r.content_md.includes(GITHUB_URL)).length, 1, 'URL 子串查重生效，0 重复')
+  assert.equal(rows.length, 3)
+  assert.equal(dao.getDoc(pyId).id, pyId, 'Python 侧既有 doc 未被覆盖')
+  after.close()
+  db.close()
+  rmSync(dir, { recursive: true, force: true })
+  rmSync(stateDir, { recursive: true, force: true })
+})
+
+test('doc 提取：无 URL 报告 → 零 doc；提取失败不影响 writeReport 返回 true', () => {
+  const { path, dir } = tmpDb('docs-plain')
+  const stateDir = mkdtempSync(join(tmpdir(), 'lurker-docs4-'))
+  const store = new Store(stateDir, logger, path)
+  store.ensureDir('reports/12345678@chatroom')
+
+  assert.equal(store.writeReport('daily', '12345678@chatroom', '2026-01-05', '纯文字日报\n### 本期文件索引\n\n（本期无新文件）\n'), true)
+  let db = new DatabaseSync(path)
+  assert.equal(docsOf(db).length, 0, '无 URL/无索引行 → 零 doc')
+  db.close()
+
+  // 镜像库指向目录 → 镜像初始化失败静默降级，writeReport 仍 true（既有降级语义回归）
+  const badDir = mkdtempSync(join(tmpdir(), 'lurker-baddb2-'))
+  const store2 = new Store(stateDir, logger, badDir)
+  assert.equal(store2.writeReport('daily', '12345678@chatroom', '2026-01-06', sampleReportMd()), true)
+
+  rmSync(dir, { recursive: true, force: true })
+  rmSync(stateDir, { recursive: true, force: true })
+  rmSync(badDir, { recursive: true, force: true })
+})

@@ -20,7 +20,7 @@
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { openDb } from './db.js'
-import { KnowledgeDao, hash8 } from './dao.js'
+import { KnowledgeDao, hash8, contentHash } from './dao.js'
 import type { DbLogger } from './db.js'
 
 /** 报告类型（与 report.ts 的 ReportKind 同名集；此处独立定义避免依赖循环） */
@@ -86,6 +86,85 @@ export function defaultDbPath(): string {
 const INSIGHTS_RE = /^groups\/([^/]+)\/insights\.jsonl$/
 const DAILY_REPORT_RE = /^reports\/([^/]+)\/(\d{4}-\d{2}-\d{2})\.md$/
 
+// ==================== 报告 → doc 提取（与 Python extract_docs_from_reports.py 同口径） ====================
+
+export const TAG_FROM_REPORT = '来自报告'
+export const TAG_GITHUB = 'github'
+
+/** URL 截断：中文引号 / 空白 / 右括号 / 常见中文标点（= Python URL_RE） */
+const URL_RE = /https?:\/\/[^\s\)）」』】"'，。；、！？：]+/g
+/** 去尾部标点（= Python URL_TRAIL_RE） */
+const URL_TRAIL_RE = /[.,;:!?）)」』\]〉»]+$/
+
+/** 报告文本中的全部唯一 URL（尾部标点剥离后去重，顺序保持出现序） */
+export function extractUrls(text: string): string[] {
+  const out: string[] = []
+  const seen = new Set<string>()
+  for (const m of text.matchAll(URL_RE)) {
+    const u = m[0].replace(URL_TRAIL_RE, '')
+    if (u && !seen.has(u)) {
+      seen.add(u)
+      out.push(u)
+    }
+  }
+  return out
+}
+
+/** URL 域名（= Python host_of） */
+export function hostOf(url: string): string {
+  const m = /^https?:\/\/([^/]+)/.exec(url)
+  return m ? m[1] : url
+}
+
+/** URL 所在行原文（保留行内引用格式，= Python line_context） */
+export function lineContext(md: string, url: string): string {
+  for (const line of md.split('\n')) {
+    if (line.includes(url)) return line.trim()
+  }
+  return ''
+}
+
+/**
+ * 从 URL 所在引用行取可读描述（GitHub 仓库名优先；否则取「…」内除 URL 外的可读文字；
+ * 都没有 → null，由调用方用域名兜底）。= Python descriptive_title。
+ */
+export function descriptiveTitle(md: string, url: string): string | null {
+  const ctx = lineContext(md, url)
+  if (!ctx) return null
+  if (url.includes('github.com')) {
+    const m = /github\.com\/([A-Za-z0-9_.\-]+)\/([A-Za-z0-9_.\-]+)/.exec(url)
+    if (m) {
+      const [, owner, name] = m
+      if (ctx.includes(name)) return name
+      return `${owner}/${name}`
+    }
+  }
+  const q = /「([^」]+)」/.exec(ctx)
+  if (q) {
+    const text = q[1]
+      .replace(url, '')
+      .replace(/^[\s。，,.:：]+|[\s。，,.:：]+$/g, '')
+    if (text) return text.slice(0, 30)
+  }
+  return null
+}
+
+/**
+ * 「### 本期文件索引」区段下的非占位行（跳过空行与「本期无新文件」）。
+ * = Python file_index_entries。
+ */
+export function fileIndexEntries(md: string): string[] {
+  if (!md.includes('### 本期文件索引')) return []
+  const sec = md.split('### 本期文件索引', 2)[1].split('\n### ', 2)[0]
+  const out: string[] = []
+  for (const raw of sec.split('\n')) {
+    const line = raw.trim()
+    if (!line || line.includes('本期无新文件')) continue
+    out.push(line)
+  }
+  return out
+}
+
 /** 条目本地日键 YYYY-MM-DD（ts 缺失/非法 → null） */
 function dayKeyOf(ts: unknown): string | null {
   const ms = typeof ts === 'number' ? ts : typeof ts === 'string' ? Date.parse(ts) : NaN
@@ -110,8 +189,17 @@ export interface SqliteMirror {
    * 报告类型显式通道（缺口 G1/G2 修复）：writeReport 落盘后调用——kind 由代码给出而非
    * 从路径猜测；period 起止由 reportPeriodOf 推导（dateKey 非法 → warn 跳过）。
    * chatId='aggregate' 为跨群汇总（schema report.chat_id='aggregate'）。
+   * 内部随后调用 mirrorDocsFromReport 做非对话资料（URL/文件索引）提取入 doc 表。
    */
   mirrorReport(kind: ReportKindName, chatId: string, dateKey: string, md: string): void
+  /**
+   * 报告落盘时并行提取非对话资料入 doc 表（与日报镜像同一模式：SQLite 只是
+   * 查询层镜像，逐条 safe 包裹，失败只 warn 不影响主流程）。
+   * 口径与 0数据格式/extract_docs_from_reports.py 逐条对齐（见各 helper 注释）：
+   * URL 查重命中（findDocIdByUrl）即跳过——保持首建 source_ref 不覆盖，与
+   * Python「命中即跳过」一致，因此两边先后跑不会产生重复 doc。
+   */
+  mirrorDocsFromReport(kind: ReportKindName, chatId: string, dateKey: string, md: string): void
   close(): void
 }
 
@@ -174,6 +262,66 @@ export function createSqliteMirror(sqlitePath: string | undefined, logger: DbLog
     )
   }
 
+  /**
+   * mirrorDocsFromReport：单份报告的非对话资料提取（URL + 文件索引行 → doc 表）。
+   * 逐条 safe 包裹：单条失败只 warn，不影响其余条目与主流程。
+   */
+  const mirrorDocsFromReport = (kind: ReportKindName, chatId: string, dateKey: string, md: string): void => {
+    if (!md || !dateKey) return
+    const sourceRef = `报告 ${dateKey} · ${chatId}`
+
+    // ---- URL → doc(category='web') ----
+    for (const url of extractUrls(md)) {
+      safe(() => {
+        // 与 Python 查重 2 同口径：全库任一 content_md 已含该 URL → 命中即跳过，
+        // 保持首建 source_ref 不覆盖（两边先后跑不会产生重复 doc）
+        if (dao.findDocIdByUrl(url)) return
+        const desc = descriptiveTitle(md, url) ?? hostOf(url)
+        const ctx = lineContext(md, url)
+        const contentMd = `- URL：${url}\n` + (ctx ? `- 语境：${ctx}\n` : '') + `- 提及：${sourceRef}\n`
+        const docId = dao.upsertDoc({
+          title: `资源：${desc}`,
+          category: 'web',
+          sourceType: 'web',
+          sourceRef,
+          contentMd,
+        })
+        if (docId) {
+          const tagId = dao.ensureTag(TAG_FROM_REPORT)
+          if (tagId) dao.tagDoc(docId, TAG_FROM_REPORT)
+          if (url.includes('github.com')) {
+            dao.tagDoc(docId, TAG_GITHUB) // tagDoc 内部已按 name 幂等建 tag
+          }
+        }
+      })
+    }
+
+    // ---- 「### 本期文件索引」行 → doc(category='file') ----
+    for (const line of fileIndexEntries(md)) {
+      safe(() => {
+        // 与 Python 同口径双重查重：行原文指纹（含提及行的 content_hash）+ 全库子串兜底
+        const name = line.replace(/^[-*]+\s*/, '').trim()
+        if (!name) return
+        const contentMd = `${line}\n（${dateKey} · ${chatId}）\n`
+        const hash = contentHash(contentMd)
+        const hitByHash = dao.findDocByHash(hash)
+        const hitByText = dao.findDocIdByUrl(line)
+        if (hitByHash || hitByText) return
+        const docId = dao.upsertDoc({
+          title: name.slice(0, 80),
+          category: 'file',
+          sourceType: 'file_import',
+          sourceRef,
+          contentMd,
+        })
+        if (docId) {
+          dao.tagDoc(docId, TAG_FROM_REPORT)
+        }
+      })
+    }
+    void kind // kind 不影响提取口径（URL/文件索引与周期类型无关），保留参数以对齐 mirrorReport
+  }
+
   return {
     mirrorJsonl(rel, entry) {
       if (INSIGHTS_RE.test(rel)) safe(() => mirrorInsight(entry))
@@ -226,6 +374,12 @@ export function createSqliteMirror(sqlitePath: string | undefined, logger: DbLog
           docIdsHint: null,
         }),
       )
+      // 报告落盘并行提取非对话资料入 doc 表（独立 safe，资料提取失败不影响报告镜像）
+      safe(() => mirrorDocsFromReport(kind, chatId, dateKey, md))
+    },
+
+    mirrorDocsFromReport(kind, chatId, dateKey, md) {
+      mirrorDocsFromReport(kind, chatId, dateKey, md)
     },
 
     mirrorText(rel, text) {
