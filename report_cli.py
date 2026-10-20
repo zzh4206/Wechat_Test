@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""report_cli.py — 微信知识库 CLI（entry / report / doc），schema v0.4。
+"""report_cli.py — 微信知识库 CLI（entry / report / doc / revision / marking），schema v0.6。
 
 用法:
     python3 report_cli.py [--db PATH] entry add --kind note --text "..." [--doc-id N]
@@ -8,9 +8,16 @@
     python3 report_cli.py [--db PATH] report list
     python3 report_cli.py [--db PATH] report finalize --id N
     python3 report_cli.py [--db PATH] doc add --title T [--category C] [--file PATH] [--tag a,b]
+    python3 report_cli.py [--db PATH] revision add --chat-id ID --period daily|weekly|monthly
+                          --date YYYY-MM-DD --type T [--target R] [--summary S] [--source chat|web] [--ts N]
+    python3 report_cli.py [--db PATH] revisions list [--chat-id ID] [--period P] [--date D]
+    python3 report_cli.py [--db PATH] marking add --chat-id ID --kind done|undone|deleted
+                          --target R [--source chat|web] [--ts N]
+    python3 report_cli.py [--db PATH] markings latest [--kind K]
 
 --db 默认 ./knowledge.db。所有写操作都会更新 updated_at（entry 除外，其用 created_at）。
-打开库时自动执行 schema 迁移（user_version 3→4 幂等、单事务；0=全新建 v4；>4 报错拒开）。
+打开库时自动执行 schema 迁移（v0.6：4→5 纯新增两表两视图、单事务幂等；3 先升 4 再升 5；
+0=全新建 v5；<4（除 0/3）或 >5 报错拒开）。
 """
 import argparse
 import datetime as dt
@@ -24,7 +31,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCHEMA_SQL_PATH = os.path.join(HERE, "schema.sql")
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # v0.4 report 表重建 DDL（与 schema.sql 逐字一致）；迁移按列名显式回填 chat_id='aggregate'
 MIGRATE_3_TO_4_SQL = """
@@ -88,34 +95,77 @@ FROM report r
 ORDER BY r.period_type, r.period_start DESC;
 """
 
+# v0.6 纯新增 DDL（与 schema.sql 逐字一致；TECH-v0.6 §1）：两表两视图，既有表零改动
+MIGRATE_4_TO_5_SQL = """
+CREATE TABLE report_revision (
+  id           INTEGER PRIMARY KEY,
+  chat_id      TEXT NOT NULL CHECK (length(chat_id) BETWEEN 1 AND 128),
+  period_type  TEXT NOT NULL CHECK (period_type IN ('daily','weekly','monthly')),
+  period_start TEXT NOT NULL,
+  ts           INTEGER NOT NULL,
+  type         TEXT NOT NULL,
+  target_ref   TEXT,
+  summary      TEXT,
+  source       TEXT NOT NULL CHECK (source IN ('chat','web')),
+  source_key   TEXT NOT NULL UNIQUE,
+  created_at   INTEGER NOT NULL
+);
+CREATE INDEX idx_revision_report ON report_revision(chat_id, period_type, period_start, ts);
+CREATE INDEX idx_revision_ts ON report_revision(ts);
+CREATE TABLE marking (
+  id           INTEGER PRIMARY KEY,
+  chat_id      TEXT NOT NULL CHECK (length(chat_id) BETWEEN 1 AND 128),
+  kind         TEXT NOT NULL CHECK (kind IN ('done','undone','deleted')),
+  target_ref   TEXT NOT NULL,
+  ts           INTEGER NOT NULL,
+  source       TEXT NOT NULL CHECK (source IN ('chat','web')),
+  source_key   TEXT NOT NULL UNIQUE,
+  created_at   INTEGER NOT NULL
+);
+CREATE INDEX idx_marking_chat ON marking(chat_id, kind, ts);
+CREATE INDEX idx_marking_target ON marking(target_ref);
+CREATE VIEW v_marking_latest AS
+SELECT m.* FROM marking m
+JOIN (SELECT target_ref, MAX(ts) AS mx, MAX(id) AS mi FROM marking GROUP BY target_ref) t
+  ON m.target_ref = t.target_ref AND m.ts = t.mx AND m.id = t.mi;
+CREATE VIEW v_report_revised AS
+SELECT chat_id, period_type, period_start, COUNT(*) AS revision_count, MAX(ts) AS revised_at
+FROM report_revision GROUP BY chat_id, period_type, period_start;
+"""
+
 
 def user_version(conn: sqlite3.Connection) -> int:
     return int(conn.execute("PRAGMA user_version").fetchone()[0])
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
-    """schema 迁移（幂等、自动）：3→4 单事务重建 report + 建 media；0=全新建 v4；>4 拒开。
-    任何一步失败整体回滚，user_version 最后置（在事务内）。"""
+    """schema 迁移（幂等、自动，v0.6）：4→5 单事务纯新增两表两视图；3 先升 4 再升 5；
+    0=全新建 v5；<4（除 0/3）或 >5 拒开。任何一步失败整体回滚，user_version 最后置。"""
     v = user_version(conn)
     if v == SCHEMA_VERSION:
         return
     if v > SCHEMA_VERSION:
         sys.exit(f"[错误] 库 schema 版本 v{v} 高于本工具支持的 v{SCHEMA_VERSION}，拒绝打开")
-    if v not in (0, 3):
-        sys.exit(f"[错误] 不支持的 schema 版本 v{v}（仅支持 0/3/{SCHEMA_VERSION}）")
+    if v not in (0, 3, 4):
+        sys.exit(f"[错误] 不支持的 schema 版本 v{v}（仅支持 0/3/4/{SCHEMA_VERSION}）")
     try:
         if v == 0:
             with open(SCHEMA_SQL_PATH, encoding="utf-8") as f:
-                conn.executescript(f.read())  # 全量 v0.4 DDL（含 PRAGMA user_version=4）
+                conn.executescript(f.read())  # 全量 v0.6 DDL（含 PRAGMA user_version=5）
             if user_version(conn) != SCHEMA_VERSION:
-                raise RuntimeError("全新建库后 user_version != 4")
+                raise RuntimeError("全新建库后 user_version != 5")
             return
         # executescript 会隐式提交挂起事务，故把事务写进脚本文本（单事务、可整体回滚）。
         # DROP report 前须关外键（SQLite 迁移规约），否则 entry 子行引用会阻断 DROP。
         conn.execute("PRAGMA foreign_keys = OFF")
-        script = ("BEGIN;\n" + MIGRATE_3_TO_4_SQL
-                  + f"\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n")
-        conn.executescript(script)
+        scripts = []
+        if v == 3:
+            scripts.append(("BEGIN;\n" + MIGRATE_3_TO_4_SQL
+                            + "\nPRAGMA user_version = 4;\nCOMMIT;\n"))
+        scripts.append("BEGIN;\n" + MIGRATE_4_TO_5_SQL
+                       + f"\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n")
+        for script in scripts:
+            conn.executescript(script)
     except Exception as e:
         conn.rollback()
         sys.exit(f"[错误] schema 迁移失败（已回滚）: {e}")
@@ -336,6 +386,83 @@ def doc_add(a) -> None:
     conn.close()
 
 
+# ---------------------------------------------------------------- revision / marking（v0.6）
+def revision_add(a) -> None:
+    """修订事件是不可变事实：source_key 冲突→提示已有 id，不做 UPDATE。"""
+    dt.date.fromisoformat(a.date)  # 日期格式防线
+    conn = connect(a.db)
+    t = a.ts if a.ts is not None else now()
+    skey = a.source_key or f"rev:{a.chat_id}:{a.period}:{a.date}:{t}"
+    hit = conn.execute("SELECT id FROM report_revision WHERE source_key = ?", (skey,)).fetchone()
+    if hit:
+        print(f"[跳过] source_key 已存在（id={hit['id']}），修订事件不可变、不更新")
+        conn.close()
+        return
+    cur = conn.execute(
+        "INSERT INTO report_revision (chat_id, period_type, period_start, ts, type,"
+        " target_ref, summary, source, source_key, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (a.chat_id, a.period, a.date, t, a.type, a.target, a.summary, a.source, skey, now()))
+    conn.commit()
+    print(f"OK revision #{cur.lastrowid} added ({a.period} {a.date} type={a.type})")
+    conn.close()
+
+
+def revisions_list(a) -> None:
+    conn = connect(a.db)
+    sql = ("SELECT * FROM report_revision WHERE 1=1")
+    args: list = []
+    if a.chat_id:
+        sql += " AND chat_id = ?"; args.append(a.chat_id)
+    if a.period:
+        sql += " AND period_type = ?"; args.append(a.period)
+    if a.date:
+        sql += " AND period_start = ?"; args.append(a.date)
+    sql += " ORDER BY ts"
+    rows = conn.execute(sql, args).fetchall()
+    if not rows:
+        print("(无修订记录)")
+    for r in rows:
+        print(f"#{r['id']:<4} [{r['chat_id']}] {r['period_type']} {r['period_start']}"
+              f"  {iso(r['ts'])}  type={r['type']}  target={r['target_ref'] or '-'}"
+              f"  summary={r['summary'] or '-'}  src={r['source']}")
+    conn.close()
+
+
+def marking_add(a) -> None:
+    """标记是不可变事实：同一 target_ref 状态演变 = 追加行；source_key 冲突→跳过。"""
+    conn = connect(a.db)
+    t = a.ts if a.ts is not None else now()
+    skey = a.source_key or f"mark:{a.chat_id}:{a.target}:{t}"
+    hit = conn.execute("SELECT id FROM marking WHERE source_key = ?", (skey,)).fetchone()
+    if hit:
+        print(f"[跳过] source_key 已存在（id={hit['id']}），标记事件不可变、不更新")
+        conn.close()
+        return
+    cur = conn.execute(
+        "INSERT INTO marking (chat_id, kind, target_ref, ts, source, source_key, created_at)"
+        " VALUES (?,?,?,?,?,?,?)",
+        (a.chat_id, a.kind, a.target, t, a.source, skey, now()))
+    conn.commit()
+    print(f"OK marking #{cur.lastrowid} added ({a.kind} {a.target})")
+    conn.close()
+
+
+def markings_latest(a) -> None:
+    conn = connect(a.db)
+    sql = "SELECT * FROM v_marking_latest"
+    args: list = []
+    if a.kind:
+        sql += " WHERE kind = ?"; args.append(a.kind)
+    sql += " ORDER BY ts"
+    rows = conn.execute(sql, args).fetchall()
+    if not rows:
+        print("(无标记记录)")
+    for r in rows:
+        print(f"#{r['id']:<4} [{r['chat_id']}] {r['kind']:<7} {r['target_ref']}"
+              f"  {iso(r['ts'])}  src={r['source']}")
+    conn.close()
+
+
 # ---------------------------------------------------------------- main
 def main() -> None:
     p = argparse.ArgumentParser(description="微信知识库 CLI")
@@ -371,6 +498,41 @@ def main() -> None:
     da.add_argument("--file", default=None)
     da.add_argument("--tag", default="", help="逗号分隔 tag 名")
     da.set_defaults(func=doc_add)
+
+    rv = sub.add_parser("revision")
+    ra = rv.add_subparsers(dest="op", required=True).add_parser("add")
+    ra.add_argument("--chat-id", required=True)
+    ra.add_argument("--period", required=True, choices=["daily", "weekly", "monthly"])
+    ra.add_argument("--date", required=True, help="period_start YYYY-MM-DD")
+    ra.add_argument("--type", required=True, help="修订类型（自由短词，如 section/correction/status）")
+    ra.add_argument("--target", default=None, help="段落/条目引用（可空）")
+    ra.add_argument("--summary", default=None, help="元数据摘要（红线：不含原文）")
+    ra.add_argument("--source", default="chat", choices=["chat", "web"])
+    ra.add_argument("--ts", type=int, default=None, help="修订发生时刻（缺省当前时间）")
+    ra.add_argument("--source-key", default=None, help="幂等键（缺省按插件惯例生成）")
+    ra.set_defaults(func=revision_add)
+
+    rvs = sub.add_parser("revisions")
+    rl = rvs.add_subparsers(dest="op", required=True).add_parser("list")
+    rl.add_argument("--chat-id", default=None)
+    rl.add_argument("--period", default=None, choices=["daily", "weekly", "monthly"])
+    rl.add_argument("--date", default=None)
+    rl.set_defaults(func=revisions_list)
+
+    mk = sub.add_parser("marking")
+    ma = mk.add_subparsers(dest="op", required=True).add_parser("add")
+    ma.add_argument("--chat-id", required=True)
+    ma.add_argument("--kind", required=True, choices=["done", "undone", "deleted"])
+    ma.add_argument("--target", required=True, help="任务/事项标识")
+    ma.add_argument("--source", default="chat", choices=["chat", "web"])
+    ma.add_argument("--ts", type=int, default=None)
+    ma.add_argument("--source-key", default=None)
+    ma.set_defaults(func=marking_add)
+
+    mks = sub.add_parser("markings")
+    ml = mks.add_subparsers(dest="op", required=True).add_parser("latest")
+    ml.add_argument("--kind", default=None, choices=["done", "undone", "deleted"])
+    ml.set_defaults(func=markings_latest)
 
     args = p.parse_args()
     args.func(args)

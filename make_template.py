@@ -91,6 +91,13 @@ def make_sample(path: str) -> None:
         cur.executemany(
             "INSERT INTO doc_tag(doc_id, tag_id) VALUES (?,?)",
             [(doc_ids[di], t + 1) for t in tids])
+    # v0.6：修订/标记演示对应的 tag（挂在被修订报告引用的资料上，全部合成值）
+    cur.executemany("INSERT OR IGNORE INTO tag(name) VALUES (?)", [("示例-已修订",), ("示例-已完成",)])
+    for name, di in (("示例-已修订", 0), ("示例-已完成", 1)):
+        cur.execute("INSERT OR IGNORE INTO tag (name) VALUES (?)", (name,))
+        tid = cur.execute("SELECT id FROM tag WHERE name = ?", (name,)).fetchone()[0]
+        cur.execute("INSERT OR IGNORE INTO doc_tag(doc_id, tag_id) VALUES (?,?)",
+                    (doc_ids[di], tid))
 
     # 4 份 report（v0.4）：同日双群两份 daily + 1 份聚合 daily + 1 份聚合 weekly
     reports = [
@@ -163,6 +170,43 @@ def make_sample(path: str) -> None:
             "INSERT INTO chat_digest(chat_topic, digest_md, happened_on, doc_id,"
             " source_key, created_by, created_at) VALUES (?,?,?,?,?,?,?)",
             (topic, dmd, day, did, skey, by, NOW - DAY))
+
+    # v0.6 修订历史（TECH §3.2）：同一报告（demo-chat-1 的 2026-01-05 日报）3 条修订，
+    # type 各不相同；source_key 按插件惯例 rev:<chatId>:<period>:<date>:<ts>
+    revisions = [
+        # (chat_id, period_type, period_start, ts, type, target_ref, summary, source, source_key)
+        ("demo-chat-1", "daily", "2026-01-05", NOW - DAY, "section",
+         "本期要点", "新增要点一条（合成占位）", "chat", "rev:demo-chat-1:daily:2026-01-05:1001"),
+        ("demo-chat-1", "daily", "2026-01-05", NOW - DAY + 600, "correction",
+         "本期要点", "订正日期笔误（合成占位）", "chat", "rev:demo-chat-1:daily:2026-01-05:1002"),
+        ("demo-chat-1", "daily", "2026-01-05", NOW - DAY + 1200, "status",
+         None, "报告状态说明更新（合成占位）", "web", "rev:demo-chat-1:daily:2026-01-05:1003"),
+    ]
+    for row in revisions:
+        cur.execute(
+            "INSERT INTO report_revision(chat_id, period_type, period_start, ts, type,"
+            " target_ref, summary, source, source_key, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (*row, NOW - DAY))
+
+    # v0.6 完成情况标记：跨报告混合三态，含同一 target_ref 的 undone→done 演变（追加行）
+    markings = [
+        # (chat_id, kind, target_ref, ts, source, source_key)
+        ("demo-chat-1", "undone", "demo-task-0001", NOW - 2 * DAY, "chat",
+         "mark:demo-chat-1:demo-task-0001:2001"),
+        ("demo-chat-1", "done", "demo-task-0001", NOW - 3600, "chat",
+         "mark:demo-chat-1:demo-task-0001:2002"),   # 演变：undone → done
+        ("demo-chat-1", "done", "demo-task-0002", NOW - 7200, "web",
+         "mark:demo-chat-1:demo-task-0002:2003"),
+        ("demo-chat-2", "undone", "demo-task-0003", NOW - DAY, "chat",
+         "mark:demo-chat-2:demo-task-0003:2004"),
+        ("demo-chat-2", "deleted", "demo-task-0004", NOW - 5400, "chat",
+         "mark:demo-chat-2:demo-task-0004:2005"),
+    ]
+    for row in markings:
+        cur.execute(
+            "INSERT INTO marking(chat_id, kind, target_ref, ts, source, source_key, created_at)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (*row, NOW - DAY))
 
     conn.commit()
     conn.close()

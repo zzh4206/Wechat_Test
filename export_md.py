@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """export_md.py — 把 report 与 doc 导出为 Markdown 文件树（仅供 1数据/exports/ 或仓库预览）。
 
+v0.6：报告导出附「修订时间线」与「完成情况（最新态）」小节（来自 report_revision /
+v_marking_latest，无记录则省略小节）。
+
 用法:
     python3 export_md.py --db PATH --out DIR
         out/reports/YYYY/YYYY-MM-DD.md | YYYY-Www.md | YYYY-MM.md   （aggregate 聚合报告，按周期类型）
@@ -31,6 +34,41 @@ def frontmatter(meta: dict) -> str:
             v = json.dumps(v, ensure_ascii=False)
         lines.append(f"{k}: {v}")
     lines.append("---")
+    return "\n".join(lines)
+
+
+def revision_section(conn, r) -> str:
+    """「修订时间线」小节（v0.6）：该报告全部修订事件，按 ts 升序。"""
+    rows = conn.execute(
+        "SELECT * FROM report_revision"
+        " WHERE chat_id = ? AND period_type = ? AND period_start = ? ORDER BY ts",
+        (r["chat_id"], r["period_type"], r["period_start"])).fetchall()
+    if not rows:
+        return ""
+    lines = ["## 修订时间线", ""]
+    for v in rows:
+        ref = f"（{v['target_ref']}）" if v["target_ref"] else ""
+        summary = f"：{v['summary']}" if v["summary"] else ""
+        lines.append(f"- {dt.datetime.fromtimestamp(v['ts']).strftime('%Y-%m-%d %H:%M')}"
+                     f" [{v['type']}]{ref}{summary}（src={v['source']}）")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def marking_section(conn, r) -> str:
+    """「完成情况（最新态）」小节（v0.6）：该会话标记的最新态（v_marking_latest）。"""
+    rows = conn.execute(
+        "SELECT * FROM v_marking_latest WHERE chat_id = ? ORDER BY ts",
+        (r["chat_id"],)).fetchall()
+    if not rows:
+        return ""
+    lines = ["## 完成情况（最新态）", ""]
+    kind_names = {"done": "已完成", "undone": "未完成", "deleted": "已删除"}
+    for m in rows:
+        lines.append(f"- [{kind_names.get(m['kind'], m['kind'])}] {m['target_ref']}"
+                     f"（{dt.datetime.fromtimestamp(m['ts']).strftime('%Y-%m-%d %H:%M')}"
+                     f"，src={m['source']}）")
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -73,7 +111,8 @@ def main() -> None:
             "title": r["title"], "status": r["status"],
             "doc_ids_hint": r["doc_ids_hint"], "entry_count": r["entry_count"],
             "created_at": r["created_at"], "updated_at": r["updated_at"],
-        }) + "\n\n" + (r["content_md"] or "") + "\n"
+        }) + "\n\n" + (r["content_md"] or "") + "\n" \
+            + revision_section(conn, r) + marking_section(conn, r)
         with open(path, "w", encoding="utf-8") as f:
             f.write(body)
         n_rep += 1
