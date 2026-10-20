@@ -609,11 +609,17 @@ export class ReportService {
     if (!CHAT_ID_RE.test(chatId)) throw new Error(`report: illegal chatId rejected: ${JSON.stringify(chatId)}`)
     const ts = asOf ?? this.now()
     let win = reportWindow(kind, ts)
-    if (kind === 'daily' && backfillDateKey) {
-      // 覆盖窗口：[dateKey 前一日 20:20, 再生成时刻]——把正号登录后同步进库的消息全部纳入
+    if (backfillDateKey) {
+      // 补发/回填覆盖窗口：daily 锚定 [dateKey 前一日 20:20, now]（调度对齐口径）；
+      // weekly/monthly 锚定 periodStart（周一/当月 1 号）当日 00:00 起——把正号登录后
+      // 同步进库的消息全部纳入；dateKey 不变（月报补发锚定当月 1 号，验收裁定 §三-2）。
       const dayStart = parseLocalDayStart(backfillDateKey)
       if (dayStart !== null) {
-        win = { start: dayStart - 86_400_000 + 20 * 3600_000 + 20 * 60_000, end: ts, dateKey: backfillDateKey }
+        if (kind === 'daily') {
+          win = { start: dayStart - 86_400_000 + 20 * 3600_000 + 20 * 60_000, end: ts, dateKey: backfillDateKey }
+        } else {
+          win = { start: dayStart, end: ts, dateKey: backfillDateKey }
+        }
       }
     }
     const key = `${chatId}\u0000${kind}\u0000${win.dateKey}`
@@ -625,7 +631,7 @@ export class ReportService {
   }
 
   private async run(chatId: string, kind: ReportKind, win: ReportWindow): Promise<GenerateReportResult> {
-    const rel = reportRelPath(chatId, win.dateKey)
+    const rel = reportRelPath(chatId, win.dateKey, kind)
     // 路径先过围栏（fail loud：非法路径绝不落盘）
     assertInsideState(this.options.stateDir, this.options.stateDir + '/' + rel)
     if (!this.options.store.ensureDir(['reports', chatId].join('/'))) {
@@ -644,7 +650,7 @@ export class ReportService {
       // T3：empty 路径 batch_stats 全 0（零 LLM 调用可见化）
       const batchStats: BatchStats = { batches: 0, failedBatches: 0, maxBatchMs: 0, ckptHits: 0, totalCalls: 0, totalMs: 0 }
       const md = renderReport({ kind, chatId, window: win, draft: null, status: 'empty', messageCount: 0, quotes: [], persons: [], actions: this.collectActions(chatId, win), board: this.collectBoard(chatId, win), fileLines: this.collectFileLines(chatId, win), batchStats })
-      this.options.store.writeText(rel, md)
+      this.options.store.writeReport(kind, chatId, win.dateKey, md) // P0 返工：空报告也走显式通道实时入库
       await this.recordMeta(chatId, kind, win, 'empty', rel, 0, 0, 0, '', batchStats)
       await this.trackDegradedStreak(chatId, kind, 'empty')
       return { status: 'empty', path: rel, judgmentCount: 0, topicCount: 0, messageCount: 0 }
@@ -750,7 +756,7 @@ export class ReportService {
       }
     }
     const md = renderReport({ kind, chatId, window: win, draft, status, messageCount, degradedReason, partialNote, quotes, persons, actions: this.collectActions(chatId, win), board: this.collectBoard(chatId, win), fileLines: this.collectFileLines(chatId, win), batchStats })
-    const written = this.options.store.writeText(rel, md)
+    const written = this.options.store.writeReport(kind, chatId, win.dateKey, md) // P0 返工：显式通道实时入库（单群三类型）
     const path = written ? rel : null
     const judgmentCount = draft?.judgments.length ?? 0
     const topicCount = draft?.topics.length ?? 0
@@ -1534,9 +1540,12 @@ function mapDraft(draft: ReportDraft, messages: readonly StoredMessage[]): Repor
   }
 }
 
-/** md 相对路径：<stateDir>/reports/<chatId>/<date>.md（经 store 围栏） */
-export function reportRelPath(chatId: string, dateKey: string): string {
-  return ['reports', chatId, `${dateKey}.md`].join('/')
+/** md 相对路径：kind 子目录路由（与 store.writeReport 完全一致；daily 无子目录向后兼容） */
+export function reportRelPath(chatId: string, dateKey: string, kind: 'daily' | 'weekly' | 'monthly' = 'daily'): string {
+  const aggregate = chatId === 'aggregate'
+  const sub = kind === 'weekly' ? 'weekly/' : kind === 'monthly' ? 'monthly/' : ''
+  if (aggregate) return `reports/summary/${sub}${dateKey}.md`
+  return `reports/${chatId}/${sub}${dateKey}.md`
 }
 
 /** T7：ab 双跑 B 侧 sidecar 相对路径：reports/<chatId>/<date>.refine.json（draft + σ + 批统计） */

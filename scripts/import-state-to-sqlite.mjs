@@ -130,8 +130,7 @@ function detectReportKind(md) {
   const head = md.slice(0, 200)
   if (head.includes('# 周报')) return 'weekly'
   if (head.includes('# 月报')) return 'monthly'
-  if (head.includes('# 日报')) return 'daily'
-  return 'daily'
+  return 'daily' // 日报/跨群汇总/无标题 → daily（回退计数上报）
 }
 
 // reports/<x>/YYYY-MM-DD.md 按群逐文件收集（v0.4：每 (chatId, day) 一行，不再跨群聚合）
@@ -159,16 +158,45 @@ for (const name of readdirSync(args.stateDir)) {
   }
 
   if (name === 'reports') {
-    for (const sub of readdirSync(p)) {
-      const rp = join(p, sub)
-      if (!statSync(rp).isDirectory()) continue
+    // 收集单群报告：新布局含 weekly//monthly/ 子目录（报告文件路径按类型分目录热修）
+    const collect = (dir, chatId) => {
+      const rp = join(p, dir)
+      if (!statSync(rp).isDirectory()) return
       for (const f of readdirSync(rp)) {
         if (!/^\d{4}-\d{2}-\d{2}\.md$/.test(f)) continue
         const day = basename(f, '.md')
         const md = readFileSync(join(rp, f), 'utf8')
-        reportFiles.push([sub, day, md])
+        reportFiles.push([chatId, day, md])
         stats.reportFiles++
       }
+    }
+    for (const sub of readdirSync(p)) {
+      const rp = join(p, sub)
+      if (!statSync(rp).isDirectory()) continue
+      // kind 子目录（weekly//monthly/）挂在其 chat 目录下
+      if (sub === 'weekly' || sub === 'monthly') {
+        for (const chat of readdirSync(rp)) {
+          if (chat === 'summary') continue // aggregate 子目录在下方 summary 分支处理
+          collect(join(sub, chat), chat)
+        }
+        continue
+      }
+      if (sub === 'summary') {
+        // P1 裁定：summary 聚合统一 chat_id='aggregate'（'summary' 伪会话口径废止）
+        for (const kindDir of ['', 'weekly/', 'monthly/']) {
+          const sp = join(rp, kindDir)
+          if (!statSync(sp).isDirectory()) continue
+          for (const f of readdirSync(sp)) {
+            if (!/^\d{4}-\d{2}-\d{2}\.md$/.test(f)) continue
+            const day = basename(f, '.md')
+            const md = readFileSync(join(sp, f), 'utf8')
+            reportFiles.push(['aggregate', day, md])
+            stats.reportFiles++
+          }
+        }
+        continue
+      }
+      collect(sub, sub)
     }
     continue
   }
