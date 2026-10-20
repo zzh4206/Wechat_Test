@@ -1,24 +1,21 @@
 /**
  * sender.ts：filehelper 发送 worker（红线升级 2026-10-14 用户批准：no-send → 仅 filehelper 一个受控出口）。
  *
- * 2026-10-15 发送原语替换（用户否决 wechat-ui UI 校准方案——要求常驻聊天窗口太麻烦）：
- * - 发送原语抽为可替换接口 SendPrimitive；两实现：
- *   · KeyboardSender（默认）：wx-chatbot 式键盘模拟（2026-10-15 二次实测简化）——
- *     **搜索定位整段删除**（实测：Cmd+F 开的是搜一搜面板；点击搜索框时灵时不灵；而
- *     "前台 + 粘贴 + 回车"直接把文本发进当前会话一次成功）。键序 = activate + 前台确认 →
- *     剪贴板写消息 → Cmd+V → Return 发送 → 恢复剪贴板。目标会话由"用户当前打开的会话"
- *     决定（运行前提：文件传输助手是当前会话，发送期间勿切换）；中文走剪贴板避开输入法；
- *     TCC 只需"辅助功能"；
- *   · WechatUiSender：原 wechat-ui send 实现（Config sendMethod='wechat-ui' 可切回）。
- * - 验证（KeyboardSender 真发后）：延迟 2s 用 wechat_db.py read --chat-id filehelper --limit 3
- *   （只读）确认文件传输助手最新消息包含本次文本特征串（#l<id 前 8 位），验证通过才置 sent；
+ * 2026-10-20 发送原语（现行，用户指定键序，全链路目视实证）：
+ * - KeyboardSender（唯一实现）8 步键序：剪贴板=消息文本 → ⌘⇧W 调出微信 → ⌘F 搜索框 →
+ *   搜索词（Config sendTargetChat，真实值放运行配置；默认空=fail-closed 不发送；
+ *   sendSearchViaClipboard=true 走剪贴板粘贴——实测 CJK 直接键入被 IME 拦截）→ Return
+ *   进入目标对话（光标自动落输入框）→ ⌘V 粘贴消息 → Return 发送 → 恢复剪贴板。
+ *   无需窗口常驻/无需特定会话/无需屏幕录制 TCC。
+ * - 验证（真发后）：延迟 2s 用 wechat_db.py read --chat-id <readbackChatId> --limit 3
+ *   （只读）确认目标会话最新消息包含本次文本特征串（#l<id 前 8 位>），验证通过才置 sent；
+ *   readbackChatId 默认空 = fail-closed 不发送。
  * - 边界（本文件仍是项目里**唯一**允许发起微信发送的模块）：
  *   · 通道白名单**代码级硬编码** ALLOWED_CHANNELS = ['filehelper']——其他 channel 永远不发；
  *   · 文本策略：单行 ≤200 字符 = `【lurker】<title>` + ≤160 字摘要 + 特征串，绝不发全文；
  * - 闸门（全部保留并强化）：
  *   ① 总闸：Config senderEnabled（默认 false）+ sendDryRun（默认 true）。
- *      keyboard 模式 dry_run = activate + 前台确认后直接结束（不碰输入框不回车——实测教训：
- *      干跑时的粘贴也可能落进当前会话输入框被误发）；wechat-ui 模式 dry_run 照旧只记日志；
+ *      dry_run = 键序执行到"进入目标对话、光标在输入框"即停（不粘贴不回车）。
  *   ② 通道闸：仅 ALLOWED_CHANNELS；
  *   ③ 交互闸：微信前台（osascript）+ 系统空闲秒数（ioreg IOHIDSystem），空闲 <10s 视为用户
  *      正在操作 → 跳过本轮防按键串扰；连续 N 次非前台 warn；
@@ -26,19 +23,10 @@
  *      会激活微信），但**保留用户空闲检测**（空闲 <10s 仍跳过并计数——允许抢前台，绝不抢
  *      正在打字的手）；抢前台模式发送成功审计记 result='take_focus_sent'，与普通模式可区分。
  * - 失败重试 ≤3 次（attempts 落盘 outbox 行），超限 status='failed' 不再重试（防风暴）；
- *   wechat-ui 模式 --id 用 outbox 唯一 id（工具侧幂等）；
- * - 发送前定位闸（2026-10-16，HANDOFF-sender-autotarget）：keyboard 模式在合规闸之前 spawn
- *   `wechat-ui open --chat '文件传输助手'`（侧栏 OCR 精确定位 + 点击 + 标题核验，唯一命中才点击）——
- *   废除"用户必须常驻文件传输助手"前提；失败 → deferred 不发不计 attempts
- *   （审计 result='locate_deferred' + reason：target_missing / env_unavailable / ui_tool_missing / tcc_denied）；
- * - 发送段（2026-10-16 E2E 定论）：合成 Return 对微信 4.x 输入框无效（真人 Enter 有效、合成事件
- *   被吞，三种投递方式全试）——KeyboardSender 真发段改为 spawn `wechat-ui deliver --chat '文件传输助手'`：
- *   工具侧 = 定位打开（幂等）→ 焦点点击输入区 → 合成 Cmd+V（实证可靠）→ OCR 复核草稿 → OCR 锚定
- *   "发送"按钮点击 → 轮询草稿清空（E2E 实证 2/2+deliver 子命令全链成功）；
- * - 发送前合规闸（路线 A，2026-10-15）：keyboard 模式在"粘贴+Return"之前 spawn
- *   `wechat-ui read --chat '文件传输助手'`（只读 OCR 标题核验，dry_run 照常执行）——
- *   当前会话不是文件传输助手 / wechat-ui 缺失 / TCC 屏幕录制缺失 → deferred 不发不计
- *   attempts（审计 result='wrong_chat_open' + reason 字段，Config.chatVerifyRetries 默认 2）；
+ * - 历史方案（均已于 2026-10-20 移除，存档见 git history 与 docs/）：
+ *   · activate+粘贴+回车（文件传输助手须常驻，2026-10-15~16）；
+ *   · wechat-ui OCR 定位闸/合规闸/deliver 发送段/WechatUiSender（录屏点击方式，10-16~10-20）——
+ *     废除原因：依赖屏幕捕获 TCC 与窗口常驻；现由 ⌘⇧W+⌘F 定位 + DB 回读兜底替代；
  * - 频控：maxSendsPerDay（默认 20）超限的当日 pending 标 'skipped_quota'；
  * - 审计纪律：audit/sender.jsonl 只记元数据（outbox id / 结果 / attempts），绝不记正文；
  * - 剪贴板恢复失败不阻塞（warn）；
@@ -76,21 +64,6 @@ export const VERIFY_MANUAL_ALERT_ATTEMPTS = 5
 /** 系统空闲低于该秒数视为用户正在操作（跳过防按键串扰） */
 export const IDLE_SKIP_BELOW_SEC = 10
 
-/**
- * 合规闸失败原因枚举（审计 reason 字段；result 恒为 'wrong_chat_open'，deferred=true，不计 attempts）：
- * - wrong_chat_open：OCR 标题核验 3 次全失败（当前会话不是文件传输助手 / 读不到标题）——用户环境状态；
- * - ui_tool_missing：wechat-ui 二进制缺失 / 无法执行（spawn ENOENT/EACCES）——部署问题；
- * - tcc_denied：DSH 宿主缺「屏幕录制」权限（wechat-ui 截图被 TCC 拦截）——权限问题。
- */
-export type ChatVerifyReason = 'wrong_chat_open' | 'ui_tool_missing' | 'tcc_denied'
-
-/**
- * 定位闸失败原因枚举（审计 reason 字段；result='locate_deferred'，deferred=true，不计 attempts）：
- * - chat_not_in_sidebar / ambiguous_sidebar_match / chat_open_unverified → target_missing：目标行不可唯一精确定位（绝不模糊点击）；
- * - screen_locked / wechat_not_frontmost / main_window_unavailable / window_must_fit_one_display /
- *   wechat_not_running / no_frame_after_filter_refresh → env_unavailable：环境不可用（熄屏/锁屏/多窗口态/不在前台），下轮自动重试；
- * - ui_tool_missing / tcc_denied：部署/权限问题（确定性失败，不重试直接返回）。
- */
 export interface SenderLogger {
   info(message: string): unknown
   warn(message: string): unknown
@@ -183,7 +156,7 @@ export interface SenderOptions {
   allowTakeFocus?: boolean
   /** 交互闸连续非前台 N 次后 warn（默认 3） */
   frontmostWarnAfter?: number
-  /** Config.sendTargetChat：发送目标会话名（搜索词；默认 '老大'——大号在小号通讯录中的备注） */
+  /** Config.sendTargetChat：发送目标会话名（搜索词；真实值放运行配置，默认空=fail-closed 不发送） */
   sendTargetChat?: string
   /** Config.readbackChatId：DB 回读验证目标会话 wxid（P0 兜底闸目标；缺失 fail-closed 不发送） */
   readbackChatId?: string
@@ -317,7 +290,6 @@ export class KeyboardSender implements SendPrimitive {
   private readonly sleep: (ms: number) => Promise<void>
   private readonly isFrontmostFn: () => Promise<boolean>
   private readonly allowTakeFocus: boolean
-  private readonly wechatUiPath: string
   private readonly sendTargetChat: string
   private readonly searchViaClipboard: boolean
   private readonly warn?: (message: string) => void
@@ -328,9 +300,7 @@ export class KeyboardSender implements SendPrimitive {
     isFrontmost: () => Promise<boolean>
     /** 抢前台模式：activate 后不做前台中止检查（微信不在前台也继续键序） */
     allowTakeFocus?: boolean
-    /** wechat-ui 二进制路径（定位/合规闸原语用） */
-    wechatUiPath?: string
-    /** 发送目标会话名（搜索词；Config sendTargetChat，默认 '老大'） */
+    /** 发送目标会话名（搜索词；Config sendTargetChat；空=fail-closed 不发送） */
     sendTargetChat?: string
     /** 搜索词键入方式：false = System Events 直接键入；true = 剪贴板回退（CJK IME 风险兜底） */
     searchViaClipboard?: boolean
@@ -340,7 +310,6 @@ export class KeyboardSender implements SendPrimitive {
     this.sleep = options.sleepMs
     this.isFrontmostFn = options.isFrontmost
     this.allowTakeFocus = options.allowTakeFocus ?? false
-    this.wechatUiPath = options.wechatUiPath ?? 'wechat-ui'
     this.sendTargetChat = options.sendTargetChat ?? SEND_TARGET_CHAT_DEFAULT
     this.searchViaClipboard = options.searchViaClipboard ?? false
     this.warn = options.warn
@@ -490,12 +459,6 @@ export class SenderService {
   }
 
   /**
-   * ④ 发送前合规闸（路线 A，keyboard 模式专用；dry_run 照常执行——只读核验，
-   * 正好用于上线前验证 TCC「屏幕录制」授权与当前会话定位）。
-   * 未通过 → deferred：审计 result='wrong_chat_open' + reason 字段，attempts 不增
-   * （用户环境/部署状态不是发送失败），保持 pending 下轮自动重试。
-   */
-  /**
    * 发送单条 outbox 条目（与消费循环完全同一路径：dry_run / 状态机 / 审计 / 验证）。
    * 闸门（总闸/通道闸/交互闸/频控）由调用方先过；这里只负责"怎么发 + 怎么验"。
    */
@@ -544,10 +507,6 @@ export class SenderService {
       this.options.logger.error(`sender: keyboard 模式缺 ${missing}（无法 DB 回读验证）— fail-closed 不发送 id=${id} attempts=${attempts}`)
       return { action: 'failed' }
     }
-
-    // ⓪ 定位闸：自动定位并打开文件传输助手（废除常驻前提；已打开时零点击幂等通过）
-
-    // ④ 发送前合规闸：wechat-ui read 标题核验通过才执行"粘贴+Return"键序（防误发核心）
 
     const r = await this.primitive.transmit({ id, text, feature, dryRun: false })
     if (!r.ok && r.stage === 'env_unavailable') {

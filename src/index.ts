@@ -170,8 +170,6 @@ export interface PluginConfig {
   verifyDelaySec: number
   /** DB 回读验证尝试次数（默认 4；总窗口 ≈ verifyDelaySec × verifyRetries ≈ 12s） */
   verifyRetries: number
-  /** 发送前合规闸（wechat-ui read 标题核验）失败重试次数（默认 2 = 总尝试 3 次） */
-  chatVerifyRetries: number
   /** 抢前台模式（默认 false = 微信非前台跳过本轮）。true = 自动激活微信前台发送，仍让路给正在打字的用户（空闲 <10s 跳过） */
   allowTakeFocus: boolean
   idleSkipBelowSec: number
@@ -265,12 +263,11 @@ export const Config: Schema<PluginConfig> = Schema.object({
   reportPipeline: Schema.string().default('map-reduce').description("T7 报告归纳管线：map-reduce（默认，方案 A，安全默认）| refine（方案 B 滚动流水线接管，实验）| ab（双跑：正式报告仍用 A，B 产出落 reports/<chatId>/<date>.refine.json 供人工三维度评审）。BooookScore 修正案：不预设 B 优，A/B 灰度实测定夺"),
   schemaTwoStage: Schema.boolean().default(false).description('T8 两段式生成实验开关（默认 false = 零变化）：true 时报告生成的每次 LLM 调用拆两步——先自由文本归纳（无 schema 约束）、再独立调用格式化为既有 schema，再走既有断言。依据 EMNLP 2024《Let Me Speak Freely?》：严格格式约束抑制推理。仅 report 路径（map/merge/refine）生效，distiller 不受影响；两步成本均入统计行，可对照观察'),
     verifyRetries: Schema.number().default(4).description('DB 回读验证尝试次数（默认 4；穷尽仍未命中才判 failed_wrong_target）'),
-  chatVerifyRetries: Schema.number().default(2).description('发送前合规闸（wechat-ui read 标题核验，防误发）失败重试次数（默认 2 = 共 3 次；全失败 deferred 不发不计 attempts）'),
   allowTakeFocus: Schema.boolean().default(false).description('抢前台模式（默认 false = 微信非前台跳过本轮，人在电脑前模式）。true = 全自动无人值守：自动激活微信前台发送，但系统空闲 <10s（用户正在打字/操作）仍让路跳过'),
   accountWhitelist: Schema.array(Schema.string()).default([]).description('账号白名单 wxid 数组（账号生命周期自动化，fail-closed 同 groups 语义：白名单外账号活跃 → sender 全面挂起+取钥硬阻断）。空 = 仅允许 sourceDbRoot 派生的默认账号'),
     activeAccountWxid: Schema.string().default('').description('配置账号 wxid（账号生命周期自动化；空 = 从 sourceDbRoot 路径派生 wxid 段；派生不出且未显式配置 = 探针关闭零变化）'),
   allowAutoRekey: Schema.boolean().default(false).description('小号回归自动取钥（默认 false：只通知人工执行 bootstrap_keys.py）。true = 自动执行取钥+验证。开启前必须人工成功手跑一次取钥（两段式安全条件，见 RUNBOOK）'),
-    sendTargetChat: Schema.string().default('老大').description('发送目标会话名（搜索词；用户指定：大号在小号通讯录中的备注。搜索结果多条时 Enter 选第一个，异常由 DB 回读兜底报警）'),
+    sendTargetChat: Schema.string().default('').description('发送目标会话名（搜索词；真实值放运行配置。默认空 = fail-closed 不发送；搜索结果多条时 Enter 选第一个，异常由 DB 回读兜底报警）'),
   readbackChatId: Schema.string().default('').description('DB 回读验证目标会话 wxid（P0 兜底闸目标；必填——缺失 fail-closed 不发送。真实值放 cordis.patch.yml）'),
   sendSearchViaClipboard: Schema.boolean().default(false).description('搜索词键入走剪贴板回退（默认 false = System Events 直接键入；CJK IME 拦截实测失败时开启）'),
     idleSkipBelowSec: Schema.number().default(10).description('用户空闲让路阈值秒（默认 10 = 系统空闲 <10s 视为正在操作→跳过本轮让路；0 = 不让路，空闲检测失效直接抢前台发送。日常单日报场景可设 0——每天一次的抢前台可接受；频繁发送建议保持 10）'),
