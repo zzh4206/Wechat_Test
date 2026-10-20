@@ -204,12 +204,14 @@ export interface SqliteMirror {
    * 修订事件镜像（v0.6，TECH §3.1）：插件侧修订事件显式通道（接线由插件侧 P3 完成）。
    * insertReportRevision 幂等（source_key 冲突返回已有 id、不更新——修订不可变事实）。
    */
-  mirrorReportRevision(chatId: string, periodType: ReportKindName, periodStart: string, ts: number, type: string, opts?: { targetRef?: string | null; summary?: string | null; source?: 'chat' | 'web'; sourceKey?: string }): void
+  mirrorReportRevision(chatId: string, periodType: ReportKindName, periodStart: string, ts: number, type: string, opts?: { targetRef?: string | null; summary?: string | null; source?: 'chat' | 'web'; sourceKey?: string }): boolean
   /**
    * 完成情况标记镜像（v0.6）：kind 三态 done/undone/deleted；同一 target_ref 的状态
    * 演变 = 追加新行（不可变事实），最新态由 v_marking_latest 承载。
    */
-  mirrorMarking(chatId: string, kind: 'done' | 'undone' | 'deleted', targetRef: string, ts: number, opts?: { source?: 'chat' | 'web'; sourceKey?: string }): void
+  mirrorMarking(chatId: string, kind: 'done' | 'undone' | 'deleted', targetRef: string, ts: number, opts?: { source?: 'chat' | 'web'; sourceKey?: string }): boolean
+  /** 修订读侧（报告渲染的修订段；单一查询副本 = knowledge.db） */
+  listRevisions(chatId: string, periodType: string, periodStart: string): Array<{ ts: number; type: string; summary: string | null; source: string }>
   close(): void
 }
 
@@ -389,7 +391,7 @@ export function createSqliteMirror(sqlitePath: string | undefined, logger: DbLog
     },
 
     mirrorDocsFromReport(kind, chatId, dateKey, md) {
-      mirrorDocsFromReport(kind, chatId, dateKey, md)
+      safe(() => mirrorDocsFromReport(kind, chatId, dateKey, md))
     },
 
     // v0.6：修订/标记镜像（接线由插件侧 P3 完成；此处只交付方法与幂等语义）
@@ -397,12 +399,12 @@ export function createSqliteMirror(sqlitePath: string | undefined, logger: DbLog
       const period = reportPeriodOf(periodType, periodStart)
       if (!period || period.periodStart !== periodStart) {
         logger.warn(`mirror: revision periodStart 非法（${periodType} ${periodStart}）——跳过镜像`)
-        return
+        return false
       }
       const sourceKey =
         opts?.sourceKey ?? `rev:${chatId}:${periodType}:${periodStart}:${ts}:${type}`
-      safe(() =>
-        dao.insertReportRevision({
+      try {
+        return dao.insertReportRevision({
           chatId,
           periodType,
           periodStart,
@@ -412,23 +414,40 @@ export function createSqliteMirror(sqlitePath: string | undefined, logger: DbLog
           summary: opts?.summary ?? null,
           source: opts?.source ?? 'chat',
           sourceKey,
-        }),
-      )
+        }) !== null
+      } catch (error) {
+        logger.warn(`mirror: reportRevision 写入失败：${String(error).slice(0, 120)}`)
+        return false
+      }
     },
 
     mirrorMarking(chatId, kind, targetRef, ts, opts) {
-      if (!targetRef) return
+      if (!targetRef) return false
       const sourceKey = opts?.sourceKey ?? `mark:${chatId}:${targetRef}:${ts}`
-      safe(() =>
-        dao.insertMarking({
+      try {
+        return dao.insertMarking({
           chatId,
           kind,
           targetRef,
           ts,
           source: opts?.source ?? 'chat',
           sourceKey,
-        }),
-      )
+        }) !== null
+      } catch (error) {
+        logger.warn(`mirror: marking 写入失败：${String(error).slice(0, 120)}`)
+        return false
+      }
+    },
+
+    listRevisions(chatId, periodType, periodStart) {
+      try {
+        return dao
+          .listRevisions(chatId, periodType)
+          .filter((r) => r.period_start === periodStart)
+          .map((r) => ({ ts: Number(r.ts), type: String(r.type), summary: r.summary === null ? null : String(r.summary), source: String(r.source) }))
+      } catch {
+        return []
+      }
     },
 
     mirrorText(rel, text) {

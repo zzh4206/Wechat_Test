@@ -346,6 +346,8 @@ export interface RenderInput {
   board?: { mineOwed: readonly string[]; owedMe: readonly string[] }
   /** L3「本期文件索引」（M5-T5.4 接真数据源）：新文件行（星标/最新版/摘要）。缺省时保留占位行。 */
   fileLines?: readonly string[]
+  /** 修订记录行（审批标记设计 §3.2 流展示；来自 report_revisions 表，时间正序）。非空时尾部渲染修订段。 */
+  revisionLines?: readonly string[]
   /**
    * T3 batch_stats：本次生成的批统计（批数/失败批/最大批耗时/缓存命中/总调用/总耗时）。
    * 提供时在报告末尾追加一行统计（degraded/empty 也应有合理输出——empty 传全 0）。
@@ -369,7 +371,12 @@ export function renderReport(input: RenderInput): string {
     lines.push('本期窗口内无消息，无内容可归纳。', '')
     // T3：empty 路径也输出 batch_stats 行（全 0——零 LLM 调用可见化）
     if (input.batchStats) lines.push(renderBatchStatsLine(input.batchStats), '')
-    return lines.join('\n')
+      if (input.revisionLines && input.revisionLines.length > 0) {
+    lines.push('## 修订记录', '')
+    for (const line of input.revisionLines) lines.push(line)
+    lines.push('')
+  }
+return lines.join('\n')
   }
   // —— L1 一分钟层 ——
   lines.push('## L1 一分钟层', '')
@@ -755,7 +762,11 @@ export class ReportService {
         tokensEst: refineSide.stats.tokensEst,
       }
     }
-    const md = renderReport({ kind, chatId, window: win, draft, status, messageCount, degradedReason, partialNote, quotes, persons, actions: this.collectActions(chatId, win), board: this.collectBoard(chatId, win), fileLines: this.collectFileLines(chatId, win), batchStats })
+    // 修订记录段（单一查询副本=knowledge.db；渲染时从 report_revision 取该报告条目）
+    const revisionLines = this.options.store
+      .listRevisions(chatId, kind, win.dateKey)
+      .map((r) => `- ${new Date(r.ts).toISOString().slice(0, 16).replace('T', ' ')} ${r.type}：${r.summary ?? ''}（来源：${r.source === 'web' ? '前端' : '对话框'}）`)
+    const md = renderReport({ kind, chatId, window: win, draft, status, messageCount, degradedReason, partialNote, quotes, persons, actions: this.collectActions(chatId, win), board: this.collectBoard(chatId, win), fileLines: this.collectFileLines(chatId, win), batchStats, revisionLines })
     const written = this.options.store.writeReport(kind, chatId, win.dateKey, md) // P0 返工：显式通道实时入库（单群三类型）
     const path = written ? rel : null
     const judgmentCount = draft?.judgments.length ?? 0
