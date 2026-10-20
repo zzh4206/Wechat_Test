@@ -245,7 +245,7 @@ function makeV3Db(path) {
   db.close()
 }
 
-test('迁移：v3 样例库 → v4 后行数不变、chat_id=aggregate、entry 外键存活；v4 重跑幂等', () => {
+test('迁移：v3 样例库 → v5 后行数不变、chat_id=aggregate、entry 外键存活；重跑幂等', () => {
   const { path, dir } = tmpDb('migrate')
   makeV3Db(path)
 
@@ -265,32 +265,77 @@ test('迁移：v3 样例库 → v4 后行数不变、chat_id=aggregate、entry �
   assert.ok(dao.upsertReport({ periodType: 'daily', periodStart: '2026-01-05', periodEnd: '2026-01-05', title: '日报', contentMd: 'x', chatId: '12345678@chatroom' }))
   db.close()
 
-  // v4 库重跑：无变化（幂等）
+  // v5 库重跑：无变化（幂等）
   const db2 = openDb(path, { logger })
   assert.ok(db2)
   const dao2 = new KnowledgeDao(db2, logger)
   assert.equal(dao2.count('report'), 3)
-  assert.equal(checkSchemaVersion(db2), 4)
+  assert.equal(checkSchemaVersion(db2), 5)
   db2.close()
 
-  // 原生 sqlite3 CLI 侧核对 user_version=4（node:sqlite 视角一致）
-  assert.equal(checkSchemaVersion(new DatabaseSync(path)), 4)
+  // 原生 sqlite3 CLI 侧核对 user_version=5（node:sqlite 视角一致）
+  assert.equal(checkSchemaVersion(new DatabaseSync(path)), 5)
   rmSync(dir, { recursive: true, force: true })
 })
 
-test('迁移：user_version > 4 拒开；0/新建库直接建 v4', () => {
+test('迁移：user_version > 5 拒开；0/新建库直接建 v5', () => {
   const dir = mkdtempSync(join(tmpdir(), 'lurker-db-ver-'))
   const path = join(dir, 't.db')
   const db = new DatabaseSync(path)
-  db.exec('PRAGMA user_version = 5;')
+  db.exec('PRAGMA user_version = 6;')
   db.close()
-  assert.equal(openDb(path, { logger }), null, '>4 库应拒开并 warn')
+  assert.equal(openDb(path, { logger }), null, '>5 库应拒开并 warn')
 
   const fresh = join(dir, 'fresh.db')
   const db2 = openDb(fresh, { logger })
-  assert.ok(db2, '全新库应成功创建 v4')
-  assert.equal(checkSchemaVersion(db2), 4)
+  assert.ok(db2, '全新库应成功创建 v5')
+  assert.equal(checkSchemaVersion(db2), 5)
   db2.close()
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('迁移：v4 库 → v5 纯新增两表两视图，既有数据零变化；重跑幂等；<4 拒开', () => {
+  const { path, dir } = tmpDb('migrate45')
+  const db = openDb(path, { logger }) // 先建 v5 库
+  db.close()
+  // 手动降到 v4 并删掉 v0.6 新对象，模拟真实 v4 库
+  const raw = new DatabaseSync(path)
+  raw.exec('PRAGMA foreign_keys = OFF;')
+  raw.exec('DROP VIEW IF EXISTS v_marking_latest; DROP VIEW IF EXISTS v_report_revised;')
+  raw.exec('DROP TABLE IF EXISTS marking; DROP TABLE IF EXISTS report_revision;')
+  raw.exec('PRAGMA user_version = 4;')
+  raw.close()
+
+  const before = new DatabaseSync(path)
+  const snapshot = (db2) => ({
+    report: db2.prepare('SELECT * FROM report ORDER BY id').all(),
+    entry: db2.prepare('SELECT COUNT(*) AS n FROM entry').get().n,
+  })
+  const snap = snapshot(before)
+  before.close()
+
+  const db2 = openDb(path, { logger })
+  assert.ok(db2, 'v4 库应成功打开并迁移到 v5')
+  assert.equal(checkSchemaVersion(db2), 5)
+  const after = snapshot(db2)
+  assert.deepEqual(after, snap, '迁移后既有行零变化')
+  const dao = new KnowledgeDao(db2, logger)
+  assert.equal(dao.count('report_revision'), 0)
+  assert.equal(dao.count('marking'), 0)
+  db2.close()
+
+  // 重跑幂等
+  const db3 = openDb(path, { logger })
+  assert.ok(db3)
+  assert.equal(checkSchemaVersion(db3), 5)
+  db3.close()
+
+  // <4（除 0/3）拒开
+  const bad = join(dir, 'bad.db')
+  const raw2 = new DatabaseSync(bad)
+  raw2.exec('PRAGMA user_version = 2;')
+  raw2.close()
+  assert.equal(openDb(bad, { logger }), null, 'v2 库应拒开')
   rmSync(dir, { recursive: true, force: true })
 })
 
@@ -590,4 +635,150 @@ test('doc 提取：无 URL 报告 → 零 doc；提取失败不影响 writeRepor
   rmSync(dir, { recursive: true, force: true })
   rmSync(stateDir, { recursive: true, force: true })
   rmSync(badDir, { recursive: true, force: true })
+})
+
+// ==================== v0.6：修订历史 + 完成情况标记（TECH-v0.6 §4） ====================
+
+test('v0.6 迁移：v4 样例库 → uv=5、既有数据零变化；重跑幂等（DAO 视角）', () => {
+  const { path, dir } = tmpDb('v06-mig')
+  const db = openDb(path, { logger })
+  const dao = new KnowledgeDao(db, logger)
+  const rid = dao.upsertReport({ periodType: 'daily', periodStart: '2026-01-05', periodEnd: '2026-01-05', title: '日报', contentMd: 'v1' })
+  db.close()
+  const raw = new DatabaseSync(path)
+  raw.exec('DROP VIEW IF EXISTS v_marking_latest; DROP VIEW IF EXISTS v_report_revised;')
+  raw.exec('DROP TABLE marking; DROP TABLE report_revision;')
+  raw.exec('PRAGMA user_version = 4;')
+  raw.close()
+
+  const db2 = openDb(path, { logger })
+  const dao2 = new KnowledgeDao(db2, logger)
+  assert.equal(checkSchemaVersion(db2), 5)
+  assert.equal(dao2.count('report'), 1, '既有 report 行零变化')
+  assert.equal(dao2.getReport('daily', '2026-01-05').id, rid)
+  db2.close()
+  const db3 = openDb(path, { logger }) // 重跑幂等
+  assert.equal(checkSchemaVersion(db3), 5)
+  db3.close()
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('v0.6 修订：同 source_key 两遍 → 1 行；不同 source_key → 多行；v_report_revised 计数正确', () => {
+  const { path, dir } = tmpDb('v06-rev')
+  const db = openDb(path, { logger })
+  const dao = new KnowledgeDao(db, logger)
+
+  const base = { chatId: '12345678@chatroom', periodType: 'daily', periodStart: '2026-01-05', ts: 1700000000000, type: 'section', source: 'chat' }
+  const id1 = dao.insertReportRevision({ ...base, sourceKey: 'rev:c:d:1' })
+  assert.ok(id1)
+  const id1b = dao.insertReportRevision({ ...base, summary: '重放不覆盖', sourceKey: 'rev:c:d:1' })
+  assert.equal(id1b, id1, 'source_key 冲突返回已有 id（不 UPDATE）')
+  assert.equal(dao.count('report_revision'), 1, '修订事件不可变：重放零新增')
+  const row = db.prepare('SELECT * FROM report_revision WHERE id = ?').get(id1)
+  assert.equal(row.summary, null, '已有行未被重放覆盖')
+
+  dao.insertReportRevision({ ...base, type: 'correction', ts: 1700000600000, sourceKey: 'rev:c:d:2' })
+  dao.insertReportRevision({ ...base, chatId: '1234567890@chatroom', type: 'status', sourceKey: 'rev:c2:d:3' })
+  assert.equal(dao.count('report_revision'), 3, '不同 source_key → 多行')
+
+  const revised = db.prepare('SELECT * FROM v_report_revised').all()
+  assert.equal(revised.length, 2)
+  const ownRevised = revised.find((r) => r.chat_id === '12345678@chatroom')
+  assert.equal(ownRevised.revision_count, 2, '同一报告 2 条修订')
+  assert.equal(ownRevised.revised_at, 1700000600000, 'revised_at = MAX(ts)')
+
+  // 列表过滤
+  assert.equal(dao.listRevisions('12345678@chatroom').length, 2)
+  assert.equal(dao.listRevisions('12345678@chatroom', 'daily').length, 2)
+  assert.equal(dao.listRevisions().length, 3)
+
+  // CHECK 防线：非法 kind/period/长度被拒
+  assert.equal(dao.insertReportRevision({ ...base, sourceKey: 'rev:bad:1', periodType: 'hourly' }), null)
+  assert.equal(dao.insertReportRevision({ ...base, sourceKey: 'rev:bad:2', source: 'sms' }), null)
+  assert.equal(dao.insertReportRevision({ ...base, sourceKey: 'rev:bad:3', chatId: '' }), null)
+
+  db.close()
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('v0.6 标记：同 target undone→done 两行；v_marking_latest 只见 done；跨群聚合可查', () => {
+  const { path, dir } = tmpDb('v06-mark')
+  const db = openDb(path, { logger })
+  const dao = new KnowledgeDao(db, logger)
+
+  const base = { chatId: '12345678@chatroom', source: 'chat', ts: 1700000000000 }
+  assert.ok(dao.insertMarking({ ...base, kind: 'undone', targetRef: 'demo-task-0001', sourceKey: 'mark:1' }))
+  assert.ok(dao.insertMarking({ ...base, kind: 'done', targetRef: 'demo-task-0001', ts: 1700003600000, sourceKey: 'mark:2' }))
+  assert.equal(dao.count('marking'), 2, '状态演变 = 追加行，不 UPDATE')
+  // source_key 冲突：返回已有 id、不覆盖
+  assert.equal(dao.insertMarking({ ...base, kind: 'undone', targetRef: 'demo-task-0001', sourceKey: 'mark:2' }), 2)
+
+  // 跨群另一 target
+  dao.insertMarking({ chatId: '1234567890@chatroom', kind: 'undone', targetRef: 'demo-task-0002', source: 'web', ts: 1700001000000, sourceKey: 'mark:3' })
+  dao.insertMarking({ chatId: '1234567890@chatroom', kind: 'deleted', targetRef: 'demo-task-0003', ts: 1700002000000, sourceKey: 'mark:4' })
+
+  const latest = db.prepare('SELECT * FROM v_marking_latest ORDER BY target_ref').all()
+  assert.equal(latest.length, 3)
+  assert.equal(latest[0].kind, 'done', 'undone→done 演变后最新态只见 done')
+  assert.equal(latest[1].kind, 'undone')
+  assert.equal(latest[2].kind, 'deleted')
+
+  const undone = dao.listMarkingsLatest('undone')
+  assert.equal(undone.length, 1)
+  assert.equal(undone[0].chat_id, '1234567890@chatroom', '跨群聚合可查')
+  assert.equal(dao.listMarkingsLatest().length, 3)
+
+  // CHECK 防线
+  assert.equal(dao.insertMarking({ ...base, kind: 'paused', targetRef: 'x', sourceKey: 'mark:5' }), null)
+  assert.equal(dao.insertMarking({ ...base, kind: 'done', targetRef: '', sourceKey: 'mark:6' }), null)
+
+  db.close()
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('v0.6 T4 语义：final 报告 upsert 修订内容后仍 final；draft 报告 upsert 后仍 draft', () => {
+  const { path, dir } = tmpDb('v06-t4')
+  const db = openDb(path, { logger })
+  const dao = new KnowledgeDao(db, logger)
+
+  dao.upsertReport({ periodType: 'daily', periodStart: '2026-01-05', periodEnd: '2026-01-05', title: '日报A', contentMd: 'v1', status: 'final' })
+  dao.upsertReport({ periodType: 'daily', periodStart: '2026-01-06', periodEnd: '2026-01-06', title: '日报B', contentMd: 'v1' })
+
+  // final 被修订（重放同键内容更新、status 仍传 draft）→ 保持 final，内容更新
+  dao.upsertReport({ periodType: 'daily', periodStart: '2026-01-05', periodEnd: '2026-01-05', title: '日报A', contentMd: 'v2（修订）', status: 'draft' })
+  const a = dao.getReport('daily', '2026-01-05')
+  assert.equal(a.status, 'final', 'T4：final 被修订后仍 final（不降级）')
+  assert.match(a.content_md, /v2（修订）/, '内容正常更新')
+
+  // draft 重放（status 仍 draft）→ 不自动 final
+  dao.upsertReport({ periodType: 'daily', periodStart: '2026-01-06', periodEnd: '2026-01-06', title: '日报B', contentMd: 'v2' })
+  const b = dao.getReport('daily', '2026-01-06')
+  assert.equal(b.status, 'draft', 'T4：draft 报告 upsert 后仍 draft（不自动 final）')
+
+  db.close()
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('v0.6 镜像：mirrorReportRevision / mirrorMarking 幂等入镜；非法 period 跳过', () => {
+  const { path, dir } = tmpDb('v06-mirror')
+  const stateDir = mkdtempSync(join(tmpdir(), 'lurker-v06-state-'))
+  const store = new Store(stateDir, logger, path)
+  const db = openDb(path, { logger })
+  const dao = new KnowledgeDao(db, logger)
+
+  const m = store.mirror
+  m.mirrorReportRevision('12345678@chatroom', 'daily', '2026-01-05', 1700000000000, 'section', { summary: '合成占位', sourceKey: 'rev:t:1' })
+  m.mirrorReportRevision('12345678@chatroom', 'daily', '2026-01-05', 1700000000000, 'section', { summary: '重放', sourceKey: 'rev:t:1' })
+  assert.equal(dao.count('report_revision'), 1, '修订镜像幂等')
+  m.mirrorReportRevision('12345678@chatroom', 'monthly', '2026-01-15', 1700000000000, 'status')
+  assert.equal(dao.count('report_revision'), 1, '非法 periodStart（非月初）跳过')
+
+  m.mirrorMarking('12345678@chatroom', 'undone', 'demo-task-9', 1700000000000, { sourceKey: 'mark:t:1' })
+  m.mirrorMarking('12345678@chatroom', 'done', 'demo-task-9', 1700003600000, { sourceKey: 'mark:t:2' })
+  assert.equal(dao.count('marking'), 2)
+  assert.equal(db.prepare("SELECT kind FROM v_marking_latest WHERE target_ref='demo-task-9'").get().kind, 'done')
+
+  db.close()
+  rmSync(dir, { recursive: true, force: true })
+  rmSync(stateDir, { recursive: true, force: true })
 })

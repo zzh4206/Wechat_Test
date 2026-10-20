@@ -78,6 +78,70 @@ export interface ChatDigestInput {
   createdAt?: number
 }
 
+// ==================== v0.6：修订历史 + 完成情况标记 ====================
+
+export type RevisionSource = 'chat' | 'web'
+
+/** report_revision 输入（TECH-v0.6 §1.1）：修订事件是不可变事实，source_key 冲突不更新 */
+export interface ReportRevisionInput {
+  chatId: string
+  periodType: ReportKind
+  /** YYYY-MM-DD */
+  periodStart: string
+  /** 修订发生时刻（毫秒） */
+  ts: number
+  /** 修订类型（自由短词：section/correction/status…） */
+  type: string
+  /** 段落/条目引用（可空） */
+  targetRef?: string | null
+  /** 元数据摘要（红线：不含消息/语句原文） */
+  summary?: string | null
+  source: RevisionSource
+  /** 幂等键（如 rev:<chatId>:<period>:<ts>:<n>） */
+  sourceKey: string
+  createdAt?: number
+}
+
+export type MarkingKind = 'done' | 'undone' | 'deleted'
+
+/** marking 输入（TECH-v0.6 §1.2）：同 target_ref 状态演变 = 追加行，source_key 冲突不更新 */
+export interface MarkingInput {
+  chatId: string
+  kind: MarkingKind
+  /** 任务/事项标识 */
+  targetRef: string
+  /** 标记时刻（毫秒） */
+  ts: number
+  source: RevisionSource
+  sourceKey: string
+  createdAt?: number
+}
+
+export interface ReportRevisionRow {
+  id: number
+  chat_id: string
+  period_type: string
+  period_start: string
+  ts: number
+  type: string
+  target_ref: string | null
+  summary: string | null
+  source: string
+  source_key: string
+  created_at: number
+}
+
+export interface MarkingRow {
+  id: number
+  chat_id: string
+  kind: string
+  target_ref: string
+  ts: number
+  source: string
+  source_key: string
+  created_at: number
+}
+
 export interface ReportRow {
   id: number
   period_type: string

@@ -200,6 +200,16 @@ export interface SqliteMirror {
    * Python「命中即跳过」一致，因此两边先后跑不会产生重复 doc。
    */
   mirrorDocsFromReport(kind: ReportKindName, chatId: string, dateKey: string, md: string): void
+  /**
+   * 修订事件镜像（v0.6，TECH §3.1）：插件侧修订事件显式通道（接线由插件侧 P3 完成）。
+   * insertReportRevision 幂等（source_key 冲突返回已有 id、不更新——修订不可变事实）。
+   */
+  mirrorReportRevision(chatId: string, periodType: ReportKindName, periodStart: string, ts: number, type: string, opts?: { targetRef?: string | null; summary?: string | null; source?: 'chat' | 'web'; sourceKey?: string }): void
+  /**
+   * 完成情况标记镜像（v0.6）：kind 三态 done/undone/deleted；同一 target_ref 的状态
+   * 演变 = 追加新行（不可变事实），最新态由 v_marking_latest 承载。
+   */
+  mirrorMarking(chatId: string, kind: 'done' | 'undone' | 'deleted', targetRef: string, ts: number, opts?: { source?: 'chat' | 'web'; sourceKey?: string }): void
   close(): void
 }
 
@@ -380,6 +390,45 @@ export function createSqliteMirror(sqlitePath: string | undefined, logger: DbLog
 
     mirrorDocsFromReport(kind, chatId, dateKey, md) {
       mirrorDocsFromReport(kind, chatId, dateKey, md)
+    },
+
+    // v0.6：修订/标记镜像（接线由插件侧 P3 完成；此处只交付方法与幂等语义）
+    mirrorReportRevision(chatId, periodType, periodStart, ts, type, opts) {
+      const period = reportPeriodOf(periodType, periodStart)
+      if (!period || period.periodStart !== periodStart) {
+        logger.warn(`mirror: revision periodStart 非法（${periodType} ${periodStart}）——跳过镜像`)
+        return
+      }
+      const sourceKey =
+        opts?.sourceKey ?? `rev:${chatId}:${periodType}:${periodStart}:${ts}:${type}`
+      safe(() =>
+        dao.insertReportRevision({
+          chatId,
+          periodType,
+          periodStart,
+          ts,
+          type,
+          targetRef: opts?.targetRef ?? null,
+          summary: opts?.summary ?? null,
+          source: opts?.source ?? 'chat',
+          sourceKey,
+        }),
+      )
+    },
+
+    mirrorMarking(chatId, kind, targetRef, ts, opts) {
+      if (!targetRef) return
+      const sourceKey = opts?.sourceKey ?? `mark:${chatId}:${targetRef}:${ts}`
+      safe(() =>
+        dao.insertMarking({
+          chatId,
+          kind,
+          targetRef,
+          ts,
+          source: opts?.source ?? 'chat',
+          sourceKey,
+        }),
+      )
     },
 
     mirrorText(rel, text) {

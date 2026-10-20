@@ -7,14 +7,15 @@
  * 2) 读绝对路径则要把家目录写进源码，触碰 check-sensitive.sh 红线；
  * 3) schema 漂移风险低；若上游变更，以本文件 + user_version 校验兜底。
  *
- * 与 0数据格式/schema.sql 保持语义逐字一致（v0.4，user_version=4）：
- * report 重建含 chat_id（冲突键三元组），新增 media 表；周期 GLOB/CHECK 原文保留。
+ * 与 0数据格式/schema.sql 保持语义逐字一致（v0.6，user_version=5）：
+ * v0.6 纯新增 report_revision / marking 两表 + v_report_revised / v_marking_latest
+ * 两视图（既有表零改动）；report 重建含 chat_id（冲突键三元组），media 表；周期 GLOB/CHECK 原文保留。
  */
-export const SCHEMA_VERSION = 4
+export const SCHEMA_VERSION = 5
 
-/** v0.4 全量 DDL（全新库直接执行；含 user_version=4） */
+/** v0.6 全量 DDL（全新库直接执行；含 user_version=5） */
 export const SCHEMA_SQL = `
-PRAGMA user_version = 4;
+PRAGMA user_version = 5;
 
 CREATE TABLE IF NOT EXISTS doc (
   id           INTEGER PRIMARY KEY,
@@ -131,6 +132,86 @@ CREATE VIEW IF NOT EXISTS v_report_full AS
 SELECT r.*, (SELECT COUNT(*) FROM entry e WHERE e.report_id = r.id) AS entry_count
 FROM report r
 ORDER BY r.period_type, r.period_start DESC;
+
+CREATE TABLE IF NOT EXISTS report_revision (
+  id           INTEGER PRIMARY KEY,
+  chat_id      TEXT NOT NULL CHECK (length(chat_id) BETWEEN 1 AND 128),
+  period_type  TEXT NOT NULL CHECK (period_type IN ('daily','weekly','monthly')),
+  period_start TEXT NOT NULL,
+  ts           INTEGER NOT NULL,
+  type         TEXT NOT NULL,
+  target_ref   TEXT,
+  summary      TEXT,
+  source       TEXT NOT NULL CHECK (source IN ('chat','web')),
+  source_key   TEXT NOT NULL UNIQUE,
+  created_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_revision_report ON report_revision(chat_id, period_type, period_start, ts);
+CREATE INDEX IF NOT EXISTS idx_revision_ts ON report_revision(ts);
+
+CREATE TABLE IF NOT EXISTS marking (
+  id           INTEGER PRIMARY KEY,
+  chat_id      TEXT NOT NULL CHECK (length(chat_id) BETWEEN 1 AND 128),
+  kind         TEXT NOT NULL CHECK (kind IN ('done','undone','deleted')),
+  target_ref   TEXT NOT NULL,
+  ts           INTEGER NOT NULL,
+  source       TEXT NOT NULL CHECK (source IN ('chat','web')),
+  source_key   TEXT NOT NULL UNIQUE,
+  created_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_marking_chat ON marking(chat_id, kind, ts);
+CREATE INDEX IF NOT EXISTS idx_marking_target ON marking(target_ref);
+
+CREATE VIEW IF NOT EXISTS v_marking_latest AS
+SELECT m.* FROM marking m
+JOIN (SELECT target_ref, MAX(ts) AS mx, MAX(id) AS mi FROM marking GROUP BY target_ref) t
+  ON m.target_ref = t.target_ref AND m.ts = t.mx AND m.id = t.mi;
+
+CREATE VIEW IF NOT EXISTS v_report_revised AS
+SELECT chat_id, period_type, period_start, COUNT(*) AS revision_count, MAX(ts) AS revised_at
+FROM report_revision GROUP BY chat_id, period_type, period_start;
+`
+
+/**
+ * v4 → v5 迁移 DDL（与 0数据格式 TECH-v0.6.md §1 / schema.sql 逐字一致）：
+ * 纯新增 report_revision / marking 两表 + v_report_revised / v_marking_latest 两视图，
+ * 既有表零改动。执行须包裹在单事务内、user_version 最后置（见 db.ts）。
+ */
+export const MIGRATE_V4_TO_V5_SQL = `
+CREATE TABLE report_revision (
+  id           INTEGER PRIMARY KEY,
+  chat_id      TEXT NOT NULL CHECK (length(chat_id) BETWEEN 1 AND 128),
+  period_type  TEXT NOT NULL CHECK (period_type IN ('daily','weekly','monthly')),
+  period_start TEXT NOT NULL,
+  ts           INTEGER NOT NULL,
+  type         TEXT NOT NULL,
+  target_ref   TEXT,
+  summary      TEXT,
+  source       TEXT NOT NULL CHECK (source IN ('chat','web')),
+  source_key   TEXT NOT NULL UNIQUE,
+  created_at   INTEGER NOT NULL
+);
+CREATE INDEX idx_revision_report ON report_revision(chat_id, period_type, period_start, ts);
+CREATE INDEX idx_revision_ts ON report_revision(ts);
+CREATE TABLE marking (
+  id           INTEGER PRIMARY KEY,
+  chat_id      TEXT NOT NULL CHECK (length(chat_id) BETWEEN 1 AND 128),
+  kind         TEXT NOT NULL CHECK (kind IN ('done','undone','deleted')),
+  target_ref   TEXT NOT NULL,
+  ts           INTEGER NOT NULL,
+  source       TEXT NOT NULL CHECK (source IN ('chat','web')),
+  source_key   TEXT NOT NULL UNIQUE,
+  created_at   INTEGER NOT NULL
+);
+CREATE INDEX idx_marking_chat ON marking(chat_id, kind, ts);
+CREATE INDEX idx_marking_target ON marking(target_ref);
+CREATE VIEW v_marking_latest AS
+SELECT m.* FROM marking m
+JOIN (SELECT target_ref, MAX(ts) AS mx, MAX(id) AS mi FROM marking GROUP BY target_ref) t
+  ON m.target_ref = t.target_ref AND m.ts = t.mx AND m.id = t.mi;
+CREATE VIEW v_report_revised AS
+SELECT chat_id, period_type, period_start, COUNT(*) AS revision_count, MAX(ts) AS revised_at
+FROM report_revision GROUP BY chat_id, period_type, period_start;
 `
 
 /**

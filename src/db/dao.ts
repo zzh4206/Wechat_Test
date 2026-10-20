@@ -17,10 +17,14 @@ import type {
   DocRow,
   EntryInput,
   EntryRow,
+  MarkingInput,
+  MarkingRow,
   MediaInput,
   MediaRow,
   ReportFullRow,
   ReportInput,
+  ReportRevisionInput,
+  ReportRevisionRow,
   ReportRow,
 } from './types.js'
 
@@ -226,7 +230,11 @@ export class KnowledgeDao {
 
   // ---------- report ----------
 
-  /** 幂等 upsert：UNIQUE(period_type, period_start, chat_id) 三元组冲突 → UPDATE 正文 */
+  /**
+   * 幂等 upsert：UNIQUE(period_type, period_start, chat_id) 三元组冲突 → UPDATE 正文。
+   * T4 裁定（REPLY-v0.6）：修订**不改变** status——冲突分支保持既有 status 不动
+   * （final 保持 final：draft→final 单向定稿，修订不降级；draft 也不会被自动 final）。
+   */
   upsertReport(input: ReportInput): number | null {
     const chatId = input.chatId ?? 'aggregate'
     try {
@@ -239,7 +247,6 @@ export class KnowledgeDao {
              period_end = excluded.period_end,
              title = excluded.title,
              content_md = excluded.content_md,
-             status = excluded.status,
              doc_ids_hint = excluded.doc_ids_hint,
              updated_at = excluded.updated_at`,
         )
@@ -358,8 +365,110 @@ export class KnowledgeDao {
     }
   }
 
-  // ---------- chat_digest ----------
+  // ---------- report_revision / marking（v0.6，TECH-v0.6 §3.1） ----------
 
+  /**
+   * 幂等插入修订事件：source_key 冲突 → 返回已有 id、**不 UPDATE**
+   * （修订是不可变事实，重放不产生重复行也不覆盖）；失败 → null。
+   */
+  insertReportRevision(input: ReportRevisionInput): number | null {
+    if (!input.chatId || !input.sourceKey) return null
+    try {
+      const hit = this.db
+        .prepare('SELECT id FROM report_revision WHERE source_key = ? LIMIT 1')
+        .get(input.sourceKey) as { id: number } | undefined
+      if (hit) return hit.id
+      const res = this.db
+        .prepare(
+          `INSERT INTO report_revision (chat_id, period_type, period_start, ts, type, target_ref, summary, source, source_key, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          input.chatId,
+          input.periodType,
+          input.periodStart,
+          input.ts,
+          input.type,
+          input.targetRef ?? null,
+          input.summary ?? null,
+          input.source ?? 'chat',
+          input.sourceKey,
+          input.createdAt ?? this.now(),
+        )
+      return Number(res.lastInsertRowid)
+    } catch (error) {
+      this.logger.warn(`dao.insertReportRevision failed: ${String(error)}`)
+      return null
+    }
+  }
+
+  /**
+   * 幂等插入标记：source_key 冲突 → 返回已有 id、**不 UPDATE**（标记同样是不可变事实；
+   * 同一 target_ref 的状态演变由追加新行表达，最新态走 v_marking_latest）。失败 → null。
+   */
+  insertMarking(input: MarkingInput): number | null {
+    if (!input.chatId || !input.targetRef || !input.sourceKey) return null
+    try {
+      const hit = this.db
+        .prepare('SELECT id FROM marking WHERE source_key = ? LIMIT 1')
+        .get(input.sourceKey) as { id: number } | undefined
+      if (hit) return hit.id
+      const res = this.db
+        .prepare(
+          `INSERT INTO marking (chat_id, kind, target_ref, ts, source, source_key, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          input.chatId,
+          input.kind,
+          input.targetRef,
+          input.ts,
+          input.source ?? 'chat',
+          input.sourceKey,
+          input.createdAt ?? this.now(),
+        )
+      return Number(res.lastInsertRowid)
+    } catch (error) {
+      this.logger.warn(`dao.insertMarking failed: ${String(error)}`)
+      return null
+    }
+  }
+
+  /** 修订列表：可选按会话/周期类型过滤（走 idx_revision_report），按 ts 升序 */
+  listRevisions(chatId?: string, periodType?: string): ReportRevisionRow[] {
+    try {
+      const conds: string[] = []
+      const args: SQLInputValue[] = []
+      if (chatId) {
+        conds.push('chat_id = ?')
+        args.push(chatId)
+      }
+      if (periodType) {
+        conds.push('period_type = ?')
+        args.push(periodType)
+      }
+      const where = conds.length ? `WHERE ${conds.join(' AND ')}` : ''
+      return this.db
+        .prepare(`SELECT * FROM report_revision ${where} ORDER BY ts LIMIT 500`)
+        .all(...args) as unknown as ReportRevisionRow[]
+    } catch {
+      return []
+    }
+  }
+
+  /** 标记最新态（v_marking_latest：每 target_ref 最新一条，同 ts 并列取 MAX(id)）；可选按 kind 过滤 */
+  listMarkingsLatest(kind?: string): MarkingRow[] {
+    try {
+      const rows = kind
+        ? this.db.prepare('SELECT * FROM v_marking_latest WHERE kind = ? ORDER BY ts LIMIT 500').all(kind)
+        : this.db.prepare('SELECT * FROM v_marking_latest ORDER BY ts LIMIT 500').all()
+      return rows as unknown as MarkingRow[]
+    } catch {
+      return []
+    }
+  }
+
+  // ---------- chat_digest ----------
   /** 幂等：source_key 冲突 → UPDATE（digest_md / happened_on / doc_id） */
   insertChatDigest(input: ChatDigestInput): number | null {
     if (!input.chatTopic || !input.digestMd || !input.sourceKey) return null
@@ -421,7 +530,7 @@ export class KnowledgeDao {
   }
 
   /** 单标量统计（导入器 / 测试断言行数用） */
-  count(table: 'doc' | 'tag' | 'doc_tag' | 'report' | 'entry' | 'chat_digest' | 'media'): number {
+  count(table: 'doc' | 'tag' | 'doc_tag' | 'report' | 'entry' | 'chat_digest' | 'media' | 'report_revision' | 'marking'): number {
     try {
       const row = this.db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }
       return Number(row.n)
