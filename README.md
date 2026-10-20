@@ -179,7 +179,8 @@ node scripts/import-state-to-sqlite.mjs --state-dir ~/.dsh/dsh-group-lurker
 | `0数据格式/` | **纯模板**：schema、工具、文档。**不录入任何数据**——`.db` 只是本地生成物，不入库 | 随本仓库公开 ✓ |
 | `1数据/`（仅本机） | **唯一的数据录入处**——schema 复用模板，真实数据只存本机 | **永不入库**（已 ignore；也不要对它 `git init`） |
 
-规则（完整红线见 [`0数据格式/PRIVACY.md`](0数据格式/PRIVACY.md)）：真实 wxid、聊天记录、导出文件**只允许**出现在 `1数据/`；`chat_digest` 只存要点不存原文；外部写入遵守字段冻结 + `source_key` 幂等 + 单写者原则。因此**任何人 clone 本仓库都是安全的**——只有 schema、工具与文档，没有任何数据文件。
+规则（完整红线见 [`0数据格式/PRIVACY.md`](0数据格式/PRIVACY.md)）：真实 wxid、聊天记录、导出文件**只允许**出现在 `1数据/`；`chat_digest` 只存要点不存原文；外部写入遵守字段冻结 + `source_key` 幂等 + 单写者原则。
+- **API 密钥零硬编码**：LLM 密钥只经 `apiKeyEnv` 环境变量引用，代码与配置中不允许出现任何字面密钥；CI `sensitive-scan` 同时拦截密钥模式与真实标识符因此**任何人 clone 本仓库都是安全的**——只有 schema、工具与文档，没有任何数据文件。
 
 ## 文档
 

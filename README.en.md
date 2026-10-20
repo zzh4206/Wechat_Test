@@ -171,7 +171,8 @@ This repository also carries the self-contained knowledge-base template [`0数�
 | `0数据格式/` | **Pure template**: schema, tools, documentation. **Nothing is ever entered into it** — `.db` files are local build artifacts and are not committed | Published with this repo ✓ |
 | `1数据/` (local machine only) | **The only place data is ever entered** — schema reuses the template, real data stays local | **Never committed** (ignored; do not `git init` it either) |
 
-Rules (full red lines in [`0数据格式/PRIVACY.md`](0数据格式/PRIVACY.md)): real wxids, chat records and exports may **only** live in `1数据/`; `chat_digest` stores distilled points only; external writers follow frozen field names + `source_key` idempotency + the single-writer principle. As a result, **cloning this repository is safe for anyone** — it contains only the schema, tools and documentation, never any data files.
+Rules (full red lines in [`0数据格式/PRIVACY.md`](0数据格式/PRIVACY.md)): real wxids, chat records and exports may **only** live in `1数据/`; `chat_digest` stores distilled points only; external writers follow frozen field names + `source_key` idempotency + the single-writer principle.
+- **No hardcoded API keys**: the LLM key is only referenced via the `apiKeyEnv` environment variable; no literal key may appear in code or config. CI's `sensitive-scan` blocks both key patterns and real identifiers As a result, **cloning this repository is safe for anyone** — it contains only the schema, tools and documentation, never any data files.
 
 ## Documentation
 
