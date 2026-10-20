@@ -127,6 +127,12 @@ export interface PluginConfig {
   promiseRecognitionEnabled: boolean
   /** M5-T5.3：文件索引开关（默认 false = 零活动） */
   fileIndexEnabled: boolean
+  /** files 子命令清单摄取周期（分钟；0=关）。修复"49≠链接"归档缺口的兜底数据源 */
+  fileIndexListIntervalMin: number
+  /** 单群 files 子命令摄取超时（毫秒）；超时/失败只 warn 不阻塞 */
+  fileIndexListTimeoutMs: number
+  /** 单群 files 子命令返回条数上限（1..200） */
+  fileIndexListLimit: number
   /** M5-T5.2：逾期催办草稿落 outbox（默认 false；草稿绝不发送） */
   followupDraftEnabled: boolean
   /** M6-T1：messages 滚动保留天数（默认 90；长期表 events/tasks/promises/files 不动） */
@@ -173,6 +179,9 @@ export interface PluginConfig {
   batchThreshold: number
   accountWhitelist: string[]
   allowAutoRekey: boolean
+  sendTargetChat: string
+  readbackChatId: string
+  sendSearchViaClipboard: boolean
   /** T4：自适应批大小（默认 true：timeout 压缩 ×0.7 / 连续成功扩张 ×1.2，按群按 kind 持久化；false = 固定 batchThreshold 回退通道） */
   adaptiveBatch: boolean
   /** T7：报告归纳管线（'map-reduce' | 'refine' | 'ab'；默认 'map-reduce' 安全默认，BooookScore 修正案不预设 B 优） */
@@ -235,6 +244,9 @@ export const Config: Schema<PluginConfig> = Schema.object({
   deadline1hRemind: Schema.boolean().default(false).description('M4 截止前 1 小时提醒（功能文档 §6.3 默认关）'),
   promiseRecognitionEnabled: Schema.boolean().default(false).description('M5 承诺识别（默认关）：指向我的他人承诺 → 待确认 → 等待中 → 兑现/跳票，只落库不发送'),
   fileIndexEnabled: Schema.boolean().default(false).description('M5 文件索引（默认关）：文件类消息入库 + 类型归类 + 上下文摘要 + 版本链 + 星标'),
+  fileIndexListIntervalMin: Schema.number().default(30).description('files 子命令清单摄取周期（分钟；0=关）。修复"49≠链接"归档缺口：消息流侧文件消息被归为 link 且无文件名，靠清单补 name/path 进索引'),
+  fileIndexListTimeoutMs: Schema.number().default(30_000).description('单群 files 子命令摄取超时（毫秒）；超时/失败只 warn 不阻塞主流程'),
+  fileIndexListLimit: Schema.number().default(200).description('单群 files 子命令返回条数上限（1..200）'),
   followupDraftEnabled: Schema.boolean().default(false).description('M5 逾期催办草稿（默认关）：生成得体话术草稿落 outbox 供复制，绝不发送'),
   retentionDays: Schema.number().default(90).description('M6 messages 滚动保留天数（默认 90）：每日清理一次，长期表（事件/任务/承诺/文件）不动'),
   sqlitePath: Schema.string().default('').description("v0.3 SQLite 知识库镜像路径（JSONL 仍为事实源；镜像写失败只 warn 不影响主流程）。留空 = ~/WeChat/1数据/knowledge.db；'off' = 关闭镜像"),
@@ -264,6 +276,9 @@ export const Config: Schema<PluginConfig> = Schema.object({
   accountWhitelist: Schema.array(Schema.string()).default([]).description('账号白名单 wxid 数组（账号生命周期自动化，fail-closed 同 groups 语义：白名单外账号活跃 → sender 全面挂起+取钥硬阻断）。空 = 仅允许 sourceDbRoot 派生的默认账号'),
     activeAccountWxid: Schema.string().default('').description('配置账号 wxid（账号生命周期自动化；空 = 从 sourceDbRoot 路径派生 wxid 段；派生不出且未显式配置 = 探针关闭零变化）'),
   allowAutoRekey: Schema.boolean().default(false).description('小号回归自动取钥（默认 false：只通知人工执行 bootstrap_keys.py）。true = 自动执行取钥+验证。开启前必须人工成功手跑一次取钥（两段式安全条件，见 RUNBOOK）'),
+    sendTargetChat: Schema.string().default('老大').description('发送目标会话名（搜索词；用户指定：大号在小号通讯录中的备注。搜索结果多条时 Enter 选第一个，异常由 DB 回读兜底报警）'),
+  readbackChatId: Schema.string().default('').description('DB 回读验证目标会话 wxid（P0 兜底闸目标；必填——缺失 fail-closed 不发送。真实值放 cordis.patch.yml）'),
+  sendSearchViaClipboard: Schema.boolean().default(false).description('搜索词键入走剪贴板回退（默认 false = System Events 直接键入；CJK IME 拦截实测失败时开启）'),
     idleSkipBelowSec: Schema.number().default(10).description('用户空闲让路阈值秒（默认 10 = 系统空闲 <10s 视为正在操作→跳过本轮让路；0 = 不让路，空闲检测失效直接抢前台发送。日常单日报场景可设 0——每天一次的抢前台可接受；频繁发送建议保持 10）'),
   maxSendsPerDay: Schema.number().default(20).description('每日发送上限（默认 20；超限的当日 pending 标 skipped_quota 防风暴）'),
   wechatUiPath: Schema.string().default('wechat-ui').description('wechat-ui 可执行文件（PATH 解析；建议绝对路径，如 /path/to/macos-wechat-export/wechat-ui）'),
@@ -442,6 +457,9 @@ export function apply(ctx: Context, config: PluginConfig): void {
     systemIdleSec: defaultSystemIdleSec,
     allowTakeFocus: config.allowTakeFocus,
     idleSkipBelowSec: config.idleSkipBelowSec,
+    sendTargetChat: config.sendTargetChat,
+    readbackChatId: config.readbackChatId ?? '',
+    sendSearchViaClipboard: config.sendSearchViaClipboard,
     accountGate: accountGate ?? undefined,
     intervalSec: config.sendIntervalSec,
     verifyDelaySec: config.verifyDelaySec,
@@ -706,6 +724,9 @@ export function apply(ctx: Context, config: PluginConfig): void {
           return found
         },
         refreshPaths: (chatId) => refreshWxPaths(chatId),
+        // files 子命令数据源（修复"49≠链接"归档缺口）：复用 source.locateFiles 只读查询；
+        // 源未就绪/闸门外返回 []（= 无数据，不报错）。
+        listFiles: (chatId, limit) => (source ? source.locateFiles(chatId, limit) : Promise.resolve([])),
       })
     : null
 
@@ -1012,9 +1033,42 @@ export function apply(ctx: Context, config: PluginConfig): void {
     const stopRetention = retention.start()
     // 红线升级（2026-10-14）：filehelper 发送 worker 心跳（senderEnabled=false 时为 noop 零活动）。
     const stopSender = sender.start()
+    // files 子命令清单摄取心跳（修复"49≠链接"归档缺口；fileIndex 关或周期 0 时零活动）。
+    // 独立于消息流扫描的兜底路径：立即先跑一轮，此后按 fileIndexListIntervalMin 周期执行；
+    // 单群超时/失败只 warn（safe 包裹，不阻塞主流程）；摄取后同消息流口径镜像 media 表。
+    let stopFileList: (() => void) | null = null
+    if (fileIndex && config.fileIndexListIntervalMin > 0) {
+      const listTick = async (): Promise<void> => {
+        for (const chatId of config.groups) {
+          try {
+            const result = await new Promise<Awaited<ReturnType<FileIndexService['ingestFromListing']>>>((resolve, reject) => {
+              const t = setTimeout(() => reject(new Error(`timeout ${config.fileIndexListTimeoutMs}ms`)), Math.max(1_000, config.fileIndexListTimeoutMs))
+              fileIndex
+                .ingestFromListing(chatId, config.fileIndexListLimit)
+                .then((r) => { clearTimeout(t); resolve(r) }, (e) => { clearTimeout(t); reject(e) })
+            })
+            if (result.newFiles > 0) {
+              try {
+                store.mirrorMedia(chatId, groupStore.getFiles(chatId, { limit: 1000 }))
+              } catch (error) {
+                logger.warn(`media mirror failed: ${String(error)}`)
+              }
+              logger.info(`file-index listing ingest ${chatId}: new=${result.newFiles} merged=${result.appearancesMerged}`)
+            }
+          } catch (error) {
+            logger.warn(`file-index listing ingest failed for ${chatId}: ${String(error)}`)
+          }
+        }
+      }
+      void listTick() // 启动即先补一轮（水位/去重键保证幂等）
+      const id = setInterval(() => void listTick(), Math.max(60_000, config.fileIndexListIntervalMin * 60_000))
+      stopFileList = () => clearInterval(id)
+      logger.info(`file-index listing ingest started (interval=${config.fileIndexListIntervalMin}min, timeout=${config.fileIndexListTimeoutMs}ms, limit=${config.fileIndexListLimit})`)
+    }
     return () => {
-      stopTimer() // clearInterval：唯一 setInterval 的释放点
+      stopTimer() // clearInterval：主提炼定时器释放点（setInterval 另有各 start() 返回的清理函数）
       stopSource?.() // clearInterval + 释放单实例锁
+      stopFileList?.() // files 清单摄取心跳唯一释放点
       stopScheduler?.() // clearInterval：调度器心跳唯一释放点
       stopReminder?.() // clearInterval：提醒心跳唯一释放点
       stopPromiseReminder?.() // M5：承诺提醒心跳唯一释放点

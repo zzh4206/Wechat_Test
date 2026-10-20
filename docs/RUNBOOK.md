@@ -466,6 +466,15 @@ Accessibility Inspector 确认元素层级）。**实证结论回填此处：___
   低于该阈值才跳过本轮让路（`user_active`）；≥阈值或设 0 → 不让路，直接抢前台发送。
   **日常单日报场景可设 0**（每天一次的抢前台可接受）；默认 10 适合频繁发送场景（绝不打断打字）；
 - **失败重试**：attempts 落盘，≥3 次转 `failed` 不再重试（防风暴）；
+- **发送流程替换（用户指定键序，2026-10-19）**：目标改为**大号对话**（Config
+  `sendTargetChat`，默认 '老大'；搜索词）。键序：剪贴板=消息文本 → **Cmd+Shift+W** 调出微信
+  → Cmd+F 搜索框 → 键入搜索词（`sendSearchViaClipboard=true` 回退剪贴板方案，防 CJK IME
+  拦截）→ Return 进入对话 → 500ms → Cmd+V 粘贴 → Return 发送。dry_run 停在进入对话后
+  （光标在输入框，不粘贴不发送）。回读验证目标同步改 `readbackChatId`（必填，缺失
+  fail-closed；真实值放 cordis.patch.yml）；合规闸 `--chat sendTargetChat` 同源。
+  **遗留**：① Cmd+Shift+W 为用户自定义热键——spike 脚本 `scripts/spike-cmdshiftw.mjs`
+  （PM 代跑；agent 终端无辅助功能 TCC 报 -10004 无法验证）；② 中文搜索词 IME 拦截风险 →
+  剪贴板回退开关；③ 搜索多命中 → Enter 选第一个，异常由回读兜底。
 - **错号空报告两段队列（P0 热修 2026-10-19）**：错号在线时触发的日报 = **未处理**而非
   「真的没消息」——空骨架仅落盘存档 + 压入 `regen-queue.json`（pending_regen，**不 notify
   不进 outbox，绝不发送空报告**）。正号（白名单账号）回归后每轮从队首 pop 一个元素重生成

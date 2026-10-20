@@ -98,7 +98,7 @@ test('全流程：pending → sent，spawn 参数形态正确（--id 幂等传�
   const call = env.spawnCalls[0]
   assert.equal(call.file, 'wechat-ui')
   assert.equal(call.args[0], 'send')
-  assert.deepEqual(call.args.slice(1, 3), ['--chat', '文件传输助手'])
+  assert.deepEqual(call.args.slice(1, 3), ['--chat', '老大'])
   assert.ok(call.args.includes('--id'))
   assert.equal(call.args[call.args.indexOf('--id') + 1], e.id)
   assert.deepEqual(call.args.slice(call.args.indexOf('--composer-top'), call.args.indexOf('--composer-top') + 2), ['--composer-top', '0.7'])

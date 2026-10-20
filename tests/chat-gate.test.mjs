@@ -55,6 +55,8 @@ function makeEnv(overrides = {}) {
     sourceDbRoot: '/fake/wechat-db-storage',
     sourcePython: 'python3',
     chatVerifyRetries: overrides.chatVerifyRetries ?? 2,
+    sendTargetChat: overrides.sendTargetChat ?? '老大',
+    readbackChatId: overrides.readbackChatId ?? 'wxid_target',
     wechatUiPath: overrides.wechatUiPath ?? 'wechat-ui',
     now: () => new Date(2026, 9, 15, 12, 0).getTime(),
     runCommand: (file, args) => {
@@ -101,7 +103,7 @@ function readAudit(dir) {
   return readFileSync(p, 'utf8').trim().split('\n').filter((l) => l !== '').map((l) => JSON.parse(l))
 }
 
-test('合规闸通过：spawn wechat-ui read --chat 文件传输助手（参数数组、与发送目标同常量）→ 发送链照旧 sent', async () => {
+test('合规闸通过：spawn wechat-ui read --chat 老大（参数数组、与发送目标同源）→ 发送链照旧 sent', async () => {
   const env = makeEnv()
   const e = env.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'r.md' })
   env.lastFeature = `#l${e.id.replace(/[^0-9a-zA-Z]/g, '').slice(0, 8)}`
@@ -109,10 +111,11 @@ test('合规闸通过：spawn wechat-ui read --chat 文件传输助手（参数�
   assert.equal(r.action, 'sent')
   const gate = env.steps.find((s) => s.kind === 'spawn' && s.args[0] === 'read')
   assert.equal(gate.file, 'wechat-ui')
-  assert.deepEqual(gate.args, ['read', '--chat', FILEHELPER_CHAT], '参数数组；--chat 与发送目标同源同常量')
-  // 闸在发送段之前（deliver spawn 在核验之后）
+  assert.deepEqual(gate.args, ['read', '--chat', '老大'], '参数数组；--chat 与发送目标同源（sendTargetChat）')
+  // 闸在键序之前（新键序 osascript 步骤在核验之后）
   const gateIdx = env.steps.indexOf(gate)
-  assert.ok(env.steps.findIndex((s) => s.kind === 'spawn' && s.args[0] === 'deliver') > gateIdx, '核验通过后才发送')
+  const firstKeyIdx = env.steps.findIndex((s) => s.kind === 'osascript' && String(s.step).startsWith('key:'))
+  assert.ok(firstKeyIdx > gateIdx, '核验通过后才执行键序')
   assert.equal(readOutbox(env.dir).find((x) => x.id === e.id).status, 'sent')
   assert.ok(!readAudit(env.dir).some((a) => a.result === 'wrong_chat_open'), '合规通过无 deferred 审计')
   rmSync(env.dir, { recursive: true, force: true })
@@ -140,7 +143,7 @@ test('聊错天（OCR 三连败）：deferred 不发不耗 attempts，审计 res
   assert.equal(audit[0].deferred, true)
   assert.equal(audit[0].attempts, 0, '审计 attempts 同样不增')
   assert.ok(!JSON.stringify(audit).includes('【lurker】'), '审计零正文')
-  assert.ok(env.logger.logs.warn.some((m) => m.includes('请将微信当前会话切换到文件传输助手')), 'warn 提示切会话')
+  assert.ok(env.logger.logs.warn.some((m) => m.includes('切换到目标对话')), 'warn 提示切会话')
   rmSync(env.dir, { recursive: true, force: true })
 })
 
@@ -155,7 +158,7 @@ test('OCR 误读抖动防御：二过一败（首败后重试命中）→ 放行
   env.lastFeature = `#l${e.id.replace(/[^0-9a-zA-Z]/g, '').slice(0, 8)}`
   const r = await env.sender.processOnce()
   assert.equal(r.action, 'sent', '重试命中 → 放行')
-  assert.equal(env.steps.filter((s) => s.kind === 'spawn').length, 5, '定位 1 + 核验 2 + deliver 1 + 回读 1')
+  assert.equal(env.steps.filter((s) => s.kind === 'spawn').length, 4, '定位 1 + 核验 2 + 回读 1（新键序无 deliver spawn）')
   assert.equal(env.steps.filter((s) => s.kind === 'sleep' && s.ms === CHAT_VERIFY_RETRY_DELAY_MS).length, 1, '首败后等 1s 重试一次')
   assert.equal(readOutbox(env.dir).find((x) => x.id === e.id).status, 'sent')
   rmSync(env.dir, { recursive: true, force: true })
@@ -205,7 +208,10 @@ test('dry_run 合规闸照常执行：通过→条目转 dry_run（键序跳过�
   const r = await env.sender.processOnce()
   assert.equal(r.action, 'sent') // 消费完成（dry_run 路径 action 计 sent，与现行为一致）
   assert.equal(env.steps.filter((s) => s.kind === 'spawn').length, 2, 'dry_run 也执行定位 + 只读核验')
-  assert.ok(!env.steps.some((s) => s.kind === 'osascript' && (s.step === 'key:cmd+v' || s.step === 'key:return')), '键序仍跳过')
+  // dry_run 停点=第 6 步（进入对话、光标在输入框）：定位键序执行，但不粘贴不发送
+  const osa = env.steps.filter((s) => s.kind === 'osascript').map((s) => s.step)
+  assert.ok(!osa.includes('key:cmd+v'), 'dry_run 不粘贴')
+  assert.equal(osa.filter((x) => x === 'key:return').length, 1, '仅定位 Return，无发送 Return')
   assert.equal(readOutbox(env.dir).find((x) => x.id === e.id).status, 'dry_run')
   rmSync(env.dir, { recursive: true, force: true })
 

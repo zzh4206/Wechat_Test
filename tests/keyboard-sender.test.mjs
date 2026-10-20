@@ -8,7 +8,7 @@ import { mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
-const { SenderService, appendFeature, buildSendText, MAX_TEXT_CHARS, ALLOWED_CHANNELS, SENDER_AUDIT_REL, MAX_ATTEMPTS, KEY_DELAY_PASTE_MS, VERIFY_DELAY_MS, VERIFY_RETRIES, IDLE_SKIP_BELOW_SEC } = await import('../lib/sender.js')
+const { SenderService, appendFeature, buildSendText, MAX_TEXT_CHARS, ALLOWED_CHANNELS, SENDER_AUDIT_REL, MAX_ATTEMPTS, KEY_DELAY_PASTE_MS, VERIFY_DELAY_MS, KEY_DELAY_OPEN_MS, VERIFY_RETRIES, IDLE_SKIP_BELOW_SEC } = await import('../lib/sender.js')
 const { Outbox, OUTBOX_REL } = await import('../lib/outbox.js')
 const { Store } = await import('../lib/store.js')
 
@@ -28,7 +28,10 @@ function stepOf(call) {
   if (s.includes('key code 125')) return 'key:down'
   if (s.includes('click at')) return `click:${s.match(/\{(\d+), (\d+)\}/)?.slice(1).join(',')}`
   if (s.includes('get {position, size} of window 1')) return 'ax:window'
+  if (s.includes('using {command down, shift down}')) return 'key:cmd+shift+w'
+  if (s.includes('keystroke "f" using command down')) return 'key:cmd+f'
   if (s.includes('keystroke "v" using command down')) return 'key:cmd+v'
+  if (s.includes('keystroke "')) return `keystroke:${JSON.parse(s.slice(s.indexOf('keystroke ') + 'keystroke '.length))}`
   if (s.includes('key code 36')) return 'key:return'
   return `other:${s}`
 }
@@ -49,7 +52,7 @@ function makeEnv(overrides = {}) {
     dbReadResult: overrides.dbReadResult ?? { code: 0, stdout: 'MATCH_FEATURE', stderr: '' },
     // 发送前合规闸（wechat-ui read）默认通过；chatReadSeq/chatReadResult 可覆盖
     chatReadSeq: overrides.chatReadSeq ?? null,
-    chatReadResult: overrides.chatReadResult ?? { code: 0, stdout: 'chat matched: 文件传输助手', stderr: '' },
+    chatReadResult: overrides.chatReadResult ?? { code: 0, stdout: 'chat matched: 老大', stderr: '' },
     // 定位闸（wechat-ui open）默认成功（already_open 幂等路径）；locateResult 可覆盖
     locateSeq: overrides.locateSeq ?? null,
     locateResult: overrides.locateResult ?? { code: 0, stdout: '{"type":"opened","already_open":true}', stderr: '' },
@@ -70,6 +73,9 @@ function makeEnv(overrides = {}) {
     sourceToolDir: overrides.sourceToolDir ?? '/fake/macos-wechat-export',
     sourceDbRoot: overrides.sourceDbRoot ?? '/fake/wechat-db-storage',
     sourcePython: overrides.sourcePython ?? 'python3',
+    sendTargetChat: overrides.sendTargetChat ?? '老大',
+    readbackChatId: overrides.readbackChatId ?? 'wxid_target',
+    sendSearchViaClipboard: overrides.sendSearchViaClipboard,
     idleSkipBelowSec: overrides.idleSkipBelowSec,
     allowTakeFocus: overrides.allowTakeFocus,
     now: overrides.now ?? (() => new Date(2026, 9, 15, 12, 0).getTime()),
@@ -90,7 +96,7 @@ function makeEnv(overrides = {}) {
         return Promise.resolve(ok ? { code: 0, stdout, stderr: '' } : { code: 1, stdout: '', stderr: 'err' })
       }
       steps.push({ kind: 'spawn', file, args })
-      // 定位闸 spawn（wechat-ui open --chat 文件传输助手）独立注入：locateSeq 按序弹出 / locateResult 固定
+      // 定位闸 spawn（wechat-ui open --chat 老大）独立注入：locateSeq 按序弹出 / locateResult 固定
       if (args[0] === 'open' && args.includes('--chat')) {
         if (env.locateSeq) {
           const seqOut = env.locateSeq.length > 0 ? env.locateSeq.shift() : env.locateResult
@@ -105,7 +111,7 @@ function makeEnv(overrides = {}) {
         }
         return Promise.resolve(env.deliverResult)
       }
-      // 发送前合规闸 spawn（wechat-ui read --chat 文件传输助手）独立注入：chatReadSeq 按序弹出 / chatReadResult 固定
+      // 发送前合规闸 spawn（wechat-ui read --chat 老大）独立注入：chatReadSeq 按序弹出 / chatReadResult 固定
       if (args[0] === 'read' && args.includes('--chat')) {
         if (env.chatReadSeq) {
           const seqOut = env.chatReadSeq.length > 0 ? env.chatReadSeq.shift() : env.chatReadResult
@@ -163,20 +169,26 @@ test('键序正确性（真发）：简化键序（activate→粘贴→回车）
   assert.equal(r.action, 'sent')
   const seq = env.steps.map((s) => (s.kind === 'sleep' ? `sleep:${s.ms}` : s.kind === 'spawn' ? 'spawn' : s.step))
   assert.deepEqual(seq, [
-    'spawn', // ⓪ 定位闸：wechat-ui open 侧栏 OCR 定位（already_open 幂等通过）
-    'spawn', // ④ 发送前合规闸：wechat-ui read 标题核验（防误发）
-    'activate',
+    'spawn', // ⓪ 定位闸：wechat-ui open（目标=sendTargetChat）
+    'spawn', // ④ 合规闸：wechat-ui read 标题核验（防误发）
     'clipboard_save',
-    `clipboard_set:【lurker】日报 关键判断 ${env.lastFeature}`,
-    'spawn', // 发送段：wechat-ui deliver（定位+粘贴+发送按钮点击，合成 Enter 已证死）
+    `clipboard_set:【lurker】日报 关键判断 ${env.lastFeature}`, // 1. 剪贴板=消息文本
+    'key:cmd+shift+w', // 2. Cmd+Shift+W 调出微信窗口
+    'key:cmd+f', // 3. Cmd+F 打开搜索框
+    'keystroke:老大', // 4. 键入搜索词（默认直接键入形态）
+    'key:return', // 5. 进入目标对话
+    `sleep:${KEY_DELAY_OPEN_MS}`, // 6. 渲染等待
+    'key:cmd+v', // 7. 粘贴消息文本
+    `sleep:${KEY_DELAY_PASTE_MS}`,
+    'key:return', // 8. 发送
     'clipboard_set:saved-content', // 恢复剪贴板
     `sleep:${VERIFY_DELAY_MS}`,
     'spawn', // wechat_db.py read（DB 回读验证兜底——唯一目标闸）
   ])
-  // 无搜索定位：绝不出现 Esc/AX/点击/↓/搜索词粘贴（cmd+v/return 也已移除——deliver 工具内完成）
-  for (const banned of ['key:esc', 'ax:window', 'key:down', 'key:cmd+v', 'key:return']) assert.ok(!seq.includes(banned), `不应出现 ${banned}`)
+  // 旧键序残留禁止：无 Esc/AX/点击/↓/activate
+  for (const banned of ['key:esc', 'ax:window', 'key:down', 'activate']) assert.ok(!seq.includes(banned), `不应出现 ${banned}`)
   assert.ok(!seq.some((x) => String(x).startsWith('click')), '不应点击搜索框')
-  assert.ok(!seq.includes('clipboard_set:文件传输助手'), '不应粘贴搜索词')
+  assert.ok(!seq.includes('clipboard_set:老大'), '默认直接键入形态：搜索词不走剪贴板')
   // 回读参数形态：只读、filehelper、limit 3（合规闸 spawn 是 wechat-ui read，回读 spawn 是 python3）
   const spawn = env.steps.filter((s) => s.kind === 'spawn').find((s) => s.file === 'python3')
   assert.equal(spawn.file, 'python3')
@@ -185,7 +197,7 @@ test('键序正确性（真发）：简化键序（activate→粘贴→回车）
     join('/fake/macos-wechat-export', 'wechat_db.py'),
     '--db-root', '/fake/wechat-db-storage',
     '--key-file', join('/fake/macos-wechat-export', '.wechat-local/keys.json'),
-    'read', '--chat-id', 'filehelper', '--limit', '30', // 宽窗口：共享通道抗干扰
+    'read', '--chat-id', 'wxid_target', '--limit', '30', // 宽窗口：目标会话（大号）抗干扰
   ])
   // 验证延迟在回读前
   const sleepIdx = seq.indexOf(`sleep:${VERIFY_DELAY_MS}`)
@@ -205,15 +217,21 @@ test('dry_run：确认前台后直接结束（不碰输入框不回车），条�
   assert.equal(r.action, 'sent') // 消费完成，走 dry_run 路径
   const seq = env.steps.map((s) => (s.kind === 'sleep' ? `sleep:${s.ms}` : s.kind === 'spawn' ? 'spawn' : s.step))
   assert.deepEqual(seq, [
-    'spawn', // ⓪ 定位闸照常执行（already_open 幂等通过）
-    'spawn', // dry_run 合规闸照常执行（只读核验，验证 TCC 与定位）
-    'activate',
+    'spawn', // 定位闸照常执行（只读定位）
+    'spawn', // dry_run 合规闸照常执行（只读核验）
     'clipboard_save',
-    'clipboard_set:saved-content', // dry_run 尾部：恢复剪贴板
+    `clipboard_set:【lurker】t 机密正文 #l${e.id.replace(/[^0-9a-zA-Z]/g, '').slice(0, 8)}`, // 1. 剪贴板=消息文本
+    'key:cmd+shift+w', // 2.
+    'key:cmd+f', // 3.
+    'keystroke:老大', // 4. 键入搜索词
+    'key:return', // 5. 进入目标对话
+    `sleep:${KEY_DELAY_OPEN_MS}`, // 6. 渲染等待——dry_run 停点：光标已在输入框
+    'clipboard_set:saved-content', // 恢复剪贴板
   ])
-  // 实测教训：干跑时的粘贴也可能落进输入框——dry_run 绝不 Cmd+V、绝不回车、绝不写消息剪贴板
-  assert.ok(!seq.includes('key:cmd+v') && !seq.includes('key:return'), 'dry_run 不触发任何输入')
-  assert.ok(!JSON.stringify(seq).includes('机密正文') && !seq.some((x) => String(x).includes('【lurker】')), '消息文本不进键序')
+  // dry_run 语义（用户指定键序）：执行到第 6 步（进入对话、光标在输入框）即停——
+  // 不粘贴（无 cmd+v）、不发送（仅步骤 5 的定位 Return，无第二次 Return）
+  assert.ok(!seq.includes('key:cmd+v'), 'dry_run 不粘贴消息')
+  assert.equal(seq.filter((x) => x === 'key:return').length, 1, '仅定位 Return，无发送 Return')
   assert.equal(readOutbox(env.dir).find((x) => x.id === e.id).status, 'dry_run')
   assert.ok(env.logger.logs.info.some((m) => m.includes('dry_run')), '日志注明 dry_run')
   assert.ok(!JSON.stringify(readAudit(env.dir)).includes('机密正文'), '审计零正文')
@@ -275,7 +293,7 @@ test('回读未命中（可能发错会话）→ P0：标 failed_wrong_target �
   assert.equal(p0.p0, true, '审计行醒目标 P0')
   assert.ok(env.logger.logs.warn.some((m) => m.includes('P0') && m.includes('failed_wrong_target')), '立即 warn')
   // 重试窗口：4 次尝试（每次前 sleep VERIFY_DELAY_MS），穷尽后才终判
-  assert.equal(env.steps.filter((x) => x.kind === 'spawn').length, VERIFY_RETRIES + 3, '穷尽 verifyRetries 次回读（+1 定位闸 +1 合规闸 +1 deliver）')
+  assert.equal(env.steps.filter((x) => x.kind === 'spawn').length, VERIFY_RETRIES + 2, '穷尽 verifyRetries 次回读（+1 定位闸 +1 合规闸；deliver 原语已废——新键序无 deliver spawn）')
   assert.equal(env.steps.filter((x) => x.kind === 'sleep' && x.ms === VERIFY_DELAY_MS).length, VERIFY_RETRIES, '每次尝试前等 verifyDelaySec')
   // 终态：后续周期不再消费
   const spawns = env.steps.filter((x) => x.kind === 'spawn').length
@@ -296,7 +314,7 @@ test('回读重试窗口（异步写入竞态修复）：首次回读空、第�
   env.lastFeature = `#l${e.id.replace(/[^0-9a-zA-Z]/g, '').slice(0, 8)}` // 让 MATCH_FEATURE 占位替换命中本条特征串
   const r = await env.sender.processOnce()
   assert.equal(r.action, 'sent', '竞态窗口内第二次回读命中 → sent（不误判 wrong_target）')
-  assert.equal(env.steps.filter((x) => x.kind === 'spawn').length, 5, '只回读 2 次即命中（+1 定位闸 +1 合规闸 +1 deliver）')
+  assert.equal(env.steps.filter((x) => x.kind === 'spawn').length, 4, '只回读 2 次即命中（+1 定位闸 +1 合规闸；无 deliver spawn）')
   assert.equal(readOutbox(env.dir).find((x) => x.id === e.id).status, 'sent')
   const audit = readAudit(env.dir)
   assert.deepEqual(audit.map((a) => a.result), ['transmitted', 'sent'])
@@ -329,7 +347,7 @@ test('回读重试窗口可配：verifyRetries=2 / verifyDelaySec=1（1s × 2 �
       }
       if (args[0] === 'read' && args.includes('--chat')) { // 发送前合规闸
         env.steps.push({ kind: 'spawn', file, args })
-        return Promise.resolve({ code: 0, stdout: 'chat matched: 文件传输助手', stderr: '' })
+        return Promise.resolve({ code: 0, stdout: 'chat matched: 老大', stderr: '' })
       }
       const out = env.dbReadSeq.length > 0 ? env.dbReadSeq.shift() : { code: 0, stdout: '', stderr: '' }
       const resolved = out.stdout === 'MATCH_FEATURE' ? { ...out, stdout: `{"messages":[{"content":"【lurker】x #l${e.id.replace(/[^0-9a-zA-Z]/g, '').slice(0, 8)}"}]}` } : out
@@ -341,8 +359,8 @@ test('回读重试窗口可配：verifyRetries=2 / verifyDelaySec=1（1s × 2 �
     sleepMs: (ms) => { env.steps.push({ kind: 'sleep', ms }); return Promise.resolve() },
   }).processOnce()
   assert.equal(r.action, 'sent')
-  assert.equal(env.steps.filter((x) => x.kind === 'spawn').length, 5, '回读 2 次（+1 定位闸 +1 合规闸 +1 deliver）')
-  assert.deepEqual(env.steps.filter((x) => x.kind === 'sleep').map((x) => x.ms), [1000, 1000])
+  assert.equal(env.steps.filter((x) => x.kind === 'spawn').length, 4, '回读 2 次（+1 定位闸 +1 合规闸；新键序无 deliver spawn）')
+  assert.deepEqual(env.steps.filter((x) => x.kind === 'sleep').map((x) => x.ms), [KEY_DELAY_OPEN_MS, KEY_DELAY_PASTE_MS, 1000, 1000])
   assert.equal(readOutbox(env.dir).find((x) => x.id === e.id).status, 'sent')
   rmSync(env.dir, { recursive: true, force: true })
 })
@@ -486,7 +504,7 @@ test('sendMethod=wechat-ui 可切回：spawn wechat-ui send（--chat/--text/--id
   assert.equal(spawns.length, 1)
   assert.equal(spawns[0].file, 'wechat-ui')
   assert.equal(spawns[0].args[0], 'send')
-  assert.deepEqual(spawns[0].args.slice(1, 3), ['--chat', '文件传输助手'])
+  assert.deepEqual(spawns[0].args.slice(1, 3), ['--chat', '老大'])
   assert.ok(spawns[0].args.includes('--id') && spawns[0].args.includes('--composer-top'))
   assert.equal(readOutbox(dir).find((x) => x.id === e.id).status, 'sent')
   rmSync(dir, { recursive: true, force: true })
@@ -593,7 +611,7 @@ test('定位闸：already_open 幂等通过 → 键序照常（locate spawn 首�
   const r = await env.sender.processOnce()
   assert.equal(r.action, 'sent')
   const firstSpawn = env.steps.find((s) => s.kind === 'spawn')
-  assert.deepEqual(firstSpawn.args, ['open', '--chat', '文件传输助手'], '定位闸参数：open + 同源常量目标')
+  assert.deepEqual(firstSpawn.args, ['open', '--chat', '老大'], '定位闸参数：open + 同源目标')
   rmSync(env.dir, { recursive: true, force: true })
 })
 
