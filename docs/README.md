@@ -33,6 +33,8 @@
 | [WORKBREAKDOWN.md](WORKBREAKDOWN.md) | 工作拆分（供分派编码 agent） |
 | [dispatch-prompts.md](dispatch-prompts.md) | 分派指令模板（可直接粘贴给编码 agent） |
 | [TECH-DESIGN-llm-overload-mitigation.md](TECH-DESIGN-llm-overload-mitigation.md) | LLM「消息过多 → 响应失败」的治理方案 |
+| [TECH-DESIGN-confirm-loop.md](TECH-DESIGN-confirm-loop.md) | 审批双通道与确认闭环（代码结构改动：ApprovalActions 门面 / ActionInbox / regen 泛化） |
+| [DESIGN-approval-marking.md](DESIGN-approval-marking.md) | 审批与标记的报告修正流（修订流展示 / 完成情况段 / 级联更新） |
 | [REF-mac-wechat-report.md](REF-mac-wechat-report.md) | 参考资料：macOS 端微信群聊消息读取与自动应答 |
 
 ## 解释（背景与决策）
