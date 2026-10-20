@@ -1927,6 +1927,15 @@ getReportMetas(chatId: string, opts: { kind?: ReportMetaRow['kind']; limit?: num
     }
   }
 
+  /** 设置某人关注位（watch_level；person.follow → 'group'，unfollow → 'off'）。返回是否成功 */
+  async setIdentityWatchLevel(chatId: string, pid: string, level: 'global' | 'group' | 'off'): Promise<boolean> {
+    const st = this.stores.get(chatId) ?? this.open(chatId)
+    if (!st) return false
+    const ident = st.getIdentities().find((r) => r.pid === pid)
+    if (!ident) return false
+    return st.upsertIdentity({ pid: ident.pid, wxid: ident.wxid, groupNick: ident.groupNick, remark: ident.remark, watchLevel: level })
+  }
+
   getPromise(chatId: string, promiseId: number): PromiseRow | null {
     const st = this.ensureOpenForRead(chatId)
     if (!st) return null
