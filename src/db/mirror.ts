@@ -212,6 +212,8 @@ export interface SqliteMirror {
   mirrorMarking(chatId: string, kind: 'done' | 'undone' | 'deleted', targetRef: string, ts: number, opts?: { source?: 'chat' | 'web'; sourceKey?: string }): boolean
   /** 修订读侧（报告渲染的修订段；单一查询副本 = knowledge.db） */
   listRevisions(chatId: string, periodType: string, periodStart: string): Array<{ ts: number; type: string; summary: string | null; source: string }>
+  /** marking 最新态读侧（完成情况段；v_marking_latest） */
+  listMarkingsLatest(kind?: 'done' | 'undone' | 'deleted'): Array<{ chat_id: string; kind: string; target_ref: string; ts: number; source: string }>
   close(): void
 }
 
@@ -436,6 +438,16 @@ export function createSqliteMirror(sqlitePath: string | undefined, logger: DbLog
       } catch (error) {
         logger.warn(`mirror: marking 写入失败：${String(error).slice(0, 120)}`)
         return false
+      }
+    },
+
+    listMarkingsLatest(kind) {
+      try {
+        return (kind
+          ? dao.listMarkingsLatest(kind)
+          : dao.listMarkingsLatest()) as Array<{ chat_id: string; kind: string; target_ref: string; ts: number; source: string }>
+      } catch {
+        return []
       }
     },
 

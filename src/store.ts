@@ -45,6 +45,11 @@ export class Store {
     return ok
   }
 
+  /** report 镜像透传（修订流 mirrorReportRevision 接线；未启用镜像返回 false） */
+  mirrorReport(chatId: string, periodType: 'daily' | 'weekly' | 'monthly', periodStart: string, ts: number, type: string, opts?: { targetRef?: string | null; summary?: string | null; source?: 'chat' | 'web'; sourceKey?: string }): boolean {
+    return this.mirror?.mirrorReportRevision(chatId, periodType, periodStart, ts, type, opts) ?? false
+  }
+
   /** marking 镜像透传（单一查询副本架构：ReportRevisionService 直连；未启用镜像返回 false） */
   mirrorMarking(chatId: string, kind: 'done' | 'undone' | 'deleted', targetRef: string, ts: number, opts?: { source?: 'chat' | 'web'; sourceKey?: string }): boolean {
     return this.mirror?.mirrorMarking(chatId, kind, targetRef, ts, opts) ?? false

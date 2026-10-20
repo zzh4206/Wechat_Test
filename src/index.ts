@@ -51,6 +51,9 @@ import { FileIndexService, linkFilesToEvents } from './file-index.js'
 import { createAccountGate, listAccounts, sampleAccount, diffActivity, wxidFromDbRoot, XWECHAT_FILES_REL, type FsLike } from './account-probe.js'
 import { RegenQueue, REGEN_QUEUE_REL } from './regen-queue.js'
 import { processRegenHead } from './regen-processor.js'
+import { ApprovalActions } from './approval-actions.js'
+import { ActionInbox } from './action-inbox.js'
+import { ReportRevisionService } from './report-revision.js'
 import { homedir } from 'node:os'
 // M6：保留期清理（T1.1 遗留）+ A/B 脚手架类型（新增行，不动他人行）
 import { RetentionService } from './retention.js'
@@ -179,6 +182,8 @@ export interface PluginConfig {
   sendTargetChat: string
   readbackChatId: string
   sendSearchViaClipboard: boolean
+  webActionsEnabled: boolean
+  webActionsPollSec: number
   /** T4：自适应批大小（默认 true：timeout 压缩 ×0.7 / 连续成功扩张 ×1.2，按群按 kind 持久化；false = 固定 batchThreshold 回退通道） */
   adaptiveBatch: boolean
   /** T7：报告归纳管线（'map-reduce' | 'refine' | 'ab'；默认 'map-reduce' 安全默认，BooookScore 修正案不预设 B 优） */
@@ -268,7 +273,9 @@ export const Config: Schema<PluginConfig> = Schema.object({
     activeAccountWxid: Schema.string().default('').description('配置账号 wxid（账号生命周期自动化；空 = 从 sourceDbRoot 路径派生 wxid 段；派生不出且未显式配置 = 探针关闭零变化）'),
   allowAutoRekey: Schema.boolean().default(false).description('小号回归自动取钥（默认 false：只通知人工执行 bootstrap_keys.py）。true = 自动执行取钥+验证。开启前必须人工成功手跑一次取钥（两段式安全条件，见 RUNBOOK）'),
     sendTargetChat: Schema.string().default('').description('发送目标会话名（搜索词；真实值放运行配置。默认空 = fail-closed 不发送；搜索结果多条时 Enter 选第一个，异常由 DB 回读兜底报警）'),
-  readbackChatId: Schema.string().default('').description('DB 回读验证目标会话 wxid（P0 兜底闸目标；必填——缺失 fail-closed 不发送。真实值放 cordis.patch.yml）'),
+  webActionsEnabled: Schema.boolean().default(false).description('前端动作收件箱（审批双通道 web 侧）：消费 web/actions.jsonl 调 ApprovalActions，写结果/审计文件。默认关'),
+  webActionsPollSec: Schema.number().default(5).description('动作收件箱轮询周期秒（默认 5）'),
+    readbackChatId: Schema.string().default('').description('DB 回读验证目标会话 wxid（P0 兜底闸目标；必填——缺失 fail-closed 不发送。真实值放 cordis.patch.yml）'),
   sendSearchViaClipboard: Schema.boolean().default(false).description('搜索词键入走剪贴板回退（默认 false = System Events 直接键入；CJK IME 拦截实测失败时开启）'),
     idleSkipBelowSec: Schema.number().default(10).description('用户空闲让路阈值秒（默认 10 = 系统空闲 <10s 视为正在操作→跳过本轮让路；0 = 不让路，空闲检测失效直接抢前台发送。日常单日报场景可设 0——每天一次的抢前台可接受；频繁发送建议保持 10）'),
   maxSendsPerDay: Schema.number().default(20).description('每日发送上限（默认 20；超限的当日 pending 标 skipped_quota 防风暴）'),
@@ -680,6 +687,36 @@ export function apply(ctx: Context, config: PluginConfig): void {
     })
   }
 
+  // —— 审批双通道（confirm-loop C1/C2）+ 标记修订流（approval-marking M1/M2）接线 ——
+  const reportRevision = new ReportRevisionService({
+    store,
+    logger: logger as unknown as StoreLogger,
+    mirror: {
+      mirrorMarking: (c, k, r, ts, o) => store.mirrorMarking(c, k, r, ts, o),
+      mirrorReportRevision: (c, p2, ps, ts, t, o) => store.mirrorReport(c, p2, ps, ts, t, o),
+    },
+  })
+  const approvalActions = taskRecognition && promiseRecognition
+    ? new ApprovalActions({
+        task: taskRecognition,
+        promise: promiseRecognition,
+        store: groupStore,
+        notify: async (kind2, title, body) => { await notifier.notify(kind2, title, body) },
+        logger: logger as unknown as StoreLogger,
+        enqueueReportRegen: (chatId2, dateKey2, kind2) => regenQueue.enqueue(chatId2, dateKey2, Date.now(), kind2, 'manual') !== 'deduped',
+      })
+    : null
+  const actionInbox = config.webActionsEnabled && approvalActions
+    ? new ActionInbox({
+        store,
+        actions: approvalActions,
+        marks: { markTarget: (chatId2, kind2, targetId2, status2, source2) => reportRevision.markTarget(chatId2, kind2, targetId2, status2, source2) },
+        groups: config.groups,
+        logger: logger as unknown as StoreLogger,
+        pollSec: config.webActionsPollSec,
+      })
+    : null
+
   // —— M5-T5.3：文件索引（默认关 = 零活动）。 ——
   // —— M6-T2：wx_path 定位接线——工具 `files` 子命令按会话查路径，异步刷新进缓存，
   //    locatePath 只做同步读；未命中/不可用 → 保持"待下载"占位；每次定位记 audit 元数据。 ——
@@ -1016,6 +1053,8 @@ export function apply(ctx: Context, config: PluginConfig): void {
     const stopRetention = retention.start()
     // 红线升级（2026-10-14）：filehelper 发送 worker 心跳（senderEnabled=false 时为 noop 零活动）。
     const stopSender = sender.start()
+    // 前端动作收件箱心跳（webActionsEnabled=false 时为 null = 零活动）。
+    const stopInbox = actionInbox?.start() ?? null
     // files 子命令清单摄取心跳（修复"49≠链接"归档缺口；fileIndex 关或周期 0 时零活动）。
     // 独立于消息流扫描的兜底路径：立即先跑一轮，此后按 fileIndexListIntervalMin 周期执行；
     // 单群超时/失败只 warn（safe 包裹，不阻塞主流程）；摄取后同消息流口径镜像 media 表。
@@ -1056,7 +1095,8 @@ export function apply(ctx: Context, config: PluginConfig): void {
       stopReminder?.() // clearInterval：提醒心跳唯一释放点
       stopPromiseReminder?.() // M5：承诺提醒心跳唯一释放点
       stopRetention() // M6：保留期清理心跳唯一释放点
-      stopSender() // 发送 worker 心跳唯一释放点（senderEnabled=false 时 noop）
+      stopSender()
+      stopInbox?.() // 发送 worker 心跳唯一释放点（senderEnabled=false 时 noop）
       distiller.dispose()
       journal.dispose() // 无定时器，清计数/日报内存引用
       personDigest?.dispose() // M2-T2.3：无定时器，清并发去重表

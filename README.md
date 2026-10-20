@@ -131,6 +131,14 @@ node scripts/import-state-to-sqlite.mjs --state-dir ~/.dsh/dsh-group-lurker
 | `accountWhitelist` | `[]` | **账号白名单**（fail-closed 同 `groups` 语义）：白名单外账号活跃 → 发送全面挂起 + 取钥硬阻断 |
 
 > 发送定位与 DB 回读闸（`sendTargetChat`、`readbackChatId`、`verifyDelaySec`、`verifyRetries`）属发送链路参数，见 [docs/RUNBOOK.md](docs/RUNBOOK.md)。
+| `readbackChatId` | '' | DB 回读验证目标会话 wxid（必填，缺失 fail-closed） |
+| `sendSearchViaClipboard` | false | 搜索词剪贴板回退（CJK IME 兜底） |
+| `webActionsEnabled` | false | 前端动作收件箱总闸（审批 web 通道） |
+| `webActionsPollSec` | 5 | 动作收件箱轮询周期秒 |
+| `batchThreshold` | 120 | 大窗口分批归纳阈值 |
+| `accountWhitelist` | [] | 账号白名单（账号生命周期自动化） |
+| `allowAutoRekey` | false | 小号回归自动取钥 |
+| `idleSkipBelowSec` | 10 | 空闲让路阈值秒 |
 
 ## 产出
 
