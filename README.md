@@ -31,7 +31,7 @@
 | `src/` | 插件本体：白名单读取、每群缓冲、LLM 提炼、日报、受控单出口发送、SQLite 镜像数据层（`src/db/`） |
 | `0数据格式/` | **知识库纯模板**：三层 schema（资料 `doc` + 日志 `report`/`entry` + 会话要点 `chat_digest`）+ 3 个 Python 工具。**不录入任何数据** |
 | `scripts/` | `check-sensitive.sh`（敏感信息扫描）、`llm-cost.mjs`（费用汇总）、`import-state-to-sqlite.mjs`（一次性导入器） |
-| `tests/` | 47 个测试文件、412 例，全离线 mock，不碰真实库 |
+| `tests/` | 50 个测试文件、440 例，全离线 mock，不碰真实库 |
 
 ## 架构：从聊天到知识库
 
@@ -54,6 +54,7 @@
 - **JSONL 永远是事实源**：SQLite 只是查询层，镜像与导入器使用同一套映射口径
 - **schema v0.4**：`report` 带 `chat_id`（冲突键三元组 `(period_type, period_start, chat_id)`，不再跨群聚合分节）、新增 `media` 元数据表（媒体本体永不入库）；`user_version` 迁移幂等，旧库自动升级
 - **报告落盘并行提取资料**：报告里的 URL / 文件索引自动入 `doc` 表，与 Python 批量脚本同口径零重复
+- **审批闭环与报告修订流（schema v0.6）**：`ApprovalActions` 审批动作单入口 + `ActionInbox` 动作收件箱；报告修订写入 `report_revision`（不可变历史）并级联周报/月报，完成情况以 `marking`（done/undone/deleted 追加式）标记——全部镜像进知识库，形成「单一查询副本」
 
 ## 快速开始
 
@@ -144,7 +145,7 @@ node scripts/import-state-to-sqlite.mjs --state-dir ~/.dsh/dsh-group-lurker
 
 状态目录（默认 `$DSH_HOME/dsh-group-lurker/`）：`groups/<chatId>/{insights.jsonl, llm-calls.jsonl, store.db}`、`reports/<chatId>/YYYY-MM-DD.md`（周报/日报分目录互不覆盖）、`audit.log`（仅元数据）、`cursor.json`、`outbox.jsonl`、`notify/ retention/ scheduler/`。
 
-知识库（`~/WeChat/1数据/knowledge.db`）五张核心表：`doc`（资料，`content_hash` 查重）、`entry`（随手记）、`report`（日报/周报/月报，draft → final）、`chat_digest`（**只存要点不存原文**，`source_key` 幂等）、`media`（媒体元数据，本体永不入库）。
+知识库（`~/WeChat/1数据/knowledge.db`）核心对象：五张事实表 `doc`（资料，`content_hash` 查重）、`entry`（随手记）、`report`（日报/周报/月报，draft → final）、`chat_digest`（**只存要点不存原文**，`source_key` 幂等）、`media`（媒体元数据，本体永不入库）；v0.6 增 `report_revision`（报告修订，不可变历史）与 `marking`（完成情况标记）两表，配 `v_report_revised` / `v_marking_latest` 视图。schema 迁移幂等（`user_version` 逐级升级），旧库自动升级不丢数据。
 
 日报末尾自带成本统计行（模型 / token / 花费）：
 
@@ -191,6 +192,8 @@ node scripts/import-state-to-sqlite.mjs --state-dir ~/.dsh/dsh-group-lurker
 | [docs/SECURITY-TEST-PLAN.md](docs/SECURITY-TEST-PLAN.md) | 五条红线的总纲与验收矩阵 |
 | [0数据格式/README.md](0数据格式/README.md) | 知识库模板：表关系图、工具用法 |
 | [0数据格式/PRIVACY.md](0数据格式/PRIVACY.md) | 模板侧隐私红线与外部写入规约 |
+| [docs/DESIGN-approval-marking.md](docs/DESIGN-approval-marking.md) / [docs/TECH-DESIGN-confirm-loop.md](docs/TECH-DESIGN-confirm-loop.md) | 审批标记与双通道确认闭环设计 |
+| [docs/REF-prefixes.md](docs/REF-prefixes.md) | 编号前缀注册表（PLG-N 等，防多线命名冲突） |
 | [SECURITY.md](SECURITY.md) / [CONTRIBUTING.md](CONTRIBUTING.md) / [AGENTS.md](AGENTS.md) | 漏洞上报 / 贡献规范 / agent 硬约束 |
 | [CHANGELOG.md](CHANGELOG.md) / [docs/PROGRESS.md](docs/PROGRESS.md) | 版本变更 / 开发日志 |
 
@@ -201,7 +204,7 @@ node scripts/import-state-to-sqlite.mjs --state-dir ~/.dsh/dsh-group-lurker
 ```bash
 npm install
 npm run build   # tsc → lib/
-npm test        # node --test，47 文件 / 412 例，全离线 mock
+npm test        # node --test，50 文件 / 440 例，全离线 mock
 ./scripts/check-sensitive.sh   # 提交前必跑，CI 会拦
 ```
 

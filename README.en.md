@@ -31,7 +31,7 @@ One [DSH](https://github.com/deepseek-ai) Cordis plugin plus a zero-data knowled
 | `src/` | The plugin: allow-listed reading, per-group buffering, LLM distillation, reports, single controlled send egress, SQLite mirror data layer (`src/db/`) |
 | `0数据格式/` | **Pure knowledge-base template**: three-layer schema (`doc` / `report`+`entry` / `chat_digest`) + 3 Python tools. **Nothing is ever entered into it** |
 | `scripts/` | `check-sensitive.sh` (sensitive-data scan), `llm-cost.mjs` (spend roll-up), `import-state-to-sqlite.mjs` (one-shot importer) |
-| `tests/` | 47 test files / 412 cases, fully offline mocks, never touches a real database |
+| `tests/` | 50 test files / 440 cases, fully offline mocks, never touches a real database |
 
 ## Architecture: from chats to knowledge
 
@@ -54,6 +54,7 @@ Query/export: 0数据格式/report_cli.py · export_md.py
 - **JSONL is always the source of truth**: SQLite is only a query layer; mirror and importer share one mapping contract
 - **Schema v0.4**: `report` carries `chat_id` (conflict key `(period_type, period_start, chat_id)`, no more cross-group aggregated sections), a new `media` metadata table (media files themselves are never stored); `user_version` migrations are idempotent and upgrade old databases automatically
 - **Documents extracted from reports**: URLs / file indexes found in reports land in the `doc` table automatically, deduplicated with the same rules as the Python batch script
+- **Approval loop & report revision flow (schema v0.6)**: `ApprovalActions` (single entry for approval actions) + `ActionInbox` (frontend action inbox); report revisions land in `report_revision` (immutable history) and cascade into weekly/monthly reports, completion status is tracked via append-only `marking` rows (done/undone/deleted) — all mirrored into the knowledge base as a single query copy
 
 ## Quick start
 
@@ -136,7 +137,7 @@ node scripts/import-state-to-sqlite.mjs --state-dir ~/.dsh/dsh-group-lurker
 
 State directory (default `$DSH_HOME/dsh-group-lurker/`): `groups/<chatId>/{insights.jsonl, llm-calls.jsonl, store.db}`, `reports/<chatId>/YYYY-MM-DD.md` (weekly/daily in separate directories), `audit.log` (metadata only), `cursor.json`, `outbox.jsonl`, `notify/ retention/ scheduler/`.
 
-The knowledge base (`~/WeChat/1数据/knowledge.db`) has five core tables: `doc` (documents, deduplicated by `content_hash`), `entry` (quick notes), `report` (daily/weekly/monthly, draft → final), `chat_digest` (**points only, never raw chat text**, idempotent via `source_key`), `media` (metadata only; media files are never stored).
+The knowledge base (`~/WeChat/1数据/knowledge.db`) core objects: five fact tables — `doc` (documents, deduplicated by `content_hash`), `entry` (quick notes), `report` (daily/weekly/monthly, draft → final), `chat_digest` (**points only, never raw chat text**, idempotent via `source_key`), `media` (metadata only; media files are never stored) — plus v0.6's `report_revision` (immutable report revision history) and `marking` (append-only completion status), exposed through the `v_report_revised` / `v_marking_latest` views. Schema migrations are idempotent (`user_version` steps up); old databases upgrade automatically without data loss.
 
 Every report ends with a cost summary line:
 
@@ -183,6 +184,8 @@ Rules (full red lines in [`0数据格式/PRIVACY.md`](0数据格式/PRIVACY.md))
 | [docs/SECURITY-TEST-PLAN.md](docs/SECURITY-TEST-PLAN.md) | Charter and acceptance matrix for the five red lines |
 | [0数据格式/README.md](0数据格式/README.md) | Knowledge-base template: table diagram, tool usage |
 | [0数据格式/PRIVACY.md](0数据格式/PRIVACY.md) | Template-side privacy red lines and external-writer contract |
+| [docs/DESIGN-approval-marking.md](docs/DESIGN-approval-marking.md) / [docs/TECH-DESIGN-confirm-loop.md](docs/TECH-DESIGN-confirm-loop.md) | Approval-marking and dual-channel confirmation loop design |
+| [docs/REF-prefixes.md](docs/REF-prefixes.md) | Numbering-prefix registry (PLG-N etc., prevents cross-line name clashes) |
 | [SECURITY.md](SECURITY.md) / [CONTRIBUTING.md](CONTRIBUTING.md) / [AGENTS.md](AGENTS.md) | Vulnerability reporting / contributing / agent constraints |
 | [CHANGELOG.md](CHANGELOG.md) / [docs/PROGRESS.md](docs/PROGRESS.md) | Release notes / development log |
 
@@ -193,7 +196,7 @@ Rules (full red lines in [`0数据格式/PRIVACY.md`](0数据格式/PRIVACY.md))
 ```bash
 npm install
 npm run build   # tsc → lib/
-npm test        # node --test, 47 files / 412 cases, fully offline mocks
+npm test        # node --test, 50 files / 440 cases, fully offline mocks
 ./scripts/check-sensitive.sh   # must pass before committing; CI enforces it
 ```
 
