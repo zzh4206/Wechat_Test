@@ -39,7 +39,10 @@ interface MirrorEvent {
 export interface ReportRevisionDeps {
   store: Store
   logger: StoreLogger
-  mirror?: { mirrorMarking: (chatId: string, kind: 'done' | 'undone' | 'deleted', targetRef: string, ts: number, opts?: { source?: 'chat' | 'web'; sourceKey?: string }) => boolean }
+  mirror?: {
+    mirrorMarking: (chatId: string, kind: 'done' | 'undone' | 'deleted', targetRef: string, ts: number, opts?: { source?: 'chat' | 'web'; sourceKey?: string }) => boolean
+    mirrorReportRevision: (chatId: string, periodType: 'daily' | 'weekly' | 'monthly', periodStart: string, ts: number, type: string, opts?: { targetRef?: string | null; summary?: string | null; source?: 'chat' | 'web'; sourceKey?: string }) => boolean
+  }
   now?: () => number
   /** 内存重放队列上限（默认 500；测试可调） */
   maxQueue?: number
@@ -50,12 +53,14 @@ const STATUS_LABEL = { completed: '已完成', incomplete: '未完成', deleted:
 export class ReportRevisionService {
   private readonly now: () => number
   private readonly maxQueue: number
+  private readonly mirror?: { mirrorMarking: (chatId: string, kind: 'done' | 'undone' | 'deleted', targetRef: string, ts: number, opts?: { source?: 'chat' | 'web'; sourceKey?: string }) => boolean; mirrorReportRevision: (chatId: string, periodType: 'daily' | 'weekly' | 'monthly', periodStart: string, ts: number, type: string, opts?: { targetRef?: string | null; summary?: string | null; source?: 'chat' | 'web'; sourceKey?: string }) => boolean }
   /** 镜像失败暂存（内存，有界；不落第二持久真相） */
   private pending: MirrorEvent[] = []
 
   constructor(private readonly deps: ReportRevisionDeps) {
     this.now = deps.now ?? (() => Date.now())
     this.maxQueue = Math.max(1, deps.maxQueue ?? MIRROR_RETRY_QUEUE_MAX)
+    this.mirror = deps.mirror
   }
 
   private dayKey(ts: number): string {
@@ -108,7 +113,10 @@ export class ReportRevisionService {
       this.deps.logger.error(`report-revision: 镜像失败——事件入内存队列（${this.pending.length}/${this.maxQueue}） ${JSON.stringify(ev)}`)
     }
     const label = STATUS_LABEL[status]
-    this.appendRevisionLineToMd(chatId, this.dayKey(ts), `- ${this.dayKey(ts)} ${this.hhmm(ts)} 标记：${targetKind}「#${targetId}」→ ${label}（来源：${source === 'web' ? '前端' : '对话框'}）`)
+    const mdLine = `- ${this.dayKey(ts)} ${this.hhmm(ts)} 标记：${targetKind}「#${targetId}」→ ${label}（来源：${source === 'web' ? '前端' : '对话框'}）`
+    const dateKey = this.dayKey(ts)
+    this.appendRevisionLineToMd(chatId, dateKey, mdLine)
+    this.cascadeAggregates(chatId, dateKey, { revType: 'marking', targetRef: ev.targetRef, summary: `标记：${targetKind} #${targetId} → ${label}`, source: ev.source, mdLine })
     return true
   }
 
@@ -118,10 +126,34 @@ export class ReportRevisionService {
    */
   async onApproval(chatId: string, dateKey: string, summary: string, source: 'chat' | 'web', targetRef: string | null = null): Promise<boolean> {
     const ts = this.now()
-    this.appendRevisionLineToMd(chatId, dateKey, `- ${this.dayKey(ts)} ${this.hhmm(ts)} 审批：${summary}（来源：${source === 'web' ? '前端' : '对话框'}）→ L2 对应条目状态更新`)
-    void targetRef
-    void ts
+    const mdLine = `- ${this.dayKey(ts)} ${this.hhmm(ts)} 审批：${summary}（来源：${source === 'web' ? '前端' : '对话框'}）→ L2 对应条目状态更新`
+    this.appendRevisionLineToMd(chatId, dateKey, mdLine)
+    this.mirror?.mirrorReportRevision(chatId, 'daily', dateKey, ts, 'approval', { targetRef, summary, source: source === 'web' ? 'web' : 'chat' })
+    this.cascadeAggregates(chatId, dateKey, { revType: 'approval', targetRef, summary: `审批：${summary}`, source, mdLine })
     return true
+  }
+
+  /** 级联（§1 逐级向上）：周报（dateKey 所在周的周一）/月报（当月 1 号）文件已存在才动作 */
+  private cascadeAggregates(chatId: string, dateKey: string, ev: { revType: string; targetRef: string | null; summary: string; source: string; mdLine: string }): void {
+    const day = this.parseDay(dateKey)
+    if (day === null) return
+    const monday = new Date(day.getFullYear(), day.getMonth(), day.getDate() - ((day.getDay() + 6) % 7))
+    const first = new Date(day.getFullYear(), day.getMonth(), 1)
+    const p = (x: Date): string => `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, '0')}-${String(x.getDate()).padStart(2, '0')}`
+    const targets: Array<['weekly' | 'monthly', string]> = [['weekly', p(monday)], ['monthly', p(first)]]
+    for (const [kind, key] of targets) {
+      const rel = reportRelPath(chatId, key, kind)
+      if (this.deps.store.readText(rel) === null) continue // 聚合报告不存在 → 什么都不做
+      this.appendRevisionLineToMd(chatId, key, ev.mdLine, kind)
+      this.mirror?.mirrorReportRevision(chatId, kind, key, this.now(), ev.revType, { targetRef: ev.targetRef, summary: ev.summary, source: ev.source === 'web' ? 'web' : 'chat' })
+    }
+  }
+
+  private parseDay(dateKey: string): Date | null {
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateKey)
+    if (!m) return null
+    const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]))
+    return Number.isNaN(d.getTime()) ? null : d
   }
 
   /** 报告 .md 尾部修订段：已存在则追加一行，否则新建段。写入经 store.writeText（围栏内）。 */

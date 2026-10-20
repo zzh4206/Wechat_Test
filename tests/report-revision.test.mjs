@@ -4,7 +4,7 @@
 //       队列有界（500 溢出丢最旧）、排空重放、约束 1 自查口径（不落第二持久真相）。
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, readFileSync } from 'node:fs'
+import { mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
@@ -108,4 +108,30 @@ test('内存队列有界（500）：溢出丢最旧并 error 日志', async () =
 
 test('常量：内存队列上限 500', () => {
   assert.equal(MIRROR_RETRY_QUEUE_MAX, 500)
+})
+
+// —— M2 级联 + 完成情况段 ——
+
+test('级联：周报/月报文件已存在 → 修订行同步追加；不存在 → 无操作', async () => {
+  const dir = resolve(mkdtempSync(join(tmpdir(), 'rev-casc-')))
+  const store = new Store(dir, { warn() {}, error() {} })
+  store.ensureDir(`reports/${CHAT}/weekly`)
+  store.ensureDir(`reports/${CHAT}/monthly`)
+  store.writeText(`reports/${CHAT}/${DAY}.md`, '# 日报\n')
+  store.writeText(`reports/${CHAT}/weekly/2026-10-19.md`, '# 周报\n') // 10-21 所在周的周一
+  // monthly 不建 → 级联应跳过
+  const mirrorCalls = []
+  const svc = new ReportRevisionService({
+    store,
+    logger: { warn() {}, error() {} },
+    mirror: { mirrorMarking: () => true, mirrorReportRevision: (c, periodType, periodStart, ts, type, opts) => { mirrorCalls.push([periodType, periodStart]); return true }, mirrorMarking: () => true },
+    now: () => NOW,
+  })
+  await svc.markTarget(CHAT, 'task', 3, 'completed', 'web')
+  assert.match(readFileSync(join(dir, `reports/${CHAT}/${DAY}.md`), 'utf8'), /修订记录/)
+  assert.match(readFileSync(join(dir, `reports/${CHAT}/weekly/2026-10-19.md`), 'utf8'), /修订记录/)
+  assert.ok(!existsSync(join(dir, `reports/${CHAT}/monthly/2026-10-01.md`)), '月报不存在 → 无操作')
+  assert.ok(mirrorCalls.some((m) => m[0] === 'weekly' && m[1] === '2026-10-19'), '周报修订行入镜像')
+  assert.ok(!mirrorCalls.some((m) => m[0] === 'monthly'), '月报不存在 → 无镜像修订行')
+  rmSync(dir, { recursive: true, force: true })
 })

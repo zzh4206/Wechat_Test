@@ -348,6 +348,8 @@ export interface RenderInput {
   fileLines?: readonly string[]
   /** 修订记录行（审批标记设计 §3.2 流展示；来自 report_revisions 表，时间正序）。非空时尾部渲染修订段。 */
   revisionLines?: readonly string[]
+  /** 完成情况段（§3.3：仅周报/月报渲染；来自 markings 最新态，按 target_ref 反查事项文本）。 */
+  completionLines?: readonly string[]
   /**
    * T3 batch_stats：本次生成的批统计（批数/失败批/最大批耗时/缓存命中/总调用/总耗时）。
    * 提供时在报告末尾追加一行统计（degraded/empty 也应有合理输出——empty 传全 0）。
@@ -374,6 +376,13 @@ export function renderReport(input: RenderInput): string {
       if (input.revisionLines && input.revisionLines.length > 0) {
     lines.push('## 修订记录', '')
     for (const line of input.revisionLines) lines.push(line)
+    lines.push('')
+  }
+  // 完成情况段（§3.3）：仅周报/月报；无标记整段省略；日报不含此段
+  if (kind !== 'daily' && input.completionLines && input.completionLines.length > 0) {
+    lines.push('## 完成情况（标记）', '')
+    lines.push('| 事项 | 来源日 | 标记 | 标记时间 |', '|---|---|---|---|')
+    for (const line of input.completionLines) lines.push(line)
     lines.push('')
   }
 return lines.join('\n')
@@ -761,6 +770,24 @@ export class ReportService {
         costCny: refineSide.stats.costCny,
         tokensEst: refineSide.stats.tokensEst,
       }
+    }
+    // 完成情况段（§3.3，仅周/月报）：markings 最新态按 target_ref 反查事项文本
+    let completionLines: string[] | undefined
+    if (kind !== 'daily') {
+      const labelMap = { done: '✅ 已完成', undone: '⬜ 未完成', deleted: '🗑 删除' } as Record<string, string>
+      completionLines = this.options.store
+        .listMarkingsLatest()
+        .filter((m) => m.target_ref.startsWith(`${chatId}:`) && m.ts >= win.start && m.ts <= win.end)
+        .map((m) => {
+          const ref = String(m.target_ref) // <chatId>:<kind>:<id>
+          const [, , kind2, id2] = ref.split(':')
+          const row = kind2 === 'task' ? this.options.groupStore.getTask(chatId, Number(id2)) : kind2 === 'promise' ? this.options.groupStore.getPromise(chatId, Number(id2)) : null
+          const item = row && 'statement' in row ? String(row.statement) : `${kind2} #${id2}`
+          const d = new Date(Number(m.ts))
+          const p = (n: number): string => String(n).padStart(2, '0')
+          return `| ${item} | ${p(d.getMonth() + 1)}-${p(d.getDate())} | ${labelMap[String(m.kind)] ?? String(m.kind)} | ${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())} |`
+        })
+      if ((completionLines?.length ?? 0) === 0) completionLines = undefined
     }
     // 修订记录段（单一查询副本=knowledge.db；渲染时从 report_revision 取该报告条目）
     const revisionLines = this.options.store

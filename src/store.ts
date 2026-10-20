@@ -45,6 +45,21 @@ export class Store {
     return ok
   }
 
+  /** marking 镜像透传（单一查询副本架构：ReportRevisionService 直连；未启用镜像返回 false） */
+  mirrorMarking(chatId: string, kind: 'done' | 'undone' | 'deleted', targetRef: string, ts: number, opts?: { source?: 'chat' | 'web'; sourceKey?: string }): boolean {
+    return this.mirror?.mirrorMarking(chatId, kind, targetRef, ts, opts) ?? false
+  }
+
+  /** marking 最新态读侧透传（完成情况段；未启用镜像返回 []） */
+  listMarkingsLatest(kind?: 'done' | 'undone' | 'deleted'): Array<{ chat_id: string; kind: string; target_ref: string; ts: number; source: string }> {
+    return this.mirror?.listMarkingsLatest(kind) ?? []
+  }
+
+  /** 修订读侧透传（报告渲染的修订段；单一查询副本 = knowledge.db；未启用镜像返回 []） */
+  listRevisions(chatId: string, periodType: string, periodStart: string): Array<{ ts: number; type: string; summary: string | null; source: string }> {
+    return this.mirror?.listRevisions(chatId, periodType, periodStart) ?? []
+  }
+
   /** media 镜像透传（v0.4：file-index 扫描后由接线层调用；未启用镜像时零开销） */
   mirrorMedia(chatId: string, files: ReadonlyArray<MediaSourceFile>): void {
     this.mirror?.mirrorMedia(chatId, files)
