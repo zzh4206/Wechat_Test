@@ -50,6 +50,7 @@ import type { PromiseEvent } from './promise-track.js'
 import { FileIndexService, linkFilesToEvents } from './file-index.js'
 import { createAccountGate, listAccounts, sampleAccount, diffActivity, wxidFromDbRoot, XWECHAT_FILES_REL, type FsLike } from './account-probe.js'
 import { RegenQueue, REGEN_QUEUE_REL } from './regen-queue.js'
+import { processRegenHead } from './regen-processor.js'
 import { homedir } from 'node:os'
 // M6：保留期清理（T1.1 遗留）+ A/B 脚手架类型（新增行，不动他人行）
 import { RetentionService } from './retention.js'
@@ -474,8 +475,10 @@ export function apply(ctx: Context, config: PluginConfig): void {
           return
         }
         void (async () => {
-          // 错号空报告补发队列：触发时刻活跃账号 ∉ 白名单 → 照常生成空报告 + 入队；
-          // 白名单账号回归后 → 逐条补生成（窗口锚定原 dateKey，end=再生成时刻）+ 正常报告链路。
+          // 错号空报告补发队列（两段式 FIFO）：错号 → 空报告仅存档 + 入队（绝不进发送链路，
+          // 提前 return）；白名单账号在线 → 每轮从队首 pop 一个元素补生成（end=处理时刻）：
+          // 有内容 → outbox 条目进发送链路后出队；空 → 重试 ≤2 次；3 次全空 → 如实定稿发送；
+          // 环境异常 → 放回队首不耗次数。详见 regen-processor.ts。
           const regenAudit = (result: string, chatId2: string, dateKey: string, extra?: Record<string, unknown>): void => {
             try {
               store.ensureDir('audit')
@@ -488,30 +491,30 @@ export function apply(ctx: Context, config: PluginConfig): void {
             misAccount = active !== null && !accountGate.isAllowed(active)
           }
           if (misAccount) {
+            // P0 语义：错号导致的空报告 = 未处理（等待正号回归重生成），绝不进发送链路——
+            // 空骨架照常落盘存档 + 入 pending_regen 队列 + 提前 return（不 notify 不 outbox）。
             const dateKey = localDayKey(meta.scheduledAt)
+            const res = await report.generateReport(chatId, 'daily', meta.scheduledAt)
             const qres = regenQueue.enqueue(chatId, dateKey, Date.now())
-            if (qres !== 'deduped') regenAudit('regen_queued', chatId, dateKey, { queue_len: regenQueue.list().length })
-            logger.warn(`scheduler[daily]: 错号在线——空报告 + 补发队列（${qres}） ${chatId}/${dateKey}`)
-          } else if (kind === 'daily' && accountGate) {
-            // 白名单账号在线 → 先补发历史队列（含同步进库的消息），再生成当期报告
-            for (const entry of regenQueue.list()) {
-              const metas = groupStore.getReportMetas(entry.chatId, { kind: 'daily', limit: 10 })
-              const hasReal = metas.some((m) => m.date === entry.dateKey && m.status !== 'empty')
-              if (hasReal) {
-                regenQueue.remove(entry.chatId, entry.dateKey)
-                regenAudit('regen_satisfied', entry.chatId, entry.dateKey)
-                continue
-              }
-              try {
-                const rr = await report.generateReport(entry.chatId, 'daily', new Date().getTime(), entry.dateKey)
-                regenQueue.remove(entry.chatId, entry.dateKey)
-                regenAudit('regen_done', entry.chatId, entry.dateKey, { status: rr.status })
-                await notifier.notify('daily', `补发日报已生成（${entry.chatId} ${entry.dateKey}）`, rr.status === 'empty' ? '补发窗口仍无消息' : `关键判断 ${rr.judgmentCount} 条，全文见 outbox 存档`)
-                outbox.appendOutbox({ kind: 'daily', title: `补发日报 ${entry.dateKey}`, body: `补发 ${entry.dateKey} 日报（错号期间空报告已修正）`, evidence_ref: rr.path ?? '' })
-              } catch (error) {
-                logger.error(`regen-queue: 补生成失败 ${entry.chatId}/${entry.dateKey}: ${String(error)}`)
-              }
-            }
+            regenAudit(qres === 'deduped' ? 'regen_deduped' : 'regen_queued', chatId, dateKey, { queue_len: regenQueue.list().length, status: res.status })
+            logger.warn(`scheduler[daily]: 错号在线——空报告仅存档，入补发队列等待正号回归（${qres}） ${chatId}/${dateKey}（不发送）`)
+            return
+          }
+          if (kind === 'daily' && accountGate) {
+            // 白名单账号在线 → 每轮处理队首一个补发元素，再生成当期报告
+            const outcome = await processRegenHead({
+              queue: regenQueue,
+              report,
+              groupStore,
+              outbox,
+              store,
+              logger: logger as unknown as StoreLogger,
+              notify: async (title, body) => { await notifier.notify('daily', title, body) },
+              audit: (entry) => regenAudit(String(entry.result), String(entry.chat_id), String(entry.date_key), entry),
+              now: () => Date.now(),
+            })
+            if (outcome.action === 'regenerated') logger.info(`scheduler[daily]: 补发日报已生成并入发送队列`)
+            else if (outcome.action !== 'empty') logger.warn(`scheduler[daily]: 补发队列处理结局=${outcome.action}`)
           }
           const res = await report.generateReport(chatId, kind as ReportKind, meta.scheduledAt)
           if (res.status === 'disabled') return

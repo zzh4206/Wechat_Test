@@ -466,6 +466,16 @@ Accessibility Inspector 确认元素层级）。**实证结论回填此处：___
   低于该阈值才跳过本轮让路（`user_active`）；≥阈值或设 0 → 不让路，直接抢前台发送。
   **日常单日报场景可设 0**（每天一次的抢前台可接受）；默认 10 适合频繁发送场景（绝不打断打字）；
 - **失败重试**：attempts 落盘，≥3 次转 `failed` 不再重试（防风暴）；
+- **错号空报告两段队列（P0 热修 2026-10-19）**：错号在线时触发的日报 = **未处理**而非
+  「真的没消息」——空骨架仅落盘存档 + 压入 `regen-queue.json`（pending_regen，**不 notify
+  不进 outbox，绝不发送空报告**）。正号（白名单账号）回归后每轮从队首 pop 一个元素重生成
+  （窗口锚定原 dateKey、end=处理时刻）：有内容 → 报告落盘 + outbox 条目进发送链路（done）；
+  空 → 放回队首重试 ≤2 次（regenAttempts 跨重启保留）；3 次全空 → **如实定稿**（空日报正常
+  创建发送，empty_confirmed）；环境异常 → 放回队首不耗次数。审计
+  `regen_queued/regen_deduped/regen_regenerated/regen_deferred_sync_pending/`
+  `regen_empty_confirmed/regen_satisfied/regen_env_deferred` 全生命周期可查。
+  **事件记录（2026-10-19）**：修复前错号期间两条「本期窗口内无消息」空日报已实发到文件传输
+  助手，无法撤回——已由本热修复杜绝（错号期间空报告不再进发送链路）。
 - **账号生命周期自动化（白名单制，2026-10-15）**：探针每轮消费周期对
   `xwechat_files/wxid_*` 各目录做**双快照活动对比**（间隔 2s；文件数或最新 mtime 变化 =
   持续写入流 = 活跃；单次快照无判别力）。活跃 ∉ `accountWhitelist` → sender **全面挂起**
