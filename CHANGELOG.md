@@ -6,6 +6,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- schema v0.6（审批双通道与报告修订流，TECH-v0.6 定稿）：纯新增 `report_revision`（修订历史，`source_key` 幂等、不可变事实、不建 report 外键）与 `marking`（完成情况标记，kind 三态 done/undone/deleted，同 `target_ref` 状态演变=追加行）两表及 `v_report_revised` / `v_marking_latest` 两视图，既有表零改动；`KnowledgeDao` 增 `insertReportRevision` / `insertMarking`（source_key 冲突→返回已有 id 不更新）/ `listRevisions` / `listMarkingsLatest`，`SqliteMirror` 增 `mirrorReportRevision` / `mirrorMarking`（safe 包裹，事件源接线由插件侧后续完成）；自动迁移升 user_version 4→5 单事务幂等（v3 先升 4 再升 5，0=全新建 v5，其余 <4 或 >5 拒开），与 Python 侧（0数据格式）逻辑一致
+
+### Fixed
+
+- T4 语义：`upsertReport` 冲突分支不再用 `excluded.status` 覆盖既有 status——`final` 报告被修订后仍 `final`（修订不降级），`draft` 也不会被自动 final（draft→final 单向定稿由 finalize 通道承载），测试钉死
+
 ### Fixed
 
 - 文件消息归档缺口（「local_type 49 ≠ 一定是链接」诊断落地）：`FileIndexService` 新增 `ingestFromListing`——以工具 `files` 子命令清单（`msg_id/name/path/available`）为兜底数据源补全 files 表。背景：微信 4.x 的 appmsg 文件消息 `local_type` 低 32 位与链接同为 49 且 XML 不导出，消息流侧只能归 `kind='link'`、占位无文件名，消息流扫描拿不到 `kind='file'` 行 → files 表恒 0。新增配置 `fileIndexListIntervalMin`（默认 30，0=关）/ `fileIndexListTimeoutMs` / `fileIndexListLimit`；摄取失败/超时只 warn 不阻塞；幂等（同名同大小同发送者键合并 appearances；孤儿 `msg_id` 因外键置 NULL，来源保留在 `file_id`）。证据链见 `docs/REPORT-文件消息归档缺口诊断.md`，条目入 `docs/ERROR-REFERENCE.md` §3.12（ERR-FIDX-002）
