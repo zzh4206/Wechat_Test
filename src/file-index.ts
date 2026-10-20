@@ -155,6 +155,15 @@ export interface FileScanResult {
   degraded: boolean
 }
 
+/** 待收尾（版本链/摘要/星标）的新索引条目；msg 只需 id+ts（星标/上下文查询用） */
+interface FileEntry {
+  fileId: string
+  name: string
+  ts: number
+  msg: Pick<StoredMessage, 'msgId' | 'ts' | 'senderPid'>
+  context: string
+}
+
 export interface FileIndexOptions {
   groupStore: GroupStoreService
   llm: LlmClient
@@ -174,6 +183,18 @@ export interface FileIndexOptions {
    * locatePath 只做同步读）。失败/缺省不阻塞扫描（保持"待下载"占位）。
    */
   refreshPaths?: (chatId: string) => Promise<void>
+  /**
+   * files 子命令数据源注入点（修复"49≠链接"归档缺口，docs/REPORT-文件消息归档缺口诊断.md）：
+   * appmsg 文件消息 local_type 低 32 位与链接同为 49、XML 不导出 → 消息流侧永远归为
+   * kind='link' 且占位文本无文件名，消息流扫描拿不到可索引条目；files 子命令直接返回
+   * {msg_id,name,path,available}。返回 [] 视为无数据；抛错由调用方 safe 包裹。
+   * 注意：其 msg_id 与 store server_id 命名空间不总一致——ts/sender/上下文取 store
+   * 同 id 行，未命中回退 now/空（去重键 name|size|sender 兜底，见 ingestFromListing）。
+   */
+  listFiles?: (
+    chatId: string,
+    limit: number,
+  ) => Promise<Array<{ msg_id: string; name: string | null; path: string | null; available: boolean }>>
   /** 大小注入点（消息行不携带文件大小；接线层可从源库补，缺省 0） */
   getSize?: (msg: StoredMessage) => number | null
   now?: () => number
@@ -244,13 +265,15 @@ export class FileIndexService {
 
     let newFiles = 0
     let merged = 0
-    const newEntries: Array<{ fileId: string; name: string; ts: number; msg: StoredMessage; context: string }> = []
+    const newEntries: FileEntry[] = []
 
     for (const msg of msgs) {
       const name = msg.text.trim() !== '' ? msg.text.trim() : `file-${msg.msgId}`
       const { category, ext } = classifyExt(name)
       const size = this.options.getSize?.(msg) ?? 0
-      const key = `${name}|${size}|${msg.senderPid}`
+      // 键用落库后的 sender 值（identities 外未代号化 → null/''），与 files 行、
+      // 清单摄取路径（ingestFromListing）的键口径一致——两路径才能同名合并
+      const key = `${name}|${size}|${identityPids.has(msg.senderPid) ? msg.senderPid : ''}`
       const hit = byKey.get(key)
       if (hit) {
         // 重复合并：一条索引 + appearances 追加（msg_id 保留首次）
@@ -278,6 +301,78 @@ export class FileIndexService {
       newEntries.push({ fileId, name, ts: msg.ts, msg, context })
     }
 
+    // —— 版本链 + 上下文摘要尾段（消息流与 files 清单两条摄取路径共用） ——
+    const { summariesWritten, degraded } = await this.finalizeEntries(chatId, newEntries)
+    return { ran: true, newFiles, appearancesMerged: merged, summariesWritten, degraded }
+  }
+
+  /**
+   * files 子命令数据源摄取（修复"49≠链接"归档缺口；与 scanChat 消息流路径并存）：
+   * 消息流为主（有上下文/发送者/时间，摘要质量高），本路径为**兜底补全**——
+   * 消息流侧文件消息被归为 kind='link'、占位文本无文件名，靠清单把 name/path 补进索引。
+   * ts/sender/上下文优先取 store 同 msg_id 行（server_id 命中时）；
+   * 未命中（msg_id 命名空间不一致的已知坑）回退 now/空，去重键 name|size|sender 兜底。
+   * 幂等：同键合并 appearances 追加、同 msg_id 不重复入库（appendFile 主键兜底）。
+   */
+  async ingestFromListing(chatId: string, limit = 200): Promise<FileScanResult> {
+    const empty = { ran: false, newFiles: 0, appearancesMerged: 0, summariesWritten: 0, degraded: false }
+    if (!this.options.enabled || !this.options.listFiles) return empty
+    const entries = await this.options.listFiles(chatId, Math.max(1, Math.min(200, Math.floor(limit))))
+    if (entries.length === 0) return empty
+    const existing = this.options.groupStore.getFiles(chatId, { limit: 1000 })
+    const byKey = new Map(existing.map((f) => [`${f.name}|${f.size}|${f.senderPid ?? ''}`, f]))
+    const identityPids = new Set(this.options.groupStore.getIdentities(chatId).map((i) => i.pid))
+    let newFiles = 0
+    let merged = 0
+    const newEntries: FileEntry[] = []
+    for (const e of entries) {
+      if (typeof e?.msg_id !== 'string' || e.msg_id === '') continue
+      const name = (e.name ?? '').trim() !== '' ? (e.name as string).trim() : `file-${e.msg_id}`
+      const { category, ext } = classifyExt(name)
+      // msg_id 命名空间兜底：store 同 id 行命中 → 补 ts/sender/上下文；未命中 → now/空
+      const stored = this.options.groupStore.getMessage(chatId, e.msg_id)
+      const ts = stored?.ts ?? this.now()
+      const senderPid = stored?.senderPid ?? ''
+      const size = 0 // 清单不携带大小；与消息流 getSize 兜底口径一致
+      const key = `${name}|${size}|${senderPid}`
+      const hit = byKey.get(key)
+      const wxPath = e.available && typeof e.path === 'string' && e.path !== '' ? e.path : ''
+      if (hit) {
+        const ok = await this.options.groupStore.appendFileAppearance(
+          chatId, hit.fileId, e.msg_id, ts, wxPath !== '' ? wxPath : undefined,
+        )
+        if (ok) merged++
+        continue
+      }
+      const fileId = `f_${e.msg_id}`
+      const inserted = await this.options.groupStore.appendFile(chatId, {
+        fileId,
+        name,
+        ext,
+        size,
+        senderPid: identityPids.has(senderPid) ? senderPid : null,
+        // files.msg_id 有 messages(msg_id) 外键：清单 msg_id 未命中 store（命名空间不一致的
+        // 已知坑）时置 null，来源仍保留在 fileId = f_<msg_id>；命中则原样保留。
+        msgId: stored ? e.msg_id : null,
+        wxPath: wxPath !== '' ? wxPath : '待下载',
+        category,
+      })
+      if (inserted === null) continue
+      await this.options.groupStore.appendFileAppearance(chatId, fileId, e.msg_id, ts, wxPath !== '' ? wxPath : undefined)
+      byKey.set(key, this.options.groupStore.getFile(chatId, fileId)!)
+      newFiles++
+      const context = stored ? this.collectContext(chatId, stored) : ''
+      newEntries.push({
+        fileId, name, ts, context,
+        msg: stored ?? ({ msgId: e.msg_id, ts, senderPid } as Pick<StoredMessage, 'msgId' | 'ts' | 'senderPid'>),
+      })
+    }
+    const { summariesWritten, degraded } = await this.finalizeEntries(chatId, newEntries)
+    return { ran: true, newFiles, appearancesMerged: merged, summariesWritten, degraded }
+  }
+
+  /** 版本链 + LLM 上下文摘要 + 星标（run/ingestFromListing 共用尾段） */
+  private async finalizeEntries(chatId: string, newEntries: FileEntry[]): Promise<{ summariesWritten: number; degraded: boolean }> {
     // —— 版本链：只把新条目挂到**更早**的条目上（新→旧方向，链根不被改写）， ——
     // —— 按出现时间升序处理，先到的链先成形，后到的串到链根 ————————————————
     const all = this.options.groupStore.getFiles(chatId, { limit: 1000 })
@@ -329,7 +424,7 @@ export class FileIndexService {
       }
     }
 
-    return { ran: true, newFiles, appearancesMerged: merged, summariesWritten, degraded }
+    return { summariesWritten, degraded }
   }
 
   private advanceWatermark(chatId: string, ts: number): void {
@@ -355,7 +450,7 @@ export class FileIndexService {
   }
 
   /** 星标：上下文含 deadline 语义 或 文件消息被 ≥2 个不同发送者引用 */
-  private starFor(chatId: string, entry: { msg: StoredMessage; context: string }, all: unknown[]): number {
+  private starFor(chatId: string, entry: FileEntry, all: unknown[]): number {
     void all
     if (DEADLINE_RE.test(entry.context)) return 1
     const quoters = new Set(

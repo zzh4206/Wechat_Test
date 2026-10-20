@@ -164,6 +164,8 @@ await lurker.promiseRecognition.cancelPromise('xxx@chatroom', promiseId)     // 
 
 `fileIndexEnabled: true` 后文件类消息自动入库：类型归类、同名同哈希合并（多次出现保留 appearances）、上下文一句话摘要、星标（被多人引用或上下文含 deadline 语义）、版本链折叠（"初版→修改稿→最终版"）。M6 起 wx_path 定位接线：工具 `files` 子命令按会话查路径，能定位记实际路径，定位不了（离线期未下载）保持"待下载"占位；每次定位记 `audit/file-locate.jsonl` 元数据。
 
+**files 子命令清单摄取（兜底路径，默认每 30 分钟一轮）**：微信 4.x 的文件消息 `local_type` 低 32 位与链接同为 49 且 XML 不导出，消息流侧只能归 `kind='link'`（占位 `[链接]`，无文件名）→ 消息流扫描拿不到 `kind='file'` 行。`FileIndexService.ingestFromListing` 周期调 `files` 子命令把 `name/path/available` 补进 files 表（失败/超时只 warn，下轮重试）。配置：`fileIndexListIntervalMin`（0=关）、`fileIndexListTimeoutMs`、`fileIndexListLimit`。已知坑：`files` 的 msg_id 与消息 `server_id` 命名空间不总一致——ts/sender 取不到时回退 now/空；两路径按「文件名+大小+发送者」同键合并 appearances，幂等。详见 `docs/ERROR-REFERENCE.md` §3.12（ERR-FIDX-002）。
+
 ### 7.6 outbox 查看（tailOutbox）
 
 ```sh

@@ -6,6 +6,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- 文件消息归档缺口（「local_type 49 ≠ 一定是链接」诊断落地）：`FileIndexService` 新增 `ingestFromListing`——以工具 `files` 子命令清单（`msg_id/name/path/available`）为兜底数据源补全 files 表。背景：微信 4.x 的 appmsg 文件消息 `local_type` 低 32 位与链接同为 49 且 XML 不导出，消息流侧只能归 `kind='link'`、占位无文件名，消息流扫描拿不到 `kind='file'` 行 → files 表恒 0。新增配置 `fileIndexListIntervalMin`（默认 30，0=关）/ `fileIndexListTimeoutMs` / `fileIndexListLimit`；摄取失败/超时只 warn 不阻塞；幂等（同名同大小同发送者键合并 appearances；孤儿 `msg_id` 因外键置 NULL，来源保留在 `file_id`）。证据链见 `docs/REPORT-文件消息归档缺口诊断.md`，条目入 `docs/ERROR-REFERENCE.md` §3.12（ERR-FIDX-002）
+
 ### Added
 
 - schema v0.4（会话维度 + media 表）：`report` 增列 `chat_id`（`'aggregate'`=跨群聚合），冲突键改三元组 `(period_type, period_start, chat_id)`；新增 `media` 元数据表（媒体本体永不入库，`path_kind`、status 三态、`source_key` 幂等键）；`KnowledgeDao` 增 `upsertMedia` / `listMediaByChat`，`upsertReport` 带 `chatId`
