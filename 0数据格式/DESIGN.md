@@ -161,7 +161,7 @@ FROM report r ORDER BY r.period_type, r.period_start DESC;
 - 导入器口径：`reports/<chatId>/YYYY-MM-DD.md` 按群落行；非 @chatroom 目录（如 summary）以目录名为伪会话维度落行，属**确认行为**；既有 aggregate 行永不删除。
 - 依据：REQUIREMENT-v0.4 / REPLY-v0.4 / TECH-v0.4（同目录）。
 
-## 9. v0.4.1 增补（报告类型显式通道，2026-10-19，由报告系统侧代为回填；数据负责人复验合并入主分支）
+## 9. v0.4.1 增补（报告类型显式通道，2026-10-19，由报告系统侧代为回填）
 
 - 背景：报告文件布局 `reports/<chatId>/<dateKey>.md` 不含类型信息，路径侧镜像/导入器只能
   猜测类型——周报（dateKey=周一）与月报（dateKey=1 号）能通过 daily 的 CHECK 校验，
@@ -170,9 +170,12 @@ FROM report r ORDER BY r.period_type, r.period_start DESC;
   代码给出；文件布局零破坏）；镜像按 `kind→period` 推导入库：
   daily=(d,d)、weekly=(该周周一, 周一+6 天)、monthly=(当月 1 号, 当月月末)；
   dateKey 非法（月报非 1 号 / 非日期）→ 跳过并 warn，**绝不猜测错标**。
-- 导入器同口径：文件系统侧按报告标题行（`# 日报 / 周报 / 月报`）识别；
+- 导入器同口径：文件系统侧无 kind 信息，按报告标题行（`# 日报 / 周报 / 月报`）识别；
   识别不出回退 daily 并在导入汇总中计数上报；period 推导与镜像共用同一实现（单一事实源）。
 - 路径侧镜像不再从 `reports/…` 路径写入 report 行（避免与显式通道双重写入/口径漂移）。
-- 口径裁定（数据负责人）：聚合报告 chat_id 统一为 `'aggregate'`（`'summary'` 伪会话废止）；
-  media `source_key` 采用 `<chatId>:<file_id>` 文件粒度（首见 msgId 溯源留二期可选列）。
-- 模板独立快照分支：`0数据格式-template`（本节同文），主分支以本子目录为准。
+
+## 10. v0.4.2 口径备忘（media 数据源三坑，2026-10-20，数据负责人确认）
+
+1. **msg_id 命名空间不一致**：`files` 子命令的 msg_id 与消息流 server_id 不总一致。裁定：媒体关联以 `name|size|sender` 为兜底键；孤儿 msg_id 关联置 NULL。schema 层面天然免疫——`media` 表不存 msg_id 外键，只有 `source_key`（`<chatId>:<file_id>` 文件粒度）与 `source_ts`，命名空间冲突被隔离在 TS 镜像层（mirror.ts 的 MediaSourceFile.msgId 可空）。
+2. **未下载文件自愈**：`status='pending'`、path 空（schema CHECK 允许 available 必有 path、pending 可双空）。用户在微信点开下载后，下个心跳由镜像 upsert 转 `available`——`source_key` UNIQUE 幂等键即自愈通道，无需额外机制。
+3. **消息流文件消息恒为 link 类**：文件清单摄取（`files --chat-id` / mirrorMedia）是媒体入库的主路径，消息流侧不重复摄取（49 类型≠链接解析）。已在 ERROR-REFERENCE 备案（ERR-FIDX-002）。
