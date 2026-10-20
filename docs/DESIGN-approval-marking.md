@@ -163,3 +163,23 @@ onEvent(chatId, dateKey)：
 | M1 | markings 表 + markTarget + 修订流（日报级）+ 修订记录段 |
 | M2 | 级联（周报/月报跟随）+ 完成情况段 |
 | M3 | 前端动作对接（task.mark/promise.mark 经 ActionInbox）+ 修订时间线页 |
+---
+
+## 9. 贯穿性追溯：模板侧（0数据格式）协同项
+
+本设计是**贯穿性改动**——插件侧模块只是其中一环，以下模板侧落点必须同步落实，防止"插件做了、模板没跟上"。
+完整需求已出函：`0数据格式/REQUIREMENT-v0.6-confirm-marking-template.md`（数据负责人评审）。
+
+| # | 改动 | 模板侧落点（0数据格式） | 责任方 |
+|---|---|---|---|
+| T1 | 报告修订（修订流） | report 表修订可见性：(a) 轻量列 `revised_at`/`revision_count`；(b) 新增 `report_revisions` 镜像表（前端修订时间线直查）——二选一 | 数据负责人决策 |
+| T2 | 标记（完成情况） | knowledge.db 是否需要 markings 镜像/视图（跨群聚合查询直查 vs 只读烘进 content_md 的段落） | 数据负责人决策 |
+| T3 | 审批数据镜像（Q1 复核） | v0.4 裁定"审批数据不镜像"——双通道上线后复核是否维持（建议维持） | 数据负责人复核 |
+| T4 | 定稿与修订交互（Q2） | `upsertReport` 冲突保留 `final`（方案 a）落地；修订不改 final、final 不被镜像打回 | 数据负责人落地 |
+| T5 | 工具链 | report_cli / export_md 支持 修订记录与完成情况段 的导出 | 数据负责人 |
+| T6 | 假数据 | make_template 增 修订/标记 合成样例（前端页面开发依赖） | 数据负责人 |
+| T7 | 版本与迁移 | 与 v0.5（账号层级）合并为一次 schema 迁移窗口；user_version 4→5 | 双方 |
+| T8 | 红线复核 | 标记/修订的 source 字段只含通道名（chat/web）无正文；五条红线不变 | 双方确认 |
+
+插件侧对应职责（本两份文档 §2/§3/§4）：每群库 markings/report_revisions 表、ApprovalActions/ReportRevisionService/ActionInbox、镜像接线（待 T1/T2 裁定后实施）。
+
