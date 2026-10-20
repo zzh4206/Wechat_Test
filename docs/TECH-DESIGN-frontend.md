@@ -26,9 +26,9 @@
 
 | 期 | 内容 |
 |---|---|
-| P0 | 只读回溯：报告日历/列表/详情、资料库、媒体清单、人员关注摘要 |
-| P1 | 审批收件箱：任务/承诺/事件的确认、取消、完成、改 deadline |
-| P2 | 报告操作：定稿（draft→final）、请求重新生成、把某份报告排入 outbox |
+| 一期 | 只读回溯：报告日历/列表/详情、资料库、媒体清单、人员关注摘要 |
+| 二期 | 审批收件箱：任务/承诺/事件的确认、取消、完成、改 deadline |
+| 三期 | 报告操作：定稿（draft→final）、请求重新生成、把某份报告排入 outbox |
 | 不做 | 手机端直连（见 §11-Q4）；在前端内触发 LLM 对话；在前端编辑报告正文；任何发送 |
 
 ## 2. 数据源盘点
@@ -47,7 +47,7 @@
 | 人员关注摘要 | `<stateDir>/digests/<chatId>/<pid>/<date>.md` | 只读文件 |
 | 报告生成元数据 | 同每群库 · `report_meta` | 只读 SQL |
 
-`knowledge.db` 路径取插件配置 `sqlitePath`（留空 = `~/WeChat/1数据/knowledge.db`；`'off'` 时 P0 回溯不可用，前端给出提示）。
+`knowledge.db` 路径取插件配置 `sqlitePath`（留空 = `~/WeChat/1数据/knowledge.db`；`'off'` 时 一期 回溯不可用，前端给出提示）。
 
 结论：**回溯以 `0数据格式` 为准设计；审批直接读每群库，不为它扩 schema**（理由见 §11-Q1）。
 
@@ -138,7 +138,7 @@ web/
 | 页面 | 要点 |
 |---|---|
 | 报告日历 | 月视图，格子上标 日/周/月 三种角标；顶部切群（含「聚合」）；点格子进详情 |
-| 报告详情 | 左侧正文，右侧同群前后日期快速切换；P2 加「定稿」「重新生成」「排入发件箱」 |
+| 报告详情 | 左侧正文，右侧同群前后日期快速切换；三期 加「定稿」「重新生成」「排入发件箱」 |
 | 对比视图 | 同群两期报告并排（周报对周报、月报对月报） |
 | 审批收件箱 | 按群分组，卡片显示语句、置信度、识别 deadline、证据片段；操作：确认 / 取消 / 改时间；无 deadline 任务高亮「待定时间」 |
 | 人员关注 | 选群 → 选人 → 按日期翻看个人摘要 |
@@ -152,13 +152,13 @@ web/
 
 | type | 调用 | 期 |
 |---|---|---|
-| `task.confirm` / `task.cancel` / `task.complete` | `taskRecognition.confirmTask / cancelTask / completeTask` | P1 |
-| `task.setDeadline` | `groupStore.updateTaskDeadline(chatId, id, deadline, 1)`（人工指定 → 置信度 1） | P1 |
-| `event.confirm` | `taskRecognition.confirmEvent` | P1 |
-| `promise.confirm` / `promise.cancel` / `promise.fulfilled` / `promise.close` | `promiseRecognition.confirmPromise / cancelPromise / confirmFulfilled / closePromise` | P1 |
-| `report.finalize` | `KnowledgeDao` 新增 `setReportStatus(id, 'final')` | P2 |
-| `report.regen` | `regenQueue.enqueue`（需先泛化，见 §11-Q3） | P2 |
-| `report.toOutbox` | `outbox.appendOutbox`（之后仍经 sender 四道闸，dryRun 默认生效） | P2 |
+| `task.confirm` / `task.cancel` / `task.complete` | `taskRecognition.confirmTask / cancelTask / completeTask` | 二期 |
+| `task.setDeadline` | `groupStore.updateTaskDeadline(chatId, id, deadline, 1)`（人工指定 → 置信度 1） | 二期 |
+| `event.confirm` | `taskRecognition.confirmEvent` | 二期 |
+| `promise.confirm` / `promise.cancel` / `promise.fulfilled` / `promise.close` | `promiseRecognition.confirmPromise / cancelPromise / confirmFulfilled / closePromise` | 二期 |
+| `report.finalize` | `KnowledgeDao` 新增 `setReportStatus(id, 'final')` | 三期 |
+| `report.regen` | `regenQueue.enqueue`（需先泛化，见 §11-Q3） | 三期 |
+| `report.toOutbox` | `outbox.appendOutbox`（之后仍经 sender 四道闸，dryRun 默认生效） | 三期 |
 
 处理规约：
 
@@ -224,9 +224,9 @@ web/
 
 | 期 | 交付 | 验收 |
 |---|---|---|
-| P0 | `web/` 只读服务 + 日历/详情/资料/人员页 + web-boundary 哨兵 | sample.db 上全页面可用；安全用例全过 |
-| P1 | ActionInbox + 收件箱页 | 合成库上 确认→生效 闭环；`learned_pattern` 被登记 |
-| P2 | 定稿、重新生成、排入发件箱 | 定稿状态不被下次镜像覆盖（§11-Q2）；toOutbox 在 dryRun 下只落 outbox |
+| 一期 | `web/` 只读服务 + 日历/详情/资料/人员页 + web-boundary 哨兵 | sample.db 上全页面可用；安全用例全过 |
+| 二期 | ActionInbox + 收件箱页 | 合成库上 确认→生效 闭环；`learned_pattern` 被登记 |
+| 三期 | 定稿、重新生成、排入发件箱 | 定稿状态不被下次镜像覆盖（§11-Q2）；toOutbox 在 dryRun 下只落 outbox |
 
 ## 10. 需同步的文档
 
