@@ -179,3 +179,12 @@ FROM report r ORDER BY r.period_type, r.period_start DESC;
 1. **msg_id 命名空间不一致**：`files` 子命令的 msg_id 与消息流 server_id 不总一致。裁定：媒体关联以 `name|size|sender` 为兜底键；孤儿 msg_id 关联置 NULL。schema 层面天然免疫——`media` 表不存 msg_id 外键，只有 `source_key`（`<chatId>:<file_id>` 文件粒度）与 `source_ts`，命名空间冲突被隔离在 TS 镜像层（mirror.ts 的 MediaSourceFile.msgId 可空）。
 2. **未下载文件自愈**：`status='pending'`、path 空（schema CHECK 允许 available 必有 path、pending 可双空）。用户在微信点开下载后，下个心跳由镜像 upsert 转 `available`——`source_key` UNIQUE 幂等键即自愈通道，无需额外机制。
 3. **消息流文件消息恒为 link 类**：文件清单摄取（`files --chat-id` / mirrorMedia）是媒体入库的主路径，消息流侧不重复摄取（49 类型≠链接解析）。已在 ERROR-REFERENCE 备案（ERR-FIDX-002）。
+
+## 11. v0.6 增补（修订与标记，2026-10-20 定稿）+ 架构约束
+
+- 新增 `report_revision` / `marking` 两表（不可变事实，`source_key` 幂等冲突跳过）+
+  `v_marking_latest` / `v_report_revised` 两视图；uv 4→5，既有表零改动。明细见 CHANGES-v0.6.md。
+- T4 语义钉死：`upsertReport` 冲突保留既有 status（final 不降级、draft 不自动 final）。
+- **架构约束（单一查询副本）**：marking 与 report_revision 的唯一查询副本是 knowledge.db；
+  每群库/插件侧不得再建同名持久表（防双写漂移），事件产生后直接走 mirror 通道，失败留队列重放。
+- 接线优先级：marking 先（跨群聚合硬需求）、report_revision 后（单报告维度，可推迟）。
