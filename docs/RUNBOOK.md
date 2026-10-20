@@ -468,6 +468,11 @@ Accessibility Inspector 确认元素层级）。**实证结论回填此处：___
   低于该阈值才跳过本轮让路（`user_active`）；≥阈值或设 0 → 不让路，直接抢前台发送。
   **日常单日报场景可设 0**（每天一次的抢前台可接受）；默认 10 适合频繁发送场景（绝不打断打字）；
 - **失败重试**：attempts 落盘，≥3 次转 `failed` 不再重试（防风暴）；
+- **OCR 合规闸时代已废弃（10-15 ~ 10-20，2026-10-20 移除）**：原 wechat-ui open/read
+  定位+OCR 标题核验闸（locateGate/chatVerifyGate，需屏幕录制 TCC）整体移除——由
+  ⌘⇧W+⌘F 定位键序 + DB 回读兜底（readbackChatId）替代；**屏幕录制 TCC 不再被流水线
+  需要**（仅辅助功能 TCC）。发送原语只剩键盘流程一条路（WechatUiSender/Config
+  sendMethod/composerTop/chatVerifyRetries 同批移除）。
 - **发送流程替换（用户指定键序，2026-10-19）**：目标改为**大号对话**（Config
   `sendTargetChat`，默认 '老大'；搜索词）。键序：剪贴板=消息文本 → **Cmd+Shift+W** 调出微信
   → Cmd+F 搜索框 → 键入搜索词（`sendSearchViaClipboard=true` 回退剪贴板方案，防 CJK IME

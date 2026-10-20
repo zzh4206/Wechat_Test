@@ -164,7 +164,6 @@ export interface PluginConfig {
   /** 发送 dry_run（默认 true = keyboard 模式键序到第 8 步定位即停，不粘贴消息不回车） */
   sendDryRun: boolean
   /** 发送原语（默认 'keyboard' = 键盘模拟 + DB 回读验证；'wechat-ui' 可切回旧实现） */
-  sendMethod: string
   /** 发送 worker 扫描间隔（秒，默认 300） */
   sendIntervalSec: number
   /** DB 回读验证每次尝试前的等待秒数（默认 3；微信异步写本地库，需重试窗口消化竞态） */
@@ -190,10 +189,6 @@ export interface PluginConfig {
   schemaTwoStage: boolean
   /** 每日发送上限（默认 20） */
   maxSendsPerDay: number
-  /** wechat-ui 可执行文件（默认 'wechat-ui'；仅 sendMethod='wechat-ui' 用） */
-  wechatUiPath: string
-  /** wechat-ui --composer-top（默认 0.7；仅 sendMethod='wechat-ui' 用） */
-  composerTop: number
 }
 
 export const name = 'dsh-group-lurker'
@@ -263,7 +258,6 @@ export const Config: Schema<PluginConfig> = Schema.object({
   // —— 红线升级（2026-10-14 用户批准）：filehelper 发送 worker（全部默认保守 = 关/干跑）——
   senderEnabled: Schema.boolean().default(false).description('发送总闸（默认 false = 零发送活动）。开启前务必先完成 TCC"辅助功能"授权 + sendDryRun=true 干跑确认搜索定位'),
   sendDryRun: Schema.boolean().default(true).description('发送 dry_run（默认 true = keyboard 模式执行搜索键序到第 8 步定位会话即停，不粘贴消息不回车；人工确认定位正确后再关掉真发）'),
-  sendMethod: Schema.string().default('keyboard').description("发送原语（默认 'keyboard' = wx-chatbot 式键盘模拟 + DB 回读验证，TCC 只需辅助功能；'wechat-ui' 可切回旧 UI 校准实现）"),
   sendIntervalSec: Schema.number().default(300).description('发送 worker 消费 outbox 的扫描间隔（秒）'),
   verifyDelaySec: Schema.number().default(3).description('DB 回读验证每次尝试前的等待秒数（默认 3；微信异步写本地库，需重试窗口消化竞态）'),
   batchThreshold: Schema.number().default(120).description('大窗口分批归纳阈值（默认 120；窗口消息数超过该值时日报/人物日摘自动切批归纳再合并，避免单次大调用超时。≤阈值路径零变化）'),
@@ -281,8 +275,6 @@ export const Config: Schema<PluginConfig> = Schema.object({
   sendSearchViaClipboard: Schema.boolean().default(false).description('搜索词键入走剪贴板回退（默认 false = System Events 直接键入；CJK IME 拦截实测失败时开启）'),
     idleSkipBelowSec: Schema.number().default(10).description('用户空闲让路阈值秒（默认 10 = 系统空闲 <10s 视为正在操作→跳过本轮让路；0 = 不让路，空闲检测失效直接抢前台发送。日常单日报场景可设 0——每天一次的抢前台可接受；频繁发送建议保持 10）'),
   maxSendsPerDay: Schema.number().default(20).description('每日发送上限（默认 20；超限的当日 pending 标 skipped_quota 防风暴）'),
-  wechatUiPath: Schema.string().default('wechat-ui').description('wechat-ui 可执行文件（PATH 解析；建议绝对路径，如 /path/to/macos-wechat-export/wechat-ui）'),
-  composerTop: Schema.number().default(0.7).description('wechat-ui --composer-top（默认 0.70；务必按 UI_GUIDE 用 read --snapshot 实测校准）'),
   scheduleTestMode: Schema.boolean().default(false).description('快速测试模式（默认关）：true 且 testKindIntervalMin>0 时，每间隔分钟依次强制触发 weekly/monthly 的完整生成链路（周/月报不再等日历闸门）。测试完务必关掉，避免频繁 LLM 调用'),
   testKindIntervalMin: Schema.number().default(0).description('测试模式强制触发间隔（分钟，默认 0 = 不触发）'),
 })
@@ -447,11 +439,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
     logger,
     enabled: config.senderEnabled,
     dryRun: config.sendDryRun,
-    sendMethod: config.sendMethod === 'wechat-ui' ? 'wechat-ui' : 'keyboard',
-    maxSendsPerDay: config.maxSendsPerDay,
-    wechatUiPath: config.wechatUiPath,
-    composerTop: config.composerTop,
-    sourceToolDir: config.sourceToolDir ?? '',
+    maxSendsPerDay: config.maxSendsPerDay,    sourceToolDir: config.sourceToolDir ?? '',
     sourceDbRoot: config.sourceDbRoot ?? '',
     sourcePython: config.sourcePython,
     systemIdleSec: defaultSystemIdleSec,
@@ -463,9 +451,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
     accountGate: accountGate ?? undefined,
     intervalSec: config.sendIntervalSec,
     verifyDelaySec: config.verifyDelaySec,
-    verifyRetries: config.verifyRetries,
-    chatVerifyRetries: config.chatVerifyRetries,
-  })
+    verifyRetries: config.verifyRetries,  })
   // report 依赖 llmClient（其下才定义），先占位、llmClient 就绪后赋值
   let report: ReportService | null = null
 

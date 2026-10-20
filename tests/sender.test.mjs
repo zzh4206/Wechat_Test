@@ -38,13 +38,25 @@ function makeEnv(overrides = {}) {
     logger: overrides.logger ?? silentLogger,
     enabled: overrides.enabled ?? true,
     dryRun: overrides.dryRun ?? false,
-    sendMethod: overrides.sendMethod ?? 'wechat-ui', // 本文件沿用旧 wechat-ui 实现语义；keyboard 键序见 keyboard-sender.test.mjs
+    // 2026-10-19：发送只有键盘流程一条路（wechat-ui 录屏点击时代废弃）；键序细节见 keyboard-sender.test.mjs
     maxSendsPerDay: overrides.maxSendsPerDay ?? 20,
-    wechatUiPath: overrides.wechatUiPath ?? 'wechat-ui',
-    composerTop: overrides.composerTop ?? 0.7,
     now: overrides.now ?? FIXED_NOW,
+    sourceToolDir: overrides.sourceToolDir ?? '/fake/macos-wechat-export',
+    sourceDbRoot: overrides.sourceDbRoot ?? '/fake/wechat-db-storage',
+    sourcePython: overrides.sourcePython ?? 'python3',
+    readbackChatId: overrides.readbackChatId ?? 'wxid_target',
+    sleepMs: () => Promise.resolve(), // 键序/验证延迟不真等待
     runCommand: (file, args) => {
       spawnCalls.push({ file, args })
+      if (file === 'osascript') return Promise.resolve({ code: 0, stdout: '«class UTF8»"saved-content"', stderr: '' })
+      if (file === 'python3') {
+        // wechat_db.py 回读：默认返回含全部条目签名的消息（任意条目验证均命中）；
+        // dbReadResult 显式覆盖（用于未命中/失败语义测试）
+        const db = env.dbReadResult
+        if (db && db.stdout !== 'MATCH_FEATURE') return Promise.resolve(db)
+        const sigs = env.outbox.listOutbox().map((x) => `#l${(x.id ?? '').replace(/[^0-9a-zA-Z]/g, '').slice(0, 8)}`).join(' ')
+        return Promise.resolve({ code: 0, stdout: `{"messages":[{"content":"【lurker】x ${sigs}"}]}`, stderr: '' })
+      }
       return Promise.resolve(env.spawnResult ?? overrides.spawnResult ?? { code: 0, stdout: 'sent_ui_verified', stderr: '' })
     },
     isFrontmost: () => Promise.resolve(env.frontmost),
@@ -89,19 +101,21 @@ test('总闸：enabled=false 零活动（不调 spawn、不改 outbox）', async
   rmSync(env.dir, { recursive: true, force: true })
 })
 
-test('全流程：pending → sent，spawn 参数形态正确（--id 幂等传递 + --composer-top）', async () => {
+test('全流程：pending → sent，回读 spawn 参数形态正确（--db-root/--key-file/--chat-id）', async () => {
   const env = makeEnv()
   const e = env.outbox.appendOutbox({ kind: 'daily', title: '日报已生成', body: '关键判断 3 条', evidence_ref: 'reports/x.md' })
+  env.lastFeature = `#l${e.id.replace(/[^0-9a-zA-Z]/g, '').slice(0, 8)}`
   const r = await env.sender.processOnce()
   assert.equal(r.action, 'sent')
-  assert.equal(env.spawnCalls.length, 1)
-  const call = env.spawnCalls[0]
-  assert.equal(call.file, 'wechat-ui')
-  assert.equal(call.args[0], 'send')
-  assert.deepEqual(call.args.slice(1, 3), ['--chat', '老大'])
-  assert.ok(call.args.includes('--id'))
-  assert.equal(call.args[call.args.indexOf('--id') + 1], e.id)
-  assert.deepEqual(call.args.slice(call.args.indexOf('--composer-top'), call.args.indexOf('--composer-top') + 2), ['--composer-top', '0.7'])
+  // 键序 osascript 多次 + 回读 spawn 一次
+  const readCalls = env.spawnCalls.filter((c) => c.file === 'python3')
+  assert.equal(readCalls.length, 1)
+  assert.equal(readCalls[0].args[0], join('/fake/macos-wechat-export', 'wechat_db.py'))
+  assert.ok(readCalls[0].args.includes('--db-root'))
+  assert.ok(readCalls[0].args.includes('--key-file'))
+  const ci = readCalls[0].args.indexOf('--chat-id')
+  assert.equal(readCalls[0].args[ci + 1], 'wxid_target')
+  assert.ok(env.spawnCalls.some((c) => c.file === 'osascript' && c.args.some((a) => String(a).includes('shift down'))), 'Cmd+Shift+W 在键序中')
   const after = readOutbox(env.dir).find((x) => x.id === e.id)
   assert.equal(after.status, 'sent')
   assert.equal(after.attempts, 1)
@@ -113,7 +127,8 @@ test('dry_run：不调 send，条目转 dry_run，审计只记元数据', async 
   const e = env.outbox.appendOutbox({ kind: 'weekly', title: '周报', body: '机密正文内容', evidence_ref: 'r.md' })
   const r = await env.sender.processOnce()
   assert.equal(r.action, 'sent') // 消费完成但走 dry_run 路径
-  assert.equal(env.spawnCalls.length, 0, 'dry_run 绝不调 wechat-ui send')
+  // dry_run 键序执行到进入对话（osascript 若干），但绝不回读、绝无 python3
+  assert.equal(env.spawnCalls.filter((c) => c.file !== 'osascript').length, 0, 'dry_run 只发 osascript 键序')
   assert.equal(readOutbox(env.dir).find((x) => x.id === e.id).status, 'dry_run')
   rmSync(env.dir, { recursive: true, force: true })
 })
@@ -132,7 +147,6 @@ test('通道闸：非 filehelper 的 pending 条目直接 skip 并 error 日志�
   const sender = new SenderService({
     outbox, store, logger,
     enabled: true, dryRun: false,
-    sendMethod: 'wechat-ui',
     runCommand: (file, args) => { spawnCalls.push({ file, args }); return Promise.resolve({ code: 0, stdout: 'sent_ui_verified', stderr: '' }) },
     isFrontmost: () => Promise.resolve(true),
   })
@@ -146,18 +160,17 @@ test('通道闸：非 filehelper 的 pending 条目直接 skip 并 error 日志�
   rmSync(dir, { recursive: true, force: true })
 })
 
-test('失败重试：attempts 落盘，≥3 次转 failed 不再重试（防风暴）', async () => {
-  const env = makeEnv({ spawnResult: { code: 1, stdout: 'contact_mismatch', stderr: '' } })
+test('回读穷尽未命中（真失败）→ attempts 落盘，3 次转 failed_wrong_target 不再重试（防风暴）', async () => {
+  const env = makeEnv({ dbReadResult: { code: 0, stdout: '{"messages":[{"content":"别的消息"}]}', stderr: '' } })
   const e = env.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
-  for (let i = 1; i <= MAX_ATTEMPTS; i++) await env.sender.processOnce()
-  assert.equal(env.spawnCalls.length, MAX_ATTEMPTS)
+  const r1 = await env.sender.processOnce()
+  assert.equal(r1.action, 'failed')
   const after = readOutbox(env.dir).find((x) => x.id === e.id)
-  assert.equal(after.status, 'failed')
-  assert.equal(after.attempts, MAX_ATTEMPTS)
-  // failed 不再被消费
+  assert.equal(after.status, 'failed_wrong_target')
+  assert.equal(after.attempts, 1, '单轮内回读窗口 4 次穷尽即终态（attempts=1）')
+  // 终态不再被消费
   const r = await env.sender.processOnce()
   assert.equal(r.action, 'empty')
-  assert.equal(env.spawnCalls.length, MAX_ATTEMPTS)
   rmSync(env.dir, { recursive: true, force: true })
 })
 
@@ -168,7 +181,8 @@ test('频控：maxSendsPerDay 超限的当日 pending 标 skipped_quota', async 
     ids.push(env.outbox.appendOutbox({ kind: 'remind', title: `t${i}`, body: 'b', evidence_ref: 'x' }).id)
   }
   const r = await env.sender.processOnce()
-  assert.equal(env.spawnCalls.length, 2)
+  assert.equal(env.spawnCalls.filter((c) => c.file === 'python3').length, 2, '回读 2 次')
+  assert.ok(env.spawnCalls.filter((c) => c.file === 'osascript').length >= 18, `两条日报键序完整（实际 ${env.spawnCalls.filter((c) => c.file === 'osascript').length}）`)
   const states = Object.fromEntries(readOutbox(env.dir).map((x) => [x.id, x.status]))
   assert.equal(states[ids[0]], 'sent')
   assert.equal(states[ids[1]], 'sent')
@@ -224,7 +238,7 @@ test('start()/stop：enabled=false 为 noop；enabled=true 心跳运行并可清
   const fakeClearInterval = (handle) => { if (handle === 42) fired = -1 }
   const sender = new SenderService({
     outbox: env.outbox, store: env.store, logger: silentLogger,
-    enabled: true, dryRun: true, sendMethod: 'wechat-ui',
+    enabled: true, dryRun: true,
     runCommand: () => Promise.resolve({ code: 0, stdout: 'sent_ui_verified', stderr: '' }),
     isFrontmost: () => Promise.resolve(true),
     setInterval: fakeSetInterval,
@@ -246,9 +260,9 @@ test('sendTestSample：样例条目走完整链路 pending→sent；真实 daily
   const r = await env.sender.sendTestSample()
   assert.equal(r.action, 'sent')
   assert.ok(r.id && r.id !== real.id)
-  assert.equal(env.spawnCalls.length, 1)
-  const call = env.spawnCalls[0]
-  assert.equal(call.args[call.args.indexOf('--id') + 1], r.id, '样例用自己唯一的幂等 --id')
+  assert.ok(env.spawnCalls.length >= 10, '键盘键序完整执行（osascript 多次 + 回读 1 次）')
+  assert.ok(env.spawnCalls.some((c) => c.file === 'python3' && c.args.includes('wxid_target')), '回读目标 = readbackChatId')
+  assert.ok(!env.spawnCalls.some((c) => c.args.includes('--id')), '键盘流程无 --id（wechat-ui 幂等参数已废）')
   const sample = readOutbox(env.dir).find((x) => x.id === r.id)
   assert.equal(sample.status, 'sent')
   assert.equal(sample.kind, 'test_sample')
@@ -265,7 +279,7 @@ test('sendTestSample：dry_run 下只记审计不真发；总闸关闭时拒绝'
   const env = makeEnv({ dryRun: true })
   const r = await env.sender.sendTestSample()
   assert.equal(r.action, 'dry_run')
-  assert.equal(env.spawnCalls.length, 0)
+  assert.equal(env.spawnCalls.filter((c) => c.file !== 'osascript').length, 0, 'dry_run 只发 osascript 键序（到进入对话为止）')
   assert.equal(readOutbox(env.dir).find((x) => x.id === r.id).status, 'dry_run')
   rmSync(env.dir, { recursive: true, force: true })
 
@@ -305,10 +319,19 @@ function makeTakeFocusEnv({ allowTakeFocus, idleSec, frontmost, logger = silentL
   const spawnCalls = []
   const sender = new SenderService({
     outbox, store, logger,
-    enabled: true, dryRun: false, sendMethod: 'wechat-ui',
+    enabled: true, dryRun: false,
     allowTakeFocus,
+    sourceToolDir: '/fake/macos-wechat-export',
+    sourceDbRoot: '/fake/wechat-db-storage',
+    readbackChatId: 'wxid_target',
+    sleepMs: () => Promise.resolve(),
     runCommand: (file, args) => {
       spawnCalls.push({ file, args })
+      if (file === 'osascript') return Promise.resolve({ code: 0, stdout: '«class UTF8»"saved-content"', stderr: '' })
+      if (file === 'python3') {
+        const sigs = outbox.listOutbox().map((x) => `#l${(x.id ?? '').replace(/[^0-9a-zA-Z]/g, '').slice(0, 8)}`).join(' ')
+        return Promise.resolve({ code: 0, stdout: `{"messages":[{"content":"【lurker】x ${sigs}"}]}`, stderr: '' })
+      }
       return Promise.resolve({ code: 0, stdout: 'sent_ui_verified', stderr: '' })
     },
     isFrontmost: () => Promise.resolve(frontmost),
@@ -322,7 +345,8 @@ test('allowTakeFocus=true：微信非前台也照发（跳过前台闸），审�
   const e = env.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
   const r = await env.sender.processOnce()
   assert.equal(r.action, 'sent')
-  assert.equal(env.spawnCalls.length, 1, '非前台照发（抢前台模式）')
+  const osaSpawns = env.spawnCalls.filter((c) => c.file === 'osascript')
+  assert.ok(osaSpawns.length >= 9, '非前台照发（抢前台模式，键序完整）')
   assert.equal(readOutbox(env.dir).find((x) => x.id === e.id).status, 'sent')
   const audit = readAudit(env.dir).find((a) => a.id === e.id && a.result === 'take_focus_sent')
   assert.ok(audit, '审计可区分两种模式（transmitted 之外应有 take_focus_sent 行）')
@@ -346,33 +370,35 @@ test('allowTakeFocus=true：空闲 <10s（用户正在打字）仍跳过并计�
   rmSync(env.dir, { recursive: true, force: true })
 })
 
-test('发送前失败（spawn 报错）→ 保持 pending 计 attempts，可整条重发（与验证失败解耦）', async () => {
-  const env = makeEnv({ spawnResult: { code: 1, stdout: '', stderr: 'ui boom' } })
+test('发送前失败（非前台闸）→ 保持 pending 不计 attempts，环境恢复后整条重发（与验证失败解耦）', async () => {
+  const env = makeEnv()
+  env.frontmost = false
   const e = env.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
   const r = await env.sender.processOnce()
-  assert.equal(r.action, 'failed')
+  assert.equal(r.action, 'not_frontmost')
   const after = readOutbox(env.dir).find((x) => x.id === e.id)
   assert.equal(after.status, 'pending', '消息没打出去 → 保持 pending 可整条重发')
-  assert.equal(after.attempts, 1)
+  assert.equal(after.attempts ?? 0, 0, '发送前失败不计 attempts')
   assert.equal(after.transmittedAt, undefined, '未 transmitted')
-  // 恢复后下轮整条重发成功
-  env.spawnResult = { code: 0, stdout: 'sent_ui_verified', stderr: '' }
+  // 环境恢复后下轮整条重发成功
+  env.frontmost = true
   const r2 = await env.sender.processOnce()
   assert.equal(r2.action, 'sent')
   assert.equal(readOutbox(env.dir).find((x) => x.id === e.id).status, 'sent')
   rmSync(env.dir, { recursive: true, force: true })
 })
 
-test('sent_pending_verify 历史条目：消费循环视作已发送——绝不重发（wechat-ui 无回读阶段则原样保留）', async () => {
+test('sent_pending_verify 历史条目：消费循环视作已发送——绝不重发', async () => {
   const env = makeEnv()
   const e = env.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
   // 模拟"已发送但验证中断"的落盘形态
   env.outbox.updateSendState(e.id, { status: 'sent_pending_verify', transmittedAt: Date.now(), verifyAttempts: 1 })
   const spawnsBefore = env.spawnCalls.length
+  const osaBefore = env.spawnCalls.filter((c) => c.file === 'osascript').length
   const r = await env.sender.processOnce()
-  assert.equal(r.action, 'empty', 'spv 条目不进 pending 消费队列')
-  assert.equal(env.spawnCalls.length, spawnsBefore, 'spawn 零新增——绝不重发')
-  assert.equal(readOutbox(env.dir).find((x) => x.id === e.id).status, 'sent_pending_verify', 'wechat-ui 无回读阶段，原样保留')
+  assert.equal(r.action, 'sent', '验证通过 → sent')
+  assert.equal(env.spawnCalls.filter((c) => c.file === 'osascript').length, osaBefore, '零键序新增——绝不重发')
+  assert.equal(readOutbox(env.dir).find((x) => x.id === e.id).status, 'sent', '仅补验证即转 sent')
   rmSync(env.dir, { recursive: true, force: true })
 })
 
