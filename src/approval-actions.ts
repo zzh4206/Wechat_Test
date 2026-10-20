@@ -27,7 +27,7 @@ export interface ApprovalActionsDeps {
   notify: ApprovalNotify
   logger: StoreLogger
   /** regen 补发队列入队钩子（阶段三泛化后由接线层注入；缺省 = reportRegen 返回 false） */
-  enqueueReportRegen?: (chatId: string, dateKey: string, kind: ReportKind) => boolean
+  enqueueReportRegen?: (chatId: string, dateKey: string, kind: ReportKind, reason?: 'manual' | 'wrong_account') => boolean
   now?: () => number
 }
 
@@ -126,7 +126,7 @@ export class ApprovalActions {
       this.deps.logger.warn('approval-actions: reportRegen 未接 regen 队列——请求被忽略')
       return false
     }
-    const ok = this.deps.enqueueReportRegen(chatId, dateKey, kind)
+    const ok = this.deps.enqueueReportRegen(chatId, dateKey, kind, 'manual')
     return this.receipt(ok, 'approval', '补生成已排程', ok ? `${kind} ${dateKey}（${chatId}）已入补生成队列` : `${kind} ${dateKey} 已在队列中（去重）`)
   }
 }

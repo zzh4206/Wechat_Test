@@ -84,3 +84,48 @@ test('补发链路：backfillDateKey 锚定窗口（含正号登录后同步的�
   assert.equal(metas[0].status, 'ok')
   rmSync(dir, { recursive: true, force: true })
 })
+
+test('泛化：weekly/monthly kind + manual reason + 按 (kind,dateKey,chatId) 去重', () => {
+  const dir = resolve(mkdtempSync(join(tmpdir(), 'regenq3-')))
+  const store = new Store(dir, { warn() {}, error() {} })
+  store.ensureDir('.')
+  const q = new RegenQueue({ store, logger: { warn() {}, error() {} } })
+  assert.equal(q.enqueue(CHAT, DAY, 1, 'weekly', 'manual'), 'queued')
+  assert.equal(q.enqueue(CHAT, DAY, 2, 'monthly', 'manual'), 'queued')
+  assert.equal(q.enqueue(CHAT, DAY, 3, 'daily', 'wrong_account'), 'queued')
+  // 同键去重按 kind 分别：weekly 同键再入 → deduped
+  assert.equal(q.enqueue(CHAT, DAY, 4, 'weekly', 'manual'), 'deduped')
+  // 同 dateKey 不同 chatId 不去重
+  assert.equal(q.enqueue('other@chatroom', DAY, 5, 'weekly', 'manual'), 'queued')
+  assert.equal(q.list().length, 4)
+  assert.equal(q.list().every((e) => ['daily', 'weekly', 'monthly'].includes(e.kind)), true)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('泛化消费：weekly/monthly 补生成按 kind 调 generateReport（月报 dateKey 锚定 1 号既有裁定）', async () => {
+  const dir = resolve(mkdtempSync(join(tmpdir(), 'regenq4-')))
+  const store = new Store(dir, { warn() {}, error() {} })
+  store.ensureDir('.')
+  const q = new RegenQueue({ store, logger: { warn() {}, error() {} } })
+  const outbox = new (await import('../lib/outbox.js')).Outbox({ store, now: () => 1000 })
+  const genCalls = []
+  const deps = {
+    queue: q,
+    report: { generateReport: async (chatId, kind, asOf, backfill) => { genCalls.push([chatId, kind, backfill]); return { status: 'ok', path: 'p', judgmentCount: 1, topicCount: 0, messageCount: 3 } } },
+    groupStore: { getReportMetas: () => [] },
+    outbox, store,
+    logger: { warn() {}, error() {} },
+    notify: () => {},
+    audit: () => {},
+    now: () => 5000,
+  }
+  const { processRegenHead } = await import('../lib/regen-processor.js')
+  q.enqueue(CHAT, '2026-06-08', 1, 'weekly', 'manual')
+  const r1 = await processRegenHead(deps)
+  assert.equal(r1.action, 'regenerated')
+  assert.deepEqual(genCalls[0], [CHAT, 'weekly', '2026-06-08'])
+  q.enqueue(CHAT, '2026-06-01', 2, 'monthly', 'manual')
+  await processRegenHead(deps)
+  assert.deepEqual(genCalls[1], [CHAT, 'monthly', '2026-06-01'], '月报补发锚定当月 1 号（backfill 语义）')
+  rmSync(dir, { recursive: true, force: true })
+})

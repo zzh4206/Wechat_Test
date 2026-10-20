@@ -22,7 +22,7 @@ export const REGEN_EMPTY_MAX_ATTEMPTS = 2 // 空产出重试上限（共 1+2=3 �
 
 export interface RegenProcessorDeps {
   queue: RegenQueue
-  report: { generateReport: (chatId: string, kind: 'daily', asOf?: number, backfillDateKey?: string) => Promise<{ status: string; path: string | null; judgmentCount: number; topicCount: number; messageCount: number }> }
+  report: { generateReport: (chatId: string, kind: 'daily' | 'weekly' | 'monthly', asOf?: number, backfillDateKey?: string) => Promise<{ status: string; path: string | null; judgmentCount: number; topicCount: number; messageCount: number }> }
   groupStore: { getReportMetas: (chatId: string, opts: { kind?: 'daily' | 'weekly' | 'monthly'; limit?: number }) => Array<{ date: string; status: string }> }
   outbox: Outbox
   store: Store
@@ -55,7 +55,7 @@ export async function processRegenHead(deps: RegenProcessorDeps): Promise<RegenP
 
   let rr
   try {
-    rr = await deps.report.generateReport(chatId, 'daily', deps.now(), dateKey)
+    rr = await deps.report.generateReport(chatId, head.kind, deps.now(), dateKey)
   } catch (error) {
     // 环境类失败：放回队首，不消耗重试次数（与熄屏 deferred 同语义）
     deps.queue.pop()
@@ -85,6 +85,6 @@ export async function processRegenHead(deps: RegenProcessorDeps): Promise<RegenP
   deps.queue.pop()
   deps.audit({ result: 'regen_regenerated', chat_id: chatId, date_key: dateKey, status: rr.status, messageCount: rr.messageCount })
   await deps.notify?.(`补发日报已生成（${chatId} ${dateKey}）`, `关键判断 ${rr.judgmentCount} 条，全文见 outbox 存档`)
-  deps.outbox.appendOutbox({ kind: 'daily', title: `补发日报 ${dateKey}`, body: `补发 ${dateKey} 日报（错号期间空报告已修正）`, evidence_ref: rr.path ?? '' })
+  deps.outbox.appendOutbox({ kind: 'daily', title: `补发${head.kind === 'weekly' ? '周报' : head.kind === 'monthly' ? '月报' : '日报'} ${dateKey}`, body: `补发 ${dateKey} 报告（错号期间空报告已修正）`, evidence_ref: rr.path ?? '' })
   return { action: 'regenerated', entry: head }
 }

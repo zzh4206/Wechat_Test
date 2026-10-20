@@ -19,11 +19,14 @@ export const REGEN_QUEUE_REL = 'regen-queue.json'
 /** 上限 31 条（一个月的日报量），超限丢弃最旧 */
 export const REGEN_QUEUE_MAX = 31
 
+export type RegenKind = 'daily' | 'weekly' | 'monthly'
+export type RegenReason = 'wrong_account' | 'manual'
+
 export interface RegenEntry {
   dateKey: string
-  kind: 'daily'
+  kind: RegenKind
   chatId: string
-  reason: 'wrong_account'
+  reason: RegenReason
   queuedAt: number
   /** 生命周期：pending_regen → done（出队）；empty_confirmed 终态（出队） */
   status: 'pending_regen'
@@ -53,7 +56,7 @@ export class RegenQueue {
             typeof e === 'object' && e !== null &&
             typeof (e as RegenEntry).dateKey === 'string' &&
             typeof (e as RegenEntry).chatId === 'string' &&
-            (e as RegenEntry).kind === 'daily',
+            (e as RegenEntry).kind === 'daily' || (e as RegenEntry).kind === 'weekly' || (e as RegenEntry).kind === 'monthly',
         )
         for (const e of this.entries) if (e.status === undefined) e.status = 'pending_regen'
       }
@@ -71,14 +74,14 @@ export class RegenQueue {
     return this.entries
   }
 
-  has(chatId: string, dateKey: string, kind: 'daily' = 'daily'): boolean {
+  has(chatId: string, dateKey: string, kind: RegenKind = 'daily'): boolean {
     return this.entries.some((e) => e.chatId === chatId && e.dateKey === dateKey && e.kind === kind)
   }
 
   /** 同键去重；超限丢弃最旧并 warn */
-  enqueue(chatId: string, dateKey: string, now: number, kind: 'daily' = 'daily'): RegenEnqueueResult {
+  enqueue(chatId: string, dateKey: string, now: number, kind: RegenKind = 'daily', reason: RegenReason = 'wrong_account'): RegenEnqueueResult {
     if (this.has(chatId, dateKey, kind)) return 'deduped'
-    this.entries.push({ chatId, dateKey, kind, reason: 'wrong_account', queuedAt: now, status: 'pending_regen', regenAttempts: 0 })
+    this.entries.push({ chatId, dateKey, kind, reason, queuedAt: now, status: 'pending_regen', regenAttempts: 0 })
     let result: RegenEnqueueResult = 'queued'
     while (this.entries.length > this.max) {
       const dropped = this.entries.shift()
@@ -89,13 +92,14 @@ export class RegenQueue {
     return result
   }
 
+
   /** FIFO 队首（不改队列）；空 → null */
   peek(): RegenEntry | null {
     return this.entries[0] ?? null
   }
 
   /** 记录空产出重试计数（跨重启保留） */
-  setRegenAttempts(chatId: string, dateKey: string, n: number, kind: 'daily' = 'daily'): void {
+  setRegenAttempts(chatId: string, dateKey: string, n: number, kind: RegenKind = 'daily'): void {
     const e = this.entries.find((x) => x.chatId === chatId && x.dateKey === dateKey && x.kind === kind)
     if (!e) return
     e.regenAttempts = n
