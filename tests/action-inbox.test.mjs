@@ -61,12 +61,28 @@ function makeEnv({ resolveTarget } = {}) {
 
 const line = (over = {}) => JSON.stringify({ actionId: 'a1', ts: 1, chatId: CHAT, type: 'task.confirm', targetId: 5, ...over })
 
+test('前端通道的审批修订一律记 source=web（门面缺省 chat，漏传会把前端审批记成对话框）', async () => {
+  const env = makeEnv()
+  const types = [
+    ['task.confirm'], ['task.cancel'], ['task.set_deadline', { deadline: 2e12 }], ['task.postpone', { deadline: 2e12 }],
+    ['task.rewrite', { text: '新文本' }], ['event.confirm'], ['promise.confirm'], ['promise.cancel'], ['promise.close'],
+  ]
+  env.store.writeText(ACTIONS_REL, types.map(([type, params], i) => line({ actionId: `s${i}`, type, params })).join('\n') + '\n')
+  // task.rewrite 依赖 updateTaskText：补上 fake
+  env.svc.task.updateTaskText = async () => true
+  await env.inbox.poll()
+  const sources = env.calls.filter(c => c[0] === 'revision').map(c => c[5])
+  assert.equal(sources.length, types.length)
+  assert.deepEqual([...new Set(sources)], ['web'])
+  rmSync(env.dir, { recursive: true, force: true })
+})
+
 test('正常路径：task.confirm 分发 + 结果文件 + 审计元数据 + 水位推进', async () => {
   const env = makeEnv()
   env.store.writeText(ACTIONS_REL, line() + '\n')
   const n = await env.inbox.poll()
   assert.equal(n, 1)
-  assert.deepEqual(env.calls, [['task.confirm', CHAT, 5], ['revision', CHAT, 'task', 5, '任务「#5」确认为真', 'chat']], '审批成功 → 修订接线（P0 返工）')
+  assert.deepEqual(env.calls, [['task.confirm', CHAT, 5], ['revision', CHAT, 'task', 5, '任务「#5」确认为真', 'web']], '审批成功 → 修订接线（P0 返工），来源记为前端')
   const results = readFileSync(join(env.dir, ACTION_RESULTS_REL), 'utf8').trim().split('\n').map(JSON.parse)
   assert.deepEqual(results, [{ actionId: 'a1', ok: true, code: 'ok', ts: 1000 }])
   const audit = readFileSync(join(env.dir, WEB_ACTIONS_AUDIT_REL), 'utf8').trim().split('\n').map(JSON.parse)
