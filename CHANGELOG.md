@@ -8,6 +8,8 @@
 
 ### Added
 
+- 成本治理 C1（失败退避 + 熔断 + 错误可见，依据 `docs/COST-ANALYSIS-2026-10-21.md` §3 根因链）：每群新增持久化状态 `groups/<chatId>/distill-state.json`（`failStreak` / `nextAttemptAt` / `lastSuccessAt` / 增量水位 / 熔断告警标记），`tryDistill` 入口先查 `nextAttemptAt`，退避窗口内直接返回、**不触发 LLM**；连续失败按 `min(30min, 1min×2^(k-1))` 退避，连续 5 次失败熔断 1 小时并经 notifier 告警一次（`distill-circuit-open`，dry_run 语义由 SystemNotifier 保持，未注入则静默）；`tick()` 判据改用 `nextAttemptAt` / `lastSuccessAt`（`lastDistill` 内存 Map 退役）。观测侧 `errKindOf` 由 `timeout|other` 细分为 `timeout / rate_limit / auth / server / bad_request / other`（timeout 优先匹配，对半切分判据不变），`llm_call` JSONL 增可选 `errMsg`（`redactSecretLike` 脱敏 + 截断 160 字符，仅失败行）
+- 成本治理 C2（增量水位，去重复提炼）：`tryDistill` 取 snapshot 后按水位过滤，只把 `lastDistilledMsgTs/Id` 之后的新消息送进 LLM，过滤后为空不调用；水位在成功提炼后推进（部分批失败时冻结在连续成功前缀末尾，失败批消息下次重送）；与 C1 同文件持久化，重启后仍生效。无水位历史群首轮全量一次
 - 前端工作台 FE-3「排入发件箱」：报告详情页可把一份报告排入 outbox，条目与定时报告同形（kind=周期、evidence_ref=报告路径、标题带「（前端补推）」、正文只含修订数），之后完全走既有 sender 链路（四道闸、配额、回读验证不变）。新增插件配置 `webOutboxEnabled`（默认 false）：关闭时收件箱不注入入队函数、`report.toOutbox` 回执 `unsupported`，web 侧按钮置灰并回 409；同一报告 10 分钟内重复排入回执 `duplicate`。新模块 `src/report-outbox.ts`；启用步骤见 RUNBOOK §14.5
 - 前端工作台 FE-3（报告操作，均不发送）：报告详情页新增「定稿」「重新生成」。插件收件箱新增动作 `report.finalize`（draft → final 单向，`KnowledgeDao.finalizeReport` → Store 透传，记一条 `status` 修订；已定稿回执 `status_conflict`、未启用知识库镜像回执 `unsupported`），对话框通道同步暴露 `reportFinalize`；前端开放 `report.finalize` / `report.regen`，参数 `{kind, dateKey}` 两侧同口径校验（周报须周一、月报须 1 号）。重新生成只入手动重跑队列、不进发件箱。「排入发件箱」另行实施
 - 前端工作台 FE-2（审批收件箱）：「审批」页列出各白名单群待确认的任务/承诺/事件、无时限任务与进行中事项，带证据预览与前后文；可确认、取消、完成、定时间、兑现、关闭，「人员关注」页可关注/取消关注成员。提交经 `POST /api/actions` 追加到 `web/actions.jsonl`（web 进程唯一写入点 `web/lib/actions.mjs`，拒绝符号链接），插件收件箱执行后页面轮询回执显示结果。写动作要求共享 token（`LURKER_WEB_TOKEN` = `webActionsToken`，web 进程比对清单里的 token 指纹，不一致或插件未配 token 即只读）、插件收件箱开启（清单新增 `actionsEnabled` / `operator`）、本服务 Origin 与 JSON 请求体；审计对齐：动作行带 `operator`，插件配置了 token 时不一致即回执 `operator_mismatch` 不执行、审计另记 `claimedOperator`——审计 operator 一定对应浏览器实际使用的 token；web-boundary 哨兵加钉动作模块只许追加写。启动与开启方法见 RUNBOOK §14
@@ -22,6 +24,7 @@
 
 ### Fixed
 
+- 提炼器重试风暴（10-20 单群 ¥34.87 的元凶）：旧实现失败路径既不更新 `lastDistill`、也不清 `counters`，`tick()` 又对从未成功的群每 30s 必触发，两路叠加成"每条新消息跑一轮全量提炼"——单群一天 1948 次调用、93% 失败。现改为失败只记账并退避（失败**不消费**消息计数，是否真调 LLM 只由 `nextAttemptAt` 决定），状态跨重启持久化；同时 `tick()` 不再依赖内存 Map
 - 收件箱 `report.regen` 去重回执：同一报告已在重跑队列时原被映射为 `not_found`（「目标不存在」），改为 `duplicate`
 - 补发队列手动重跑（reason=`manual`，对话框/前端「重新生成」）：原消费端不看 reason——已有正常报告时被判 satisfied 直接出队（重跑无效）；只在日报调度 tick 且配置了账号闸时才处理（最长等一天，未配账号闸永不处理）；生成后自动创建 outbox 条目进发送链路（重跑即发送）。改为独立轮询 `startManualRegen` 处理手动条目：不做 satisfied 检查、空产出不重试、**不进 outbox**，错号在线时跳过本轮；错号补发（`wrong_account`）语义不变，且不再被排在前面的手动条目阻塞。顺带修正错号补发按条目周期处理：satisfied 检查原固定查日报 meta、重试计数原按 daily 落盘（周报条目会原地无限重试）、outbox kind/标题原固定为日报；`regen-queue.json` 载入过滤的运算优先级错误（缺字段的 weekly/monthly 坏行被放行），旧版无 reason 条目视为错号补发
 - 前端收件箱回执：前端动作调审批门面时没传 `source`，落到缺省 `'chat'`，前端审批在修订段被记成「来源：对话框」——改为显式传 `'web'`；生产接线没给 `ActionInbox` 注入 `resolveTarget`，已处理过的目标一律回 `not_found`（且 `event.*` 被当任务 id 查）——`createApprovalWiring` 新增 `resolveInboxTarget` 并注入，按 task/promise/event 区分，已处理过的回 `status_conflict`

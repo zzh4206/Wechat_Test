@@ -100,6 +100,8 @@ pnpm add file:/path/to/2水群
 ```sh
 ls ~/.dsh/dsh-group-lurker
 # groups/<chatId>/insights.jsonl   每群提炼产出（引用 ≤50 字，无消息全文）
+# groups/<chatId>/llm-calls.jsonl  每次 LLM 调用一行（模型/tokens/费用/errKind/errMsg；失败行含脱敏错误摘要）
+# groups/<chatId>/distill-state.json 提炼器状态（失败退避/熔断/增量水位；C1+C2）
 # groups/<chatId>/cursor.json     读取游标（只记消息 id，不记内容）
 # reports/YYYY-MM-DD.md           每日日报
 # scheduler/state.json            调度器已触发时点（只记 kind/时间戳，不记内容）
