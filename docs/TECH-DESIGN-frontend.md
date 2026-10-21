@@ -1,9 +1,17 @@
 # 技术设计：本地前端工作台（报告回溯 + 待审批收件箱）
 
-- 版本：v0.1（草案）
-- 状态：**待确认**（§3 架构选型、§11 待决问题需维护者拍板后再派工）
-- 数据层依据：[`0数据格式/`](../0数据格式/README.md)（schema v0.4）、`src/group-store.ts`（每群库）
+- 版本：v0.1（草案，2026-10-21 入库；正文保持 v0.1 原貌，仅分期编号按 [REF-prefixes.md](REF-prefixes.md) 改为 FE-N）
+- 状态：§3 方案 B 已采纳；插件侧服务面（FE-2 的 ActionInbox / ApprovalActions）已落地，web 进程待实施
+- 数据层依据：[`0数据格式/`](../0数据格式/README.md)（本稿写于 schema v0.4，现行为 v6）、`src/group-store.ts`（每群库）
 - 安全依据：[SECURITY-TEST-PLAN.md](SECURITY-TEST-PLAN.md) §0 五条红线
+
+> **实施以后续文档为准**：本稿是讨论起点，下列内容已被后续设计/实现细化或取代——
+>
+> - 动作通道硬约定（字节偏移水位、回执码、`webActionsToken` 共享 token 与 operator 审计）：[RUNBOOK.md](RUNBOOK.md) §13；本稿 §6.2「启动时生成随机 token」以 RUNBOOK 为准
+> - 动作白名单与门面结构（含 `task.mark` / `person.follow` 等新增动作）：[TECH-DESIGN-confirm-loop.md](TECH-DESIGN-confirm-loop.md)；本稿 §5 表仅作背景
+> - 审批/标记后的报告修订流、`report_revision` / `marking` 表：[DESIGN-approval-marking.md](DESIGN-approval-marking.md)
+> - §11-Q2 已决：`upsertReport` 冲突时保持既有 status（T4 裁定，final 不再被打回 draft）
+> - §11-Q3 已决：`regen-queue` 已泛化 `kind`（daily/weekly/monthly）与 `reason`（`manual`）
 
 ---
 
@@ -26,9 +34,9 @@
 
 | 期 | 内容 |
 |---|---|
-| 一期 | 只读回溯：报告日历/列表/详情、资料库、媒体清单、人员关注摘要 |
-| 二期 | 审批收件箱：任务/承诺/事件的确认、取消、完成、改 deadline |
-| 三期 | 报告操作：定稿（draft→final）、请求重新生成、把某份报告排入 outbox |
+| FE-1 | 只读回溯：报告日历/列表/详情、资料库、媒体清单、人员关注摘要 |
+| FE-2 | 审批收件箱：任务/承诺/事件的确认、取消、完成、改 deadline |
+| FE-3 | 报告操作：定稿（draft→final）、请求重新生成、把某份报告排入 outbox |
 | 不做 | 手机端直连（见 §11-Q4）；在前端内触发 LLM 对话；在前端编辑报告正文；任何发送 |
 
 ## 2. 数据源盘点
@@ -47,7 +55,7 @@
 | 人员关注摘要 | `<stateDir>/digests/<chatId>/<pid>/<date>.md` | 只读文件 |
 | 报告生成元数据 | 同每群库 · `report_meta` | 只读 SQL |
 
-`knowledge.db` 路径取插件配置 `sqlitePath`（留空 = `~/WeChat/1数据/knowledge.db`；`'off'` 时 一期 回溯不可用，前端给出提示）。
+`knowledge.db` 路径取插件配置 `sqlitePath`（留空 = `~/WeChat/1数据/knowledge.db`；`'off'` 时 FE-1 回溯不可用，前端给出提示）。
 
 结论：**回溯以 `0数据格式` 为准设计；审批直接读每群库，不为它扩 schema**（理由见 §11-Q1）。
 
@@ -138,7 +146,7 @@ web/
 | 页面 | 要点 |
 |---|---|
 | 报告日历 | 月视图，格子上标 日/周/月 三种角标；顶部切群（含「聚合」）；点格子进详情 |
-| 报告详情 | 左侧正文，右侧同群前后日期快速切换；三期 加「定稿」「重新生成」「排入发件箱」 |
+| 报告详情 | 左侧正文，右侧同群前后日期快速切换；FE-3 加「定稿」「重新生成」「排入发件箱」 |
 | 对比视图 | 同群两期报告并排（周报对周报、月报对月报） |
 | 审批收件箱 | 按群分组，卡片显示语句、置信度、识别 deadline、证据片段；操作：确认 / 取消 / 改时间；无 deadline 任务高亮「待定时间」 |
 | 人员关注 | 选群 → 选人 → 按日期翻看个人摘要 |
@@ -152,13 +160,13 @@ web/
 
 | type | 调用 | 期 |
 |---|---|---|
-| `task.confirm` / `task.cancel` / `task.complete` | `taskRecognition.confirmTask / cancelTask / completeTask` | 二期 |
-| `task.setDeadline` | `groupStore.updateTaskDeadline(chatId, id, deadline, 1)`（人工指定 → 置信度 1） | 二期 |
-| `event.confirm` | `taskRecognition.confirmEvent` | 二期 |
-| `promise.confirm` / `promise.cancel` / `promise.fulfilled` / `promise.close` | `promiseRecognition.confirmPromise / cancelPromise / confirmFulfilled / closePromise` | 二期 |
-| `report.finalize` | `KnowledgeDao` 新增 `setReportStatus(id, 'final')` | 三期 |
-| `report.regen` | `regenQueue.enqueue`（需先泛化，见 §11-Q3） | 三期 |
-| `report.toOutbox` | `outbox.appendOutbox`（之后仍经 sender 四道闸，dryRun 默认生效） | 三期 |
+| `task.confirm` / `task.cancel` / `task.complete` | `taskRecognition.confirmTask / cancelTask / completeTask` | FE-2 |
+| `task.setDeadline` | `groupStore.updateTaskDeadline(chatId, id, deadline, 1)`（人工指定 → 置信度 1） | FE-2 |
+| `event.confirm` | `taskRecognition.confirmEvent` | FE-2 |
+| `promise.confirm` / `promise.cancel` / `promise.fulfilled` / `promise.close` | `promiseRecognition.confirmPromise / cancelPromise / confirmFulfilled / closePromise` | FE-2 |
+| `report.finalize` | `KnowledgeDao` 新增 `setReportStatus(id, 'final')` | FE-3 |
+| `report.regen` | `regenQueue.enqueue`（需先泛化，见 §11-Q3） | FE-3 |
+| `report.toOutbox` | `outbox.appendOutbox`（之后仍经 sender 四道闸，dryRun 默认生效） | FE-3 |
 
 处理规约：
 
@@ -224,9 +232,9 @@ web/
 
 | 期 | 交付 | 验收 |
 |---|---|---|
-| 一期 | `web/` 只读服务 + 日历/详情/资料/人员页 + web-boundary 哨兵 | sample.db 上全页面可用；安全用例全过 |
-| 二期 | ActionInbox + 收件箱页 | 合成库上 确认→生效 闭环；`learned_pattern` 被登记 |
-| 三期 | 定稿、重新生成、排入发件箱 | 定稿状态不被下次镜像覆盖（§11-Q2）；toOutbox 在 dryRun 下只落 outbox |
+| FE-1 | `web/` 只读服务 + 日历/详情/资料/人员页 + web-boundary 哨兵 | sample.db 上全页面可用；安全用例全过 |
+| FE-2 | ActionInbox + 收件箱页 | 合成库上 确认→生效 闭环；`learned_pattern` 被登记 |
+| FE-3 | 定稿、重新生成、排入发件箱 | 定稿状态不被下次镜像覆盖（§11-Q2）；toOutbox 在 dryRun 下只落 outbox |
 
 ## 10. 需同步的文档
 
