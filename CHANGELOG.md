@@ -6,6 +6,11 @@
 
 ## [Unreleased]
 
+### Changed
+
+- 报告修订落位规则（用户裁决，文档）：标记写「操作当天」日报（工作流演化），审批写「出身日」日报（现状不变）；修订行时间戳=操作时刻。见 `docs/ANALYSIS-2026-10-21-report-cutoff-window.md` §六
+- **直推记录**：`fix/report-placement-doc` 快进合并进 main 后以 `--no-verify` 直推（2026-10-22，分支闸门 `3901fcc` 的紧急直推例外）——原因：仅一份文档修正，且需避免与 `llm/synthetic-bench` 分支冲突
+
 ### Added
 
 - 成本治理 C1（失败退避 + 熔断 + 错误可见，依据 `docs/COST-ANALYSIS-2026-10-21.md` §3 根因链）：每群新增持久化状态 `groups/<chatId>/distill-state.json`（`failStreak` / `nextAttemptAt` / `lastSuccessAt` / 增量水位 / 熔断告警标记），`tryDistill` 入口先查 `nextAttemptAt`，退避窗口内直接返回、**不触发 LLM**；连续失败按 `min(30min, 1min×2^(k-1))` 退避，连续 5 次失败熔断 1 小时并经 notifier 告警一次（`distill-circuit-open`，dry_run 语义由 SystemNotifier 保持，未注入则静默）；`tick()` 判据改用 `nextAttemptAt` / `lastSuccessAt`（`lastDistill` 内存 Map 退役）。观测侧 `errKindOf` 由 `timeout|other` 细分为 `timeout / rate_limit / auth / server / bad_request / other`（timeout 优先匹配，对半切分判据不变），`llm_call` JSONL 增可选 `errMsg`（`redactSecretLike` 脱敏 + 截断 160 字符，仅失败行）
