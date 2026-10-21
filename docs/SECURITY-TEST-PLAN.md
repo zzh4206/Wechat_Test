@@ -98,6 +98,7 @@
 | 本机 Web 服务：白名单 fail-closed | R2 | `web-server.test`（清单缺失/为空 503；白名单外群 403、按 id 枚举读不到） | ✅ | — |
 | 本机 Web 服务：正文 XSS | R4 | `web-server.test`（`<script>` 只作文字、`javascript:` 链接降级）+ `web-boundary.test`（public/ 禁 innerHTML 类原语、无内联脚本） | ✅ | — |
 | 本机 Web 服务：写通道（POST /api/actions） | R2/R3 | `web-inbox.test`（必须带本服务 Origin、JSON 类型、共享 token 且插件收件箱开启；类型/群/参数白名单；超大/损坏请求体；actionId 服务端生成；symlink 拒写；只多出 web/actions.jsonl）+ `web-boundary.test`（actions.mjs 只许一处追加写、禁截断/改写） | ✅ | — |
+| 前端「排入发件箱」不新增发送路径 | R1 | `report-outbox.test`（开关关时插件拒绝零入队；条目与定时报告同形、不含报告正文；入队后经真实 SenderService：总闸关零活动、dryRun 只到进入对话；接线只在 `webOutboxEnabled` 时注入、配置默认 false）+ `web-inbox.test`（web 侧 409；手写 actions 行绕过 web 仍被插件拒） | ✅ | — |
 | 本机 Web 服务：与发送出口隔离 | R1/R3 | `web-boundary.test`（只 import node: 与 web/ 内模块、无子进程/出网、FE-1 零写原语、listen 只认 127.0.0.1）+ `web-server.test`（零写入快照） | ✅ | — |
 
 ---
