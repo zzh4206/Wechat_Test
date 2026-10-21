@@ -318,7 +318,7 @@ test('⑤ 增量水位：先 25 条、再来 5 条 → 第二次只送 5 条；�
   assert.equal(env.calls.length, 1)
   const first = messagesIn(env.calls[0])
   assert.equal(first.length, 25, '首轮全量（无水位历史群不特殊处理）')
-  assert.equal(JSON.parse(first[0].text), '消息0')
+  assert.equal(first[0].text, '消息0', 'C3 wire：text 是原文（只编码一层）')
 
   // 再来 5 条新消息（ts 1025..1029）
   seed(env.buffer, 'g1', 5, { startTs: 1000, from: 25 })
@@ -327,7 +327,7 @@ test('⑤ 增量水位：先 25 条、再来 5 条 → 第二次只送 5 条；�
   const second = messagesIn(env.calls[1])
   assert.equal(second.length, 5, 'C2：只送水位之后的新消息（旧 25 条不重送）')
   assert.deepEqual(
-    second.map((m) => JSON.parse(m.text)),
+    second.map((m) => m.text),
     ['消息25', '消息26', '消息27', '消息28', '消息29'],
     '送的正是新 5 条，序号连续且无重复',
   )
@@ -393,7 +393,7 @@ test('⑥ 重启：新实例从 json 恢复退避与水位（心跳也不再重�
   assert.equal(await c.distiller.tryDistill('g1', 'interval'), true)
   const fed = messagesIn(env.calls[env.calls.length - 1])
   assert.equal(fed.length, 2, '重启后水位仍有效：只送 2 条新消息')
-  assert.deepEqual(fed.map((m) => JSON.parse(m.text)), ['消息3', '消息4'])
+  assert.deepEqual(fed.map((m) => m.text), ['消息3', '消息4'])
 
   rmSync(env.dir, { recursive: true, force: true })
 })

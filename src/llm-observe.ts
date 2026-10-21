@@ -97,6 +97,12 @@ export interface ModelPricing {
   input: number
   /** 输出价格（元/百万 tokens） */
   output: number
+  /**
+   * C4：缓存命中输入价（元/百万 tokens，可选）。供应商上下文缓存命中的部分按此计价
+   * （智谱 GLM 官方缓存价约为输入价 1/4）。缺省 = 无缓存价，estimateCostWithCache
+   * 退化为按 input 计价（与 computeCostCny 同值）。
+   */
+  cacheInput?: number
 }
 
 /** 价格表：模型名 → 价格（Config.llmPricing 的形状） */
@@ -104,12 +110,13 @@ export type LlmPricingTable = Record<string, ModelPricing>
 
 /**
  * 默认价格表（智谱官方定价页 2026-10 抓取：GLM-5.3 输入 ¥8 / 输出 ¥28 每百万 tokens，
- * GLM-5.3-flash 输入 ¥0.8 / 输出 ¥2.8）。**以供应商页面为准**：
+ * GLM-5.3-flash 输入 ¥0.8 / 输出 ¥2.8；C4 缓存命中输入价 GLM-5.3 ¥2、
+ * GLM-5.3-flash ¥0.23）。**以供应商页面为准**：
  * https://docs.bigmodel.cn/cn/guide/start/pricing —— 调价改 llmPricing 配置即可，无需改代码。
  */
 export const DEFAULT_LLM_PRICING: LlmPricingTable = {
-  'glm-5.3': { input: 8, output: 28 },
-  'glm-5.3-flash': { input: 0.8, output: 2.8 },
+  'glm-5.3': { input: 8, output: 28, cacheInput: 2 },
+  'glm-5.3-flash': { input: 0.8, output: 2.8, cacheInput: 0.23 },
 }
 
 /**
@@ -120,6 +127,43 @@ export function computeCostCny(model: string, inTokens: number, outTokens: numbe
   const p = pricing?.[model]
   if (!p || typeof p.input !== 'number' || typeof p.output !== 'number') return 0
   const cny = (inTokens / 1_000_000) * p.input + (outTokens / 1_000_000) * p.output
+  return Math.round(cny * 1_000_000) / 1_000_000
+}
+
+/**
+ * C4：指令区缓存前缀占输入 token 的保守假设比例（10%）。指令区（人格 + schema +
+ * 约束）约 600–900 tokens，小窗口调用里占比可达 80%+，大窗口里约 5–10%——取 10%
+ * 作为「可再省多少」的保守口径，只用于报告尾估算，**不改 costCny 统计口径**。
+ */
+export const CACHE_PREFIX_RATIO_ASSUMED = 0.1
+
+/**
+ * C4 缓存价估算（纯函数）：与 computeCostCny 同口径，但把输入 token 中
+ * `cacheRatio` 比例视为「命中供应商上下文缓存」，该部分按 cacheInput 计价。
+ *
+ * - `cacheRatio` 缺省 = CACHE_PREFIX_RATIO_ASSUMED（报告尾「可再省 X%」用）；
+ * - 价格表未命中 / 无 cacheInput → 退化为 computeCostCny（无缓存价即无节省，保守）；
+ * - cacheRatio 会 clamp 到 [0, 1]；返回四舍五入到 1e-6 元。
+ *
+ * 注意：它**不参与** llm_call 逐行 costCny 与 BatchStats.costCny（那两者仍是未命中
+ * 上界，保守不变）——只用于向用户解释「前缀命中缓存还能再省多少」。
+ */
+export function estimateCostWithCache(
+  model: string,
+  inTokens: number,
+  outTokens: number,
+  pricing: LlmPricingTable,
+  cacheRatio: number = CACHE_PREFIX_RATIO_ASSUMED,
+): number {
+  const p = pricing?.[model]
+  if (!p || typeof p.input !== 'number' || typeof p.output !== 'number') return 0
+  const ratio = Number.isFinite(cacheRatio) ? Math.min(1, Math.max(0, cacheRatio)) : 0
+  const cachedTokens = inTokens > 0 ? inTokens * ratio : 0
+  const cachedPrice = typeof p.cacheInput === 'number' ? p.cacheInput : p.input
+  const cny =
+    (cachedTokens / 1_000_000) * cachedPrice +
+    ((inTokens - cachedTokens) / 1_000_000) * p.input +
+    (outTokens / 1_000_000) * p.output
   return Math.round(cny * 1_000_000) / 1_000_000
 }
 
@@ -398,17 +442,31 @@ function fmtTok(n: number): string {
 }
 
 /**
- * 报告尾统计行（技术文档 §7 + T9 成本透明）：
+ * 报告尾统计行（技术文档 §7 + T9 成本透明 + C4 缓存估算）：
  * `> 统计：批 x（失败 y）· 最大批耗时 z s · 缓存命中 n · LLM 调用 c 次 / t s · 模型 m · 输入 ~12.3k / 输出 ~4.5k tok · ≈¥0.0223`
  * —— 估算 token 带 `~`、费用带 `≈`（保留 4 位小数，日级费用常在分厘级）；
  * 真实 usage（tokensEst=false）时去掉 `~`；model 未提供（如 empty 路径）省略成本段（向后兼容）。
+ * C4：价格表含 cacheInput 时追加「固定前缀命中缓存可再省 ≈X%；≈¥ 为未命中上界」——
+ * `pricing` 缺省 DEFAULT_LLM_PRICING，只影响这句估算，不改变 costCny 口径。
  */
-export function renderBatchStatsLine(s: Readonly<BatchStats>): string {
+export function renderBatchStatsLine(
+  s: Readonly<BatchStats>,
+  pricing: LlmPricingTable = DEFAULT_LLM_PRICING,
+): string {
   const sec = (ms: number) => (ms / 1000).toFixed(1)
   let line = `> 统计：批 ${s.batches}（失败 ${s.failedBatches}）· 最大批耗时 ${sec(s.maxBatchMs)} s · 缓存命中 ${s.ckptHits} · LLM 调用 ${s.totalCalls} 次 / ${sec(s.totalMs)} s`
   if (s.model !== undefined) {
     const tilde = s.tokensEst === false ? '' : '~'
     line += ` · 模型 ${s.model} · 输入 ${tilde}${fmtTok(s.inTokens ?? 0)} / 输出 ${tilde}${fmtTok(s.outTokens ?? 0)} tok · ≈¥${(s.costCny ?? 0).toFixed(4)}`
+    // C4：固定前缀（人格+schema+wire 说明）逐字节稳定，可命中供应商上下文缓存。
+    // 这里只给「若命中可再省多少」的保守估算——costCny 与 ≈¥ 仍是未命中上界（统计口径不变）。
+    const p = pricing[s.model]
+    if (p?.cacheInput !== undefined && (s.inTokens ?? 0) > 0) {
+      const base = computeCostCny(s.model, s.inTokens ?? 0, s.outTokens ?? 0, pricing)
+      const cached = estimateCostWithCache(s.model, s.inTokens ?? 0, s.outTokens ?? 0, pricing)
+      const savePct = base > 0 ? Math.round((1 - cached / base) * 1000) / 10 : 0
+      if (savePct > 0) line += `（固定前缀命中缓存可再省 ≈${savePct}%；≈¥ 为未命中上界）`
+    }
   }
   // T7：ab 双跑模式追加 refine（方案 B）侧对比段——两管线各自调用数/耗时/费用，供人工评审定位
   if (s.pipeline === 'ab' && s.refine) {

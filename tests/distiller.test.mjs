@@ -113,9 +113,12 @@ test('prompt：指令区与数据区分离；数据字段中注入文本被 JSON
   // 数据区：注入文本只是 JSON 字符串内的数据
   assert.equal(dataPart.includes(JSON.stringify(injected).slice(1, -1)), true)
   // 数据区整体可解析为 JSON，且 text 字段还原出原文
+  // C3 wire：text 是原文（只编码一层），不再出现 `\"\"` 之类的双重转义
   const jsonStart = dataPart.indexOf('[')
   const parsed = JSON.parse(dataPart.slice(jsonStart))
-  assert.equal(JSON.parse(parsed[0].text), injected)
+  assert.equal(parsed[0].text, injected)
+  assert.equal(parsed[0].n, 1)
+  assert.equal(JSON.stringify(parsed).includes('\\\\"'), false, 'wire 不应有双重转义')
 })
 
 test('新增消息达到阈值自动触发提炼', async () => {
