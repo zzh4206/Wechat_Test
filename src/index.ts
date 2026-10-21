@@ -732,6 +732,8 @@ export function apply(ctx: Context, config: PluginConfig): void {
         notify: async (kind2, title, body) => { await notifier.notify(kind2, title, body) },
         logger: logger as unknown as StoreLogger,
         enqueueReportRegen: (chatId2, dateKey2, kind2) => regenQueue.enqueue(chatId2, dateKey2, Date.now(), kind2, 'manual') !== 'deduped',
+        revision: reportRevision,
+        marks: { markTarget: (chatId2, kind2, targetId2, status2, source2) => store.mirrorMarking(chatId2, status2 === 'completed' ? 'done' : status2 === 'incomplete' ? 'undone' : 'deleted', `${chatId2}:${kind2}:${targetId2}`, Date.now(), { source: source2 }) },
       })
     : null
   // W-2：总闸开但依赖缺失 → 启动即 error 指明缺谁（不再静默零消费，前端排障有据）

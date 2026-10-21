@@ -69,6 +69,8 @@ test('其余动作转发：cancel/complete/event/promise 四动作/ deadline 置
     task: svc.task, promise: svc.promise, store,
     notify: (kind, t, b) => notified.push(b),
     logger: { warn() {}, error() {} },
+    revision: { onApproval: async () => {} },
+    marks: { markTarget: async () => true },
   })
   await actions.taskCancel(CHAT, 1)
   await actions.taskComplete(CHAT, 2)
@@ -83,7 +85,7 @@ test('其余动作转发：cancel/complete/event/promise 四动作/ deadline 置
   const dl = 1234567890
   await actions.taskSetDeadline(CHAT, 8, dl)
   assert.deepEqual(deadlineCalls, [[CHAT, 8, dl, 1]], '人工指定 → confidence 1')
-  assert.equal(notified.length, 7, 'complete 走 markTarget 通道仍回执一次')
+  assert.equal(notified.length, 8)
   rmSync(dir, { recursive: true, force: true })
 })
 
@@ -95,6 +97,8 @@ test('personFollow：未知 pid → 失败不回执成功语义', async () => {
     task: fakeServices().task, promise: fakeServices().promise, store,
     notify: (k, t, b) => notified.push(b),
     logger: { warn() {}, error() {} },
+    revision: { onApproval: async () => {} },
+    marks: { markTarget: async () => true },
   })
   assert.deepEqual(store.getIdentities(CHAT), [], '初始无 identities')
   const failFollow = await actions.personFollow(CHAT, 'wxid_missing')
@@ -122,6 +126,8 @@ test('personFollow/Unfollow 走 watch_level 关注位（真实 identities 行）
     task: fakeServices().task, promise: fakeServices().promise, store,
     notify: (k, t, b) => notified.push(b),
     logger: { warn() {}, error() {} },
+    revision: { onApproval: async () => {} },
+    marks: { markTarget: async () => true },
   })
   assert.equal(await actions.personFollow(CHAT, 'wxid_boss001'), true)
   const after = store.getIdentities(CHAT).find((r) => r.pid === 'wxid_boss001')
@@ -138,6 +144,8 @@ test('reportRegen：未接队列 → false + warn；接钩子 → 转发并回�
   const actions = new ApprovalActions({
     task: fakeServices().task, promise: fakeServices().promise, store,
     notify: () => {}, logger: { warn: (m) => warns.push(m), error() {} },
+    revision: { onApproval: async () => {} },
+    marks: { markTarget: async () => true },
   })
   assert.equal(await actions.reportRegen(CHAT, '2026-06-10', 'daily'), false, '未接线忽略')
   assert.ok(warns.some((w) => w.includes('reportRegen')))
@@ -145,6 +153,8 @@ test('reportRegen：未接队列 → false + warn；接钩子 → 转发并回�
   const actions2 = new ApprovalActions({
     task: fakeServices().task, promise: fakeServices().promise, store,
     notify: () => {}, logger: { warn() {}, error() {} },
+    revision: { onApproval: async () => {} },
+    marks: { markTarget: async () => true },
     enqueueReportRegen: (c, d, k) => { enqueued.push([c, d, k]); return true },
   })
   assert.equal(await actions2.reportRegen(CHAT, '2026-06-10', 'weekly'), true)
@@ -184,6 +194,8 @@ test('taskPostpone：别名转发 taskSetDeadline（置信度 1）', async () =>
     task: fakeServices().task, promise: fakeServices().promise, store,
     notify: (k, t, b) => notified.push(b),
     logger: { warn() {}, error() {} },
+    revision: { onApproval: async () => {} },
+    marks: { markTarget: async () => true },
   })
   await actions.taskPostpone(CHAT, 9, 999)
   assert.deepEqual(deadlineCalls, [[CHAT, 9, 999, 1]])

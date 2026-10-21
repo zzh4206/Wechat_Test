@@ -45,6 +45,8 @@ function makeEnv({ resolveTarget } = {}) {
     store: { updateTaskDeadline: async (c, id, dl, conf) => { calls.push(['task.deadline', c, id, dl, conf]); return true }, setIdentityWatchLevel: async (c, pid, level) => { calls.push(['person.watch', c, pid, level]); return pid !== 'wxid_missing' }, getIdentities: () => [] },
     notify: (k, t, b) => notified.push(b),
     logger: { warn() {}, error() {} },
+    revision: { onApproval: async (c, tk, tid, summary, src) => { calls.push(['revision', c, tk, tid, summary, src]) } },
+    marks: { markTarget: async (c, tk, tid, status, src) => { calls.push(['markTarget', c, tk, tid, status, src]); return true } },
   })
   const env = { dir, store, svc, calls, notified }
   env.inbox = new ActionInbox({
@@ -64,7 +66,7 @@ test('正常路径：task.confirm 分发 + 结果文件 + 审计元数据 + 水�
   env.store.writeText(ACTIONS_REL, line() + '\n')
   const n = await env.inbox.poll()
   assert.equal(n, 1)
-  assert.deepEqual(env.calls, [['task.confirm', CHAT, 5]])
+  assert.deepEqual(env.calls, [['task.confirm', CHAT, 5], ['revision', CHAT, 'task', 5, '任务「#5」确认为真', 'chat']], '审批成功 → 修订接线（P0 返工）')
   const results = readFileSync(join(env.dir, ACTION_RESULTS_REL), 'utf8').trim().split('\n').map(JSON.parse)
   assert.deepEqual(results, [{ actionId: 'a1', ok: true, code: 'ok', ts: 1000 }])
   const audit = readFileSync(join(env.dir, WEB_ACTIONS_AUDIT_REL), 'utf8').trim().split('\n').map(JSON.parse)
@@ -133,7 +135,7 @@ test('幂等：同 actionId 重放跳过（不重复执行、不重复出结果�
   env.store.writeText(ACTIONS_OFFSET_REL, JSON.stringify({ byteOffset: Buffer.byteLength(line({ actionId: 'dup' }) + '\n', 'utf8'), lastActionId: 'dup' }) + '\n')
   const n = await env.inbox.poll()
   assert.equal(n, 0, '同 actionId 幂等跳过')
-  assert.equal(env.calls.length, 1, '只执行一次')
+  assert.equal(env.calls.length, 2, '只执行一次（confirm + 修订接线各一）')
   rmSync(env.dir, { recursive: true, force: true })
 })
 
