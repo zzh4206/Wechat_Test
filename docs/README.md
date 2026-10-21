@@ -35,6 +35,7 @@
 | [TECH-DESIGN-llm-overload-mitigation.md](TECH-DESIGN-llm-overload-mitigation.md) | LLM「消息过多 → 响应失败」的治理方案 |
 | [TECH-DESIGN-confirm-loop.md](TECH-DESIGN-confirm-loop.md) | 审批双通道与确认闭环（代码结构改动：ApprovalActions 门面 / ActionInbox / regen 泛化） |
 | [DESIGN-approval-marking.md](DESIGN-approval-marking.md) | 审批与标记的报告修正流（修订流展示 / 完成情况段 / 级联更新） |
+| [REF-prefixes.md](REF-prefixes.md) | 编号前缀注册表（新增前缀先查表登记） |
 | [REF-mac-wechat-report.md](REF-mac-wechat-report.md) | 参考资料：macOS 端微信群聊消息读取与自动应答 |
 
 ## 解释（背景与决策）
