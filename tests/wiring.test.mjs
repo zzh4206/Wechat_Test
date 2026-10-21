@@ -1,4 +1,4 @@
-// wiring.test.mjs —— P0 返工制度化防复发：按 index.ts 的真实构造方式组装服务图
+// wiring.test.mjs —— P0 返工制度化防复发：调用 index.ts 同款 createApprovalWiring 组装服务图
 // （真实 GroupStoreService / TaskRecognitionService / PromiseRecognitionService /
 //   ReportRevisionService + 真实 SQLite 镜像——不 mock 依赖注入），
 // 断言审批 → 修订行真实产生、complete → marking 镜像真实被调。
@@ -13,8 +13,7 @@ const { GroupStoreService } = await import('../lib/group-store.js')
 const { Store } = await import('../lib/store.js')
 const { TaskRecognitionService } = await import('../lib/task-recognition.js')
 const { PromiseRecognitionService } = await import('../lib/promise-track.js')
-const { ReportRevisionService } = await import('../lib/report-revision.js')
-const { ApprovalActions } = await import('../lib/approval-actions.js')
+const { createApprovalWiring } = await import('../lib/approval-wiring.js')
 const { createSqliteMirror } = await import('../lib/db/mirror.js')
 const { openDb } = await import('../lib/db/db.js')
 const { KnowledgeDao } = await import('../lib/db/dao.js')
@@ -43,31 +42,14 @@ async function makeWiring() {
   const mirror = createSqliteMirror(dbPath, logger)
   if (!mirror) throw new Error('wiring: mirror 创建失败')
 
-  const reportRevision = new ReportRevisionService({
+  // 与 index.ts 共用同一组装函数（不再在测试里另写"同构"组装——那样测不到生产接线）
+  const { reportRevision, approvalActions } = createApprovalWiring({
     store,
-    logger,
     groupStore,
-    resolveTarget: (chatId2, kind2, id2) => {
-      const row = kind2 === 'promise' ? groupStore.getPromise(chatId2, id2) : groupStore.getTask(chatId2, id2)
-      return row ? { createdAt: row.createdAt } : null
-    },
-    mirror: {
-      mirrorMarking: (chatId, kind, targetRef, ts, opts) => store.mirrorMarking(chatId, kind, targetRef, ts, { ...opts, source: opts?.source }),
-      mirrorReportRevision: (chatId, periodType, periodStart, ts, type, opts) => store.mirrorReport(chatId, periodType, periodStart, ts, type, { ...opts, source: opts?.source }),
-    },
-  })
-
-  const approvalActions = new ApprovalActions({
     task: taskRecognition,
     promise: promiseRecognition,
-    store: groupStore,
     notify: () => {},
     logger,
-    revision: reportRevision,
-    marks: {
-      markTarget: (chatId2, targetKind, targetId, status, source) =>
-        reportRevision.markTarget(chatId2, targetKind, targetId, status, source),
-    },
   })
 
   const db = openDb(dbPath, { logger })
