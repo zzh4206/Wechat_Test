@@ -40,7 +40,7 @@ export interface ReportRevisionDeps {
   store: Store
   logger: StoreLogger
   /** 存在性校验 + origin 解析（tasks/promises 行：created_at = 条目出身时刻）。返回 null = 不存在 */
-  resolveTarget: (chatId: string, targetKind: 'task' | 'promise', targetId: number) => { createdAt: number } | null
+  resolveTarget: (chatId: string, targetKind: 'task' | 'event' | 'promise', targetId: number) => { createdAt: number } | null
   mirror?: {
     mirrorMarking: (chatId: string, kind: 'done' | 'undone' | 'deleted', targetRef: string, ts: number, opts?: { source?: 'chat' | 'web'; sourceKey?: string }) => boolean
     mirrorReportRevision: (chatId: string, periodType: 'daily' | 'weekly' | 'monthly', periodStart: string, ts: number, type: string, opts?: { targetRef?: string | null; summary?: string | null; source?: 'chat' | 'web'; sourceKey?: string }) => boolean
@@ -147,7 +147,7 @@ export class ReportRevisionService {
    * 审批入口：审批动作的级联修订（识别服务落库由 ApprovalActions 先行，本服务只做修订流）。
    * 镜像接线（report_revision，低优先）排后：当前仅 .md 修订段 + knowledge 读侧缺行可接受。
    */
-  async onApproval(chatId: string, targetKind: 'task' | 'promise', targetId: number, summary: string, source: 'chat' | 'web'): Promise<boolean> {
+  async onApproval(chatId: string, targetKind: 'task' | 'event' | 'promise', targetId: number, summary: string, source: 'chat' | 'web'): Promise<boolean> {
     // onApproval 同修：origin 归属改条目出身日报（dateKey 不再由调用方传当天）
     const target = this.deps.resolveTarget(chatId, targetKind, targetId)
     if (!target) {

@@ -716,6 +716,13 @@ export function apply(ctx: Context, config: PluginConfig): void {
     store,
     logger: logger as unknown as StoreLogger,
     resolveTarget: (chatId2, kind2, id2) => {
+      // event 行无时间列——出身时刻取其证据消息 ts（事件被识别的那条消息）
+      if (kind2 === 'event') {
+        const ev = groupStore.getEvent(chatId2, id2)
+        if (!ev) return null
+        const msg = ev.evidenceMsgId ? groupStore.getMessage(chatId2, ev.evidenceMsgId) : null
+        return msg ? { createdAt: msg.ts } : null
+      }
       const row = kind2 === 'task' ? groupStore.getTask(chatId2, id2) : groupStore.getPromise(chatId2, id2)
       return row ? { createdAt: row.createdAt } : null
     },
@@ -733,7 +740,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
         logger: logger as unknown as StoreLogger,
         enqueueReportRegen: (chatId2, dateKey2, kind2) => regenQueue.enqueue(chatId2, dateKey2, Date.now(), kind2, 'manual') !== 'deduped',
         revision: reportRevision,
-        marks: { markTarget: (chatId2, kind2, targetId2, status2, source2) => store.mirrorMarking(chatId2, status2 === 'completed' ? 'done' : status2 === 'incomplete' ? 'undone' : 'deleted', `${chatId2}:${kind2}:${targetId2}`, Date.now(), { source: source2 }) },
+        marks: { markTarget: async (chatId2, kind2, targetId2, status2, source2) => store.mirrorMarking(chatId2, status2 === 'completed' ? 'done' : status2 === 'incomplete' ? 'undone' : 'deleted', `${chatId2}:${kind2}:${targetId2}`, Date.now(), { source: source2 }) },
       })
     : null
   // W-2：总闸开但依赖缺失 → 启动即 error 指明缺谁（不再静默零消费，前端排障有据）
