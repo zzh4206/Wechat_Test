@@ -691,6 +691,10 @@ export function apply(ctx: Context, config: PluginConfig): void {
   const reportRevision = new ReportRevisionService({
     store,
     logger: logger as unknown as StoreLogger,
+    resolveTarget: (chatId2, kind2, id2) => {
+      const row = kind2 === 'task' ? groupStore.getTask(chatId2, id2) : groupStore.getPromise(chatId2, id2)
+      return row ? { createdAt: row.createdAt } : null
+    },
     mirror: {
       mirrorMarking: (c, k, r, ts, o) => store.mirrorMarking(c, k, r, ts, o),
       mirrorReportRevision: (c, p2, ps, ts, t, o) => store.mirrorReport(c, p2, ps, ts, t, o),

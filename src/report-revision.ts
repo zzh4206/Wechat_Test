@@ -39,6 +39,8 @@ interface MirrorEvent {
 export interface ReportRevisionDeps {
   store: Store
   logger: StoreLogger
+  /** 存在性校验 + origin 解析（tasks/promises 行：created_at = 条目出身时刻）。返回 null = 不存在 */
+  resolveTarget: (chatId: string, targetKind: 'task' | 'promise', targetId: number) => { createdAt: number } | null
   mirror?: {
     mirrorMarking: (chatId: string, kind: 'done' | 'undone' | 'deleted', targetRef: string, ts: number, opts?: { source?: 'chat' | 'web'; sourceKey?: string }) => boolean
     mirrorReportRevision: (chatId: string, periodType: 'daily' | 'weekly' | 'monthly', periodStart: string, ts: number, type: string, opts?: { targetRef?: string | null; summary?: string | null; source?: 'chat' | 'web'; sourceKey?: string }) => boolean
@@ -94,6 +96,19 @@ export class ReportRevisionService {
    * .md 修订段照常追加。返回是否完成（镜像成功或已定稿）。
    */
   async markTarget(chatId: string, targetKind: 'task' | 'promise' | 'event', targetId: number, status: 'completed' | 'incomplete' | 'deleted', source: 'chat' | 'web'): Promise<boolean> {
+    // 存在性校验：目标不存在 → 整链零副作用（无镜像/无修订行/无级联），返回 false
+    if (targetKind === 'event') {
+      this.deps.logger.warn('report-revision: event 暂不可标记——拒绝')
+      return false
+    }
+    const target = this.deps.resolveTarget(chatId, targetKind, targetId)
+    if (!target) {
+      this.deps.logger.warn(`report-revision: 标记目标不存在 ${chatId}/${targetKind}#${targetId}——整链零副作用`)
+      return false
+    }
+    // origin 归属（2026-10-21 用户裁定）：修订归属条目最初出现的日报（created_at 本地日），
+    // 级联周报=origin 所在周周一、月报=origin 当月 1 号——出身日报永远反映最新状态。
+    const originDateKey = this.dayKey(target.createdAt)
     this.drainPending()
     const ts = this.now()
     const targetRef = `${chatId}:${targetKind}:${targetId}` // 全局唯一（防 v_marking_latest 跨群串号）
@@ -114,22 +129,41 @@ export class ReportRevisionService {
     }
     const label = STATUS_LABEL[status]
     const mdLine = `- ${this.dayKey(ts)} ${this.hhmm(ts)} 标记：${targetKind}「#${targetId}」→ ${label}（来源：${source === 'web' ? '前端' : '对话框'}）`
-    const dateKey = this.dayKey(ts)
-    this.appendRevisionLineToMd(chatId, dateKey, mdLine)
-    this.cascadeAggregates(chatId, dateKey, { revType: 'marking', targetRef: ev.targetRef, summary: `标记：${targetKind} #${targetId} → ${label}`, source: ev.source, mdLine })
+    // 特例：origin 日报告文件不存在 → 跳过 .md 追加，修订行（revisions+镜像）照记、级联照常
+    const originFileExists = this.deps.store.readText(reportRelPath(chatId, originDateKey)) !== null
+    if (originFileExists) this.appendRevisionLineToMd(chatId, originDateKey, mdLine)
+    else this.deps.logger.warn(`report-revision: origin 日（${originDateKey}）无报告文件——修订行照记、跳过 .md 追加 ${chatId}/${targetKind}#${targetId}`)
+    this.appendRevisionRow(chatId, originDateKey, { revType: 'marking', targetKind, targetRef: ev.targetRef, summary: `标记：${targetKind} #${targetId} → ${label}`, source: ev.source })
+    this.cascadeAggregates(chatId, originDateKey, { revType: 'marking', targetRef: ev.targetRef, summary: `标记：${targetKind} #${targetId} → ${label}`, source: ev.source, mdLine })
     return true
+  }
+
+  /** 修订行落档：knowledge.db report_revision 经镜像（单一查询副本；每群库不落表——约束 1） */
+  private appendRevisionRow(chatId: string, dateKey: string, ev: { revType: string; targetKind?: string | null; targetRef: string | null; summary: string; source: string }): void {
+    this.deps.mirror?.mirrorReportRevision?.(chatId, 'daily', dateKey, this.now(), ev.revType, { targetRef: ev.targetRef, summary: ev.summary, source: ev.source === 'web' ? 'web' : 'chat' })
   }
 
   /**
    * 审批入口：审批动作的级联修订（识别服务落库由 ApprovalActions 先行，本服务只做修订流）。
    * 镜像接线（report_revision，低优先）排后：当前仅 .md 修订段 + knowledge 读侧缺行可接受。
    */
-  async onApproval(chatId: string, dateKey: string, summary: string, source: 'chat' | 'web', targetRef: string | null = null): Promise<boolean> {
+  async onApproval(chatId: string, targetKind: 'task' | 'promise', targetId: number, summary: string, source: 'chat' | 'web'): Promise<boolean> {
+    // onApproval 同修：origin 归属改条目出身日报（dateKey 不再由调用方传当天）
+    const target = this.deps.resolveTarget(chatId, targetKind, targetId)
+    if (!target) {
+      this.deps.logger.warn(`report-revision: 审批目标不存在 ${chatId}/${targetKind}#${targetId}——整链零副作用`)
+      return false
+    }
+    const originDateKey = this.dayKey(target.createdAt)
     const ts = this.now()
+    const targetRef = `${chatId}:${targetKind}:${targetId}`
     const mdLine = `- ${this.dayKey(ts)} ${this.hhmm(ts)} 审批：${summary}（来源：${source === 'web' ? '前端' : '对话框'}）→ L2 对应条目状态更新`
-    this.appendRevisionLineToMd(chatId, dateKey, mdLine)
-    this.mirror?.mirrorReportRevision(chatId, 'daily', dateKey, ts, 'approval', { targetRef, summary, source: source === 'web' ? 'web' : 'chat' })
-    this.cascadeAggregates(chatId, dateKey, { revType: 'approval', targetRef, summary: `审批：${summary}`, source, mdLine })
+    this.appendRevisionRow(chatId, originDateKey, { revType: 'approval', targetKind, targetRef, summary: `审批：${summary}`, source })
+    this.mirror?.mirrorReportRevision(chatId, 'daily', originDateKey, ts, 'approval', { targetRef, summary: `审批：${summary}`, source: source === 'web' ? 'web' : 'chat' })
+    if (this.deps.store.readText(reportRelPath(chatId, originDateKey)) !== null) {
+      this.appendRevisionLineToMd(chatId, originDateKey, mdLine)
+    }
+    this.cascadeAggregates(chatId, originDateKey, { revType: 'approval', targetRef, summary: `审批：${summary}`, source, mdLine })
     return true
   }
 
@@ -145,7 +179,7 @@ export class ReportRevisionService {
       const rel = reportRelPath(chatId, key, kind)
       if (this.deps.store.readText(rel) === null) continue // 聚合报告不存在 → 什么都不做
       this.appendRevisionLineToMd(chatId, key, ev.mdLine, kind)
-      this.mirror?.mirrorReportRevision(chatId, kind, key, this.now(), ev.revType, { targetRef: ev.targetRef, summary: ev.summary, source: ev.source === 'web' ? 'web' : 'chat' })
+      this.mirror?.mirrorReportRevision?.(chatId, kind, key, this.now(), ev.revType, { targetRef: ev.targetRef, summary: ev.summary, source: ev.source === 'web' ? 'web' : 'chat' })
     }
   }
 
