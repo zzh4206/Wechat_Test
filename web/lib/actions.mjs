@@ -56,6 +56,8 @@ export const WEB_ACTIONS = Object.freeze({
   // FE-3：报告定稿 / 重新生成（重新生成只重写报告、不进发件箱——插件侧手动重跑语义）
   'report.finalize': [false, byReportPeriod],
   'report.regen': [false, byReportPeriod],
+  // 排入发件箱：插件 webOutboxEnabled 关时 web 侧先拒（409），插件侧再拒（unsupported）——双层
+  'report.toOutbox': [false, byReportPeriod],
 })
 
 /**

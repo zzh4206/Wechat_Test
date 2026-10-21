@@ -66,6 +66,7 @@ const ACTIONS_OFF_TEXT = {
   no_shared_token: '只读模式：web 进程未用 LURKER_WEB_TOKEN 启动，审批动作不可用（见 RUNBOOK §14）。',
   inbox_disabled: '只读模式：插件未开启前端收件箱（webActionsEnabled=false 或依赖缺失），审批动作不可用。',
   plugin_token_unset: '只读模式：插件未配置 webActionsToken，审计无法对应到操作者，审批动作不可用（见 RUNBOOK §14.2）。',
+  outbox_disabled: '「排入发件箱」未开启：插件配置 webOutboxEnabled=false（默认关，见 RUNBOOK §14.5）。',
   token_mismatch: '只读模式：web 进程的 LURKER_WEB_TOKEN 与插件 webActionsToken 不一致，审批动作不可用（见 RUNBOOK §14.2）。',
 }
 
@@ -181,7 +182,7 @@ async function openReport(id, into) {
   }
 }
 
-// —— 报告操作（FE-3：定稿 / 重新生成；均不发送） ——
+// —— 报告操作（FE-3：定稿 / 重新生成不发送；排入发件箱走既有发送链路） ——
 
 /** 详情页操作条。跨群聚合不是群，插件白名单里没有它，不提供操作 */
 function reportActions(r, into) {
@@ -203,9 +204,17 @@ function reportActions(r, into) {
     await submitAction({ type: 'report.regen', chatId: r.chatId, params }, status, buttons,
       { ok: '已排入重新生成：插件约 30 秒内开始，LLM 生成需要一会儿，稍后刷新查看', duplicate: '已在重新生成队列中' })
   } }, '重新生成')
+  // 排入发件箱：唯一会走向发送的操作。插件开关关时置灰；开着也要二次确认，并说明之后仍受发送层四道闸约束
+  const outboxOn = state.actions.enabled && state.actions.outboxEnabled === true
+  const toOutbox = h('button', { type: 'button', disabled: !outboxOn, title: outboxOn ? '' : ACTIONS_OFF_TEXT.outbox_disabled, onclick: async () => {
+    if (!confirm(`把「${label}」排入发件箱？\n\n会往文件传输助手推一条提醒（只有标题与修订数，不含正文）。是否真正发出仍由发送层开关决定（senderEnabled / sendDryRun）。10 分钟内重复排入会被忽略。`)) return
+    await submitAction({ type: 'report.toOutbox', chatId: r.chatId, params }, status, buttons,
+      { ok: '已排入发件箱（是否真发由发送层开关决定）', duplicate: '10 分钟内已排入过，已忽略', not_found: '报告文件不存在', unsupported: '插件未开启排入发件箱' })
+  } }, '排入发件箱')
   if (finalize) buttons.push(finalize)
   buttons.push(regen)
-  return h('div', { class: 'actions report-actions' }, finalize, regen, status,
+  if (outboxOn) buttons.push(toOutbox)
+  return h('div', { class: 'actions report-actions' }, finalize, regen, toOutbox, status,
     state.actions.enabled ? null : h('span', { class: 'muted' }, '（只读模式）'))
 }
 

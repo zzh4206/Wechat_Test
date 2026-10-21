@@ -107,7 +107,7 @@ function actionsState(allowActions, manifest, operator) {
   if (!manifest.actionsEnabled) return { enabled: false, reason: 'inbox_disabled' }
   if (!manifest.operator) return { enabled: false, reason: 'plugin_token_unset' }
   if (manifest.operator !== operator) return { enabled: false, reason: 'token_mismatch' }
-  return { enabled: true, reason: null }
+  return { enabled: true, reason: null, outboxEnabled: manifest.outboxEnabled }
 }
 
 /** 读 JSON 请求体（上限 BODY_MAX）；超限或非法返回 null */
@@ -138,6 +138,8 @@ async function postAction(req, res, ctx) {
   if (!state.enabled) return json(res, 409, { error: 'actions_disabled', reason: state.reason })
   const body = await readJsonBody(req)
   if (body === null) return json(res, 400, { error: 'bad_request', reason: 'body' })
+  // 排入发件箱的第一层闸（真正的闸在插件收件箱：webOutboxEnabled 关时不注入入队函数）
+  if (body.type === 'report.toOutbox' && !state.outboxEnabled) return json(res, 409, { error: 'actions_disabled', reason: 'outbox_disabled' })
   const built = buildAction(body, new Set(ctx.manifest.groups), ctx.operator)
   if (built.error) return json(res, built.error === 'chat_not_allowed' ? 403 : 400, built)
   appendAction(ctx.stateDir, built.line)

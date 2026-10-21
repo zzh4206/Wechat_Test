@@ -20,6 +20,7 @@ const { writeWebManifest } = await import('../lib/web-manifest.js')
 const { reportRelPath } = await import('../lib/report.js')
 const { RegenQueue } = await import('../lib/regen-queue.js')
 const { Outbox } = await import('../lib/outbox.js')
+const { createReportOutbox } = await import('../lib/report-outbox.js')
 
 const CHAT = '12345678@chatroom'
 const OUTSIDE = '1234567890@chatroom'
@@ -30,7 +31,7 @@ const ORIGIN_KEY = '2026-10-14'
 const fingerprint = (t) => createHash('sha256').update(t, 'utf8').digest('hex').slice(0, 8)
 
 /** pluginToken：插件配置 webActionsToken（null = 未配置）；web 进程固定用 TOKEN */
-async function makeEnv({ allowActions = true, actionsEnabled = true, pluginToken = TOKEN } = {}) {
+async function makeEnv({ allowActions = true, actionsEnabled = true, pluginToken = TOKEN, outboxEnabled = false } = {}) {
   const pluginOperator = pluginToken ? fingerprint(pluginToken) : undefined
   const dir = resolve(mkdtempSync(join(tmpdir(), 'web-inbox-')))
   const logger = { warn() {}, error() {}, info() {}, debug() {} }
@@ -47,9 +48,11 @@ async function makeEnv({ allowActions = true, actionsEnabled = true, pluginToken
   })
   const inbox = new ActionInbox({
     store, actions: approvalActions, groups: [CHAT], logger, resolveTarget: resolveInboxTarget, operator: pluginOperator,
+    // 与 index.ts 同口径：仅 webOutboxEnabled 时注入
+    reportOutbox: outboxEnabled ? createReportOutbox({ store, outbox: new Outbox({ store }) }) : undefined,
     marks: { markTarget: (c, k, id, s, src) => reportRevision.markTarget(c, k, id, s, src) },
   })
-  writeWebManifest(store, { groups: [CHAT], knowledgeDb: join(dir, 'knowledge.db'), actionsEnabled, operator: pluginOperator ?? null })
+  writeWebManifest(store, { groups: [CHAT], knowledgeDb: join(dir, 'knowledge.db'), actionsEnabled, operator: pluginOperator ?? null, outboxEnabled })
 
   // 合成数据：证据消息前后各有消息；一条待确认任务、一条无时限进行中任务、一条待确认承诺、一条待确认事件
   await groupStore.appendIdentity(CHAT, { pid: 'wx_p1', wxid: 'wxid_a', groupNick: '张三', watchLevel: 'off' })
@@ -137,7 +140,7 @@ test('/api/evidence：证据消息前后上下文，标出证据行', async () =
 
 test('/api/chats 报告写动作可用性', async () => {
   const on = await makeEnv()
-  try { assert.deepEqual((await on.get('/api/chats')).body.actions, { enabled: true, reason: null }) } finally { await on.stop() }
+  try { assert.deepEqual((await on.get('/api/chats')).body.actions, { enabled: true, reason: null, outboxEnabled: false }) } finally { await on.stop() }
   const noToken = await makeEnv({ allowActions: false })
   try { assert.deepEqual((await noToken.get('/api/chats')).body.actions, { enabled: false, reason: 'no_shared_token' }) } finally { await noToken.stop() }
   const off = await makeEnv({ actionsEnabled: false })
@@ -375,5 +378,41 @@ test('报告操作参数校验：周报须周一、月报须 1 号、非法日�
       if (reason) assert.equal(r.body.reason, reason)
     }
     assert.equal(actionLines(env.dir).length, 0)
+  } finally { await env.stop() }
+})
+
+// —— FE-3：排入发件箱（插件 webOutboxEnabled，默认关） ——
+
+test('排入发件箱：开关关（默认）→ web 侧 409 outbox_disabled 零落盘；手写行绕过 web 也被插件拒（unsupported）', async () => {
+  const env = await makeEnv()
+  try {
+    env.store.writeReport('daily', CHAT, ORIGIN_KEY, `# 日报 ${ORIGIN_KEY}\n\n正文\n`)
+    const r = await env.post({ type: 'report.toOutbox', chatId: CHAT, params: { kind: 'daily', dateKey: ORIGIN_KEY } })
+    assert.deepEqual([r.status, r.body.reason], [409, 'outbox_disabled'])
+    assert.equal(actionLines(env.dir).length, 0)
+    // 直接往 actions.jsonl 写（模拟绕过 web 进程）：插件侧仍拒
+    const { appendFileSync } = await import('node:fs')
+    appendFileSync(join(env.dir, 'web', 'actions.jsonl'), JSON.stringify({ actionId: 'a-1760000000000-deadbeef', ts: 1, chatId: CHAT, type: 'report.toOutbox', params: { kind: 'daily', dateKey: ORIGIN_KEY }, operator: fingerprint(TOKEN) }) + '\n')
+    await env.inbox.poll()
+    assert.equal((await env.get('/api/actions/a-1760000000000-deadbeef')).body.code, 'unsupported')
+    assert.equal(new Outbox({ store: env.store }).listOutbox().length, 0, '零入队')
+  } finally { await env.stop() }
+})
+
+test('排入发件箱：开关开 → 提交 → 插件入队一条同形条目（pending，不含正文）；10 分钟内重复 duplicate', async () => {
+  const env = await makeEnv({ outboxEnabled: true })
+  try {
+    env.store.writeReport('daily', CHAT, ORIGIN_KEY, `# 日报 ${ORIGIN_KEY}\n\n- 合成正文 synth-0009\n`)
+    assert.equal((await env.get('/api/chats')).body.actions.outboxEnabled, true)
+    const a = await env.post({ type: 'report.toOutbox', chatId: CHAT, params: { kind: 'daily', dateKey: ORIGIN_KEY } })
+    const b = await env.post({ type: 'report.toOutbox', chatId: CHAT, params: { kind: 'daily', dateKey: ORIGIN_KEY } })
+    assert.deepEqual([a.status, b.status], [202, 202])
+    await env.inbox.poll()
+    assert.equal((await env.get(`/api/actions/${a.body.actionId}`)).body.code, 'ok')
+    assert.equal((await env.get(`/api/actions/${b.body.actionId}`)).body.code, 'duplicate')
+    const entries = new Outbox({ store: env.store }).listOutbox()
+    assert.equal(entries.length, 1)
+    assert.deepEqual([entries[0].kind, entries[0].status, entries[0].channel], ['daily', 'pending', 'filehelper'])
+    assert.equal(JSON.stringify(entries[0]).includes('synth-0009'), false)
   } finally { await env.stop() }
 })
