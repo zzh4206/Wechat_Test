@@ -130,3 +130,100 @@ test('持久化：regenAttempts 跨实例保留；上限 31 去重淘汰（既�
   assert.equal(q2.list().length, REGEN_QUEUE_MAX, '上限 31')
   rmSync(dir, { recursive: true, force: true })
 })
+
+// —— 手动重跑（reason='manual'）与错号补发分开处理 ——
+
+const { processManualRegen, startManualRegen } = await import('../lib/regen-processor.js')
+
+test('手动重跑：不做 satisfied 检查、只重新生成、不进 outbox；审计 regen_manual_done', async () => {
+  const env = makeEnv(['ok'])
+  env.deps.groupStore = { getReportMetas: () => [{ date: DAY, status: 'ok' }] } // 已有正常报告：错号补发会判 satisfied
+  env.queue.enqueue(CHAT, DAY, 1, 'daily', 'manual')
+  const r = await processManualRegen(env.deps)
+  assert.equal(r.action, 'manual_regenerated')
+  assert.equal(env.queue.list().length, 0)
+  assert.equal(env.outbox.listOutbox().length, 0, '手动重跑绝不创建 outbox 条目（发送只有「排入发件箱」一个入口）')
+  assert.equal(env.audits[0].result, 'regen_manual_done')
+  assert.equal(env.notifies.length, 1, '本机通知照常（不是微信发送）')
+  rmSync(env.dir, { recursive: true, force: true })
+})
+
+test('手动重跑：空产出不重试直接结束；生成异常留在原位；错号在线跳过本轮', async () => {
+  const env = makeEnv(['empty', 'throw'])
+  env.queue.enqueue(CHAT, DAY, 1, 'daily', 'manual')
+  assert.equal((await processManualRegen(env.deps)).action, 'manual_regenerated')
+  assert.equal(env.queue.list().length, 0, '空产出如实结束，不重试')
+  env.queue.enqueue(CHAT, DAY, 2, 'daily', 'manual')
+  assert.equal((await processManualRegen(env.deps)).action, 'env_deferred')
+  assert.equal(env.queue.list().length, 1, '异常留在原位')
+  const r = await processManualRegen({ ...env.deps, accountOk: async () => false })
+  assert.equal(r.action, 'manual_skipped_account')
+  assert.equal(env.queue.list().length, 1, '错号在线不生成（防空数据覆盖正常报告）')
+  rmSync(env.dir, { recursive: true, force: true })
+})
+
+test('两种来源互不处理：processRegenHead 跳过 manual，processManualRegen 跳过 wrong_account', async () => {
+  const env = makeEnv(['ok', 'ok'])
+  env.queue.enqueue(CHAT, '2026-06-09', 1, 'daily', 'manual')
+  env.queue.enqueue(CHAT, DAY, 2, 'daily', 'wrong_account')
+  const head = await processRegenHead(env.deps)
+  assert.deepEqual([head.action, head.entry.dateKey], ['regenerated', DAY], '错号补发不被排在前面的手动条目阻塞')
+  assert.deepEqual(env.queue.list().map(e => e.reason), ['manual'])
+  assert.equal(env.outbox.listOutbox().length, 1, '错号补发照旧进发送链路')
+  const manual = await processManualRegen(env.deps)
+  assert.equal(manual.entry.dateKey, '2026-06-09')
+  assert.equal(env.outbox.listOutbox().length, 1, '手动重跑不新增 outbox')
+  rmSync(env.dir, { recursive: true, force: true })
+})
+
+test('错号补发按条目周期：satisfied 按自身 kind 查 meta，outbox kind/标题随周期', async () => {
+  const env = makeEnv(['ok'])
+  const asked = []
+  env.deps.groupStore = { getReportMetas: (c, opts) => { asked.push(opts.kind); return opts.kind === 'daily' ? [{ date: '2026-06-08', status: 'ok' }] : [] } }
+  env.queue.enqueue(CHAT, '2026-06-08', 1, 'weekly', 'wrong_account')
+  const r = await processRegenHead(env.deps)
+  assert.equal(r.action, 'regenerated', '同日日报非空不应让周报被判 satisfied')
+  assert.deepEqual(asked, ['weekly'])
+  const [entry] = env.outbox.listOutbox()
+  assert.deepEqual([entry.kind, entry.title], ['weekly', '补发周报 2026-06-08'])
+  rmSync(env.dir, { recursive: true, force: true })
+})
+
+test('错号补发空产出重试计数按条目周期落盘（weekly 不再原地无限重试）', async () => {
+  const env = makeEnv(['empty', 'empty', 'empty'])
+  env.queue.enqueue(CHAT, '2026-06-08', 1, 'weekly', 'wrong_account')
+  assert.equal((await processRegenHead(env.deps)).action, 'deferred_sync_pending')
+  assert.equal(env.queue.list()[0].regenAttempts, 1)
+  await processRegenHead(env.deps)
+  assert.equal((await processRegenHead(env.deps)).action, 'empty_confirmed')
+  assert.equal(env.queue.list().length, 0)
+  rmSync(env.dir, { recursive: true, force: true })
+})
+
+test('startManualRegen：立即跑一轮、上一轮未结束不重入、dispose 清定时器', async () => {
+  const env = makeEnv([])
+  let calls = 0
+  let release
+  env.deps.report = { generateReport: () => { calls += 1; return new Promise(ok => { release = () => ok({ status: 'ok', path: 'p', judgmentCount: 1, topicCount: 0, messageCount: 1 }) }) } }
+  env.queue.enqueue(CHAT, DAY, 1, 'daily', 'manual')
+  const stop = startManualRegen({ ...env.deps, intervalMs: 1000 })
+  await new Promise(r => setTimeout(r, 1100))
+  assert.equal(calls, 1, '生成未结束时下一 tick 不重入')
+  release()
+  await new Promise(r => setTimeout(r, 20))
+  assert.equal(env.queue.list().length, 0)
+  stop()
+  rmSync(env.dir, { recursive: true, force: true })
+})
+
+test('队列载入：旧版无 reason 条目视为错号补发；缺字段的 weekly 坏行被过滤', () => {
+  const dir = resolve(mkdtempSync(join(tmpdir(), 'regenp-load-')))
+  const store = new Store(dir, { warn() {}, error() {} })
+  store.writeText(REGEN_QUEUE_REL, JSON.stringify([
+    { chatId: CHAT, dateKey: DAY, kind: 'daily', queuedAt: 1 },
+    { kind: 'weekly' },
+  ]))
+  const q = new RegenQueue({ store, logger: { warn() {}, error() {} } })
+  assert.deepEqual(q.list().map(e => [e.dateKey, e.reason]), [[DAY, 'wrong_account']])
+  rmSync(dir, { recursive: true, force: true })
+})

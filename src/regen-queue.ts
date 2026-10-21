@@ -11,6 +11,11 @@
  *
  * 持久化：stateDir/regen-queue.json（跨重启）；同键 (chatId, dateKey, kind) 去重；
  * 上限 31 条，超限丢弃最旧并 warn。审计零正文（调用方只记元数据）。
+ *
+ * 两种来源分开消费（regen-processor.ts）：
+ * - reason='wrong_account'（错号补发）：日报调度 tick 内、账号闸放行时按 FIFO 处理，生成后进发送链路；
+ * - reason='manual'（对话框/前端「重新生成」）：独立轮询处理，只重新生成、**不进 outbox**——
+ *   要推送须另走「排入发件箱」（单一发送入口）。
  */
 import type { Store } from './store.js'
 import type { StoreLogger } from './store.js'
@@ -51,14 +56,20 @@ export class RegenQueue {
       if (!raw) return
       const parsed: unknown = JSON.parse(raw)
       if (Array.isArray(parsed)) {
+        // kind 三选一须整体加括号：原写法 `a && b && kind==='daily' || kind==='weekly' || …` 会放行
+        // 缺 dateKey/chatId 的 weekly/monthly 坏行
         this.entries = parsed.filter(
           (e): e is RegenEntry =>
             typeof e === 'object' && e !== null &&
             typeof (e as RegenEntry).dateKey === 'string' &&
             typeof (e as RegenEntry).chatId === 'string' &&
-            (e as RegenEntry).kind === 'daily' || (e as RegenEntry).kind === 'weekly' || (e as RegenEntry).kind === 'monthly',
+            ((e as RegenEntry).kind === 'daily' || (e as RegenEntry).kind === 'weekly' || (e as RegenEntry).kind === 'monthly'),
         )
-        for (const e of this.entries) if (e.status === undefined) e.status = 'pending_regen'
+        for (const e of this.entries) {
+          if (e.status === undefined) e.status = 'pending_regen'
+          // 旧版条目无 reason：当时只有错号补发一种来源
+          if (e.reason !== 'manual') e.reason = 'wrong_account'
+        }
       }
     } catch (error) {
       this.options.logger.warn(`regen-queue: load failed (ignored): ${String(error).slice(0, 120)}`)
@@ -96,6 +107,20 @@ export class RegenQueue {
   /** FIFO 队首（不改队列）；空 → null */
   peek(): RegenEntry | null {
     return this.entries[0] ?? null
+  }
+
+  /** 某来源的最早一条（不改队列）；两种来源各自 FIFO、互不阻塞 */
+  firstOf(reason: RegenReason): RegenEntry | null {
+    return this.entries.find((e) => e.reason === reason) ?? null
+  }
+
+  /** 移除指定条目（按 chatId + dateKey + kind 定位）；返回是否移除 */
+  remove(entry: Pick<RegenEntry, 'chatId' | 'dateKey' | 'kind'>): boolean {
+    const i = this.entries.findIndex((e) => e.chatId === entry.chatId && e.dateKey === entry.dateKey && e.kind === entry.kind)
+    if (i === -1) return false
+    this.entries.splice(i, 1)
+    this.persist()
+    return true
   }
 
   /** 记录空产出重试计数（跨重启保留） */

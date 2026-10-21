@@ -78,6 +78,10 @@ export class ApprovalActions {
 - `enqueue` / `has` / pop 处理按 kind 分别去重（同键 = (kind, dateKey, chatId)）；
 - 消费端（regen-processor）按 kind 调 `generateReport`（weekly/monthly 的窗口推导复用 `reportPeriodOf`——单一实现，与镜像同口径）；
 - **月报 dateKey 锚定当月 1 号**（既有裁定，backfill 参数同样适用）。
+- **两种来源分开消费**（2026-10-21 修正）：`wrong_account` 仍由日报 tick 在账号闸放行时按 FIFO 处理，
+  生成后进 outbox；`manual` 由独立轮询 `startManualRegen` 处理——不做 satisfied 检查、空产出不重试、
+  **不创建 outbox 条目**（重跑 ≠ 发送；推送走 FE-3「排入发件箱」单一入口）。初版消费端不看 reason，
+  手动重跑会被已有报告判 satisfied 直接出队、只能等次日日报 tick、且生成后自动进发送链路。
 
 ### 2.5 关注特定人员（person-digest 的通道化）
 

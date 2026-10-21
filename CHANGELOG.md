@@ -20,6 +20,7 @@
 
 ### Fixed
 
+- 补发队列手动重跑（reason=`manual`，对话框/前端「重新生成」）：原消费端不看 reason——已有正常报告时被判 satisfied 直接出队（重跑无效）；只在日报调度 tick 且配置了账号闸时才处理（最长等一天，未配账号闸永不处理）；生成后自动创建 outbox 条目进发送链路（重跑即发送）。改为独立轮询 `startManualRegen` 处理手动条目：不做 satisfied 检查、空产出不重试、**不进 outbox**，错号在线时跳过本轮；错号补发（`wrong_account`）语义不变，且不再被排在前面的手动条目阻塞。顺带修正错号补发按条目周期处理：satisfied 检查原固定查日报 meta、重试计数原按 daily 落盘（周报条目会原地无限重试）、outbox kind/标题原固定为日报；`regen-queue.json` 载入过滤的运算优先级错误（缺字段的 weekly/monthly 坏行被放行），旧版无 reason 条目视为错号补发
 - 前端收件箱回执：前端动作调审批门面时没传 `source`，落到缺省 `'chat'`，前端审批在修订段被记成「来源：对话框」——改为显式传 `'web'`；生产接线没给 `ActionInbox` 注入 `resolveTarget`，已处理过的目标一律回 `not_found`（且 `event.*` 被当任务 id 查）——`createApprovalWiring` 新增 `resolveInboxTarget` 并注入，按 task/promise/event 区分，已处理过的回 `status_conflict`
 - 前端工作台页面：可选内容为空时出现文字「null」（原生 `replaceChildren` 不跳过 null）——改用过滤空值的 `fill()`
 - 审批接线：`taskComplete` 的 `marks` 依赖改走 `reportRevision.markTarget`（原直连 `store.mirrorMarking`）——不存在的任务不再"完成成功"，完成时出身日报照常追加修订段并级联周/月报，与收件箱 `task.mark` 同源同效。组装抽成 `src/approval-wiring.ts` 的 `createApprovalWiring`，`index.ts` 与 `tests/wiring.test.mjs` 共用，接线测试从此测的是生产接线

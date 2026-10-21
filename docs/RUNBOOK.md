@@ -492,6 +492,12 @@ Accessibility Inspector 确认元素层级）。**实证结论回填此处：___
   `regen_empty_confirmed/regen_satisfied/regen_env_deferred` 全生命周期可查。
   **事件记录（2026-10-19）**：修复前错号期间两条「本期窗口内无消息」空日报已实发到文件传输
   助手，无法撤回——已由本热修复杜绝（错号期间空报告不再进发送链路）。
+- **手动重新生成（reason=`manual`，对话框 `reportRegen` / 前端 `report.regen`）**：与错号补发共用
+  `regen-queue.json`，但分开处理——独立轮询（约 30 秒一条，不依赖日报 tick 与账号闸是否配置），
+  **只重新生成报告、不进 outbox、不发送**；不做 satisfied 检查（重跑的通常就是已有报告），空产出
+  不重试；账号闸配置且错号在线时跳过本轮（防空数据覆盖正常报告）。审计 `regen_manual_done`。
+  要推送到手机须另走「排入发件箱」（发送只有一个入口）。错号补发的 satisfied 检查、重试计数与
+  outbox 条目均按条目自身周期（日/周/月）处理。
 - **账号生命周期自动化（白名单制，2026-10-15）**：探针每轮消费周期对
   `xwechat_files/wxid_*` 各目录做**双快照活动对比**（间隔 2s；文件数或最新 mtime 变化 =
   持续写入流 = 活跃；单次快照无判别力）。活跃 ∉ `accountWhitelist` → sender **全面挂起**

@@ -51,7 +51,7 @@ import type { PromiseEvent } from './promise-track.js'
 import { FileIndexService, linkFilesToEvents } from './file-index.js'
 import { createAccountGate, listAccounts, sampleAccount, diffActivity, wxidFromDbRoot, XWECHAT_FILES_REL, type FsLike } from './account-probe.js'
 import { RegenQueue, REGEN_QUEUE_REL } from './regen-queue.js'
-import { processRegenHead } from './regen-processor.js'
+import { processRegenHead, startManualRegen } from './regen-processor.js'
 import { ActionInbox } from './action-inbox.js'
 import { createApprovalWiring } from './approval-wiring.js'
 import { writeWebManifest } from './web-manifest.js'
@@ -1114,6 +1114,30 @@ export function apply(ctx: Context, config: PluginConfig): void {
     const stopSender = sender.start()
     // 前端动作收件箱心跳（webActionsEnabled=false 时为 null = 零活动）。
     const stopInbox = actionInbox?.start() ?? null
+    // 手动重跑（对话框/前端「重新生成」，reason='manual'）轮询：只重新生成、不进 outbox；
+    // 与日报 tick 解耦，账号闸注入且错号在线时跳过本轮。报告引擎未开启（report=null）时零活动。
+    const currentReport = report
+    const stopManualRegen = currentReport
+      ? startManualRegen({
+          queue: regenQueue,
+          report: currentReport,
+          logger: logger as unknown as StoreLogger,
+          notify: async (title, body) => { await notifier.notify('daily', title, body) },
+          audit: (entry) => {
+            try {
+              store.ensureDir('audit')
+              store.appendJsonl('audit/regen-queue.jsonl', { ts: new Date(Date.now()).toISOString(), ...entry })
+            } catch { /* 审计失败不阻塞 */ }
+          },
+          now: () => Date.now(),
+          accountOk: accountGate
+            ? async () => {
+                const active = await accountGate.activeAccount()
+                return active === null || accountGate.isAllowed(active)
+              }
+            : undefined,
+        })
+      : null
     // files 子命令清单摄取心跳（修复"49≠链接"归档缺口；fileIndex 关或周期 0 时零活动）。
     // 独立于消息流扫描的兜底路径：立即先跑一轮，此后按 fileIndexListIntervalMin 周期执行；
     // 单群超时/失败只 warn（safe 包裹，不阻塞主流程）；摄取后同消息流口径镜像 media 表。
@@ -1156,6 +1180,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
       stopRetention() // M6：保留期清理心跳唯一释放点
       stopSender()
       stopInbox?.() // 收件箱心跳唯一释放点（webActionsEnabled=false 时 null）
+      stopManualRegen?.() // 手动重跑轮询唯一释放点（报告引擎未开启时 null）
       distiller.dispose()
       journal.dispose() // 无定时器，清计数/日报内存引用
       personDigest?.dispose() // M2-T2.3：无定时器，清并发去重表
