@@ -182,10 +182,10 @@ export class KnowledgeDao {
     try {
       const res = this.db
         .prepare(
-          `INSERT INTO entry (ts, kind, content_md, report_id, doc_id, created_at)
-           VALUES (?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO entry (ts, kind, content_md, report_id, doc_id, created_at, chat_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
         )
-        .run(input.ts, input.kind ?? 'note', input.contentMd, input.reportId ?? null, input.docId ?? null, input.createdAt ?? this.now())
+        .run(input.ts, input.kind ?? 'note', input.contentMd, input.reportId ?? null, input.docId ?? null, input.createdAt ?? this.now(), input.chatId ?? 'aggregate')
       return Number(res.lastInsertRowid)
     } catch (error) {
       this.logger.warn(`dao.insertEntry failed: ${String(error)}`)

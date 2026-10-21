@@ -7,15 +7,17 @@
  * 2) 读绝对路径则要把家目录写进源码，触碰 check-sensitive.sh 红线；
  * 3) schema 漂移风险低；若上游变更，以本文件 + user_version 校验兜底。
  *
- * 与 0数据格式/schema.sql 保持语义逐字一致（v0.6，user_version=5）：
- * v0.6 纯新增 report_revision / marking 两表 + v_report_revised / v_marking_latest
- * 两视图（既有表零改动）；report 重建含 chat_id（冲突键三元组），media 表；周期 GLOB/CHECK 原文保留。
+ * 与 0数据格式/schema.sql 保持语义逐字一致（v6，user_version=6）：
+ * v6 在 v0.6 基础上 entry 增 chat_id 群归属（回填 'aggregate'）+ v_marking_latest
+ * 分组加 chat_id（工单 D-3/D-4）；v0.6 纯新增 report_revision / marking 两表 +
+ * v_report_revised / v_marking_latest 两视图；report 重建含 chat_id（冲突键三元组），
+ * media 表；周期 GLOB/CHECK 原文保留。
  */
-export const SCHEMA_VERSION = 5
+export const SCHEMA_VERSION = 6
 
-/** v0.6 全量 DDL（全新库直接执行；含 user_version=5） */
+/** v6 全量 DDL（全新库直接执行；含 user_version=6） */
 export const SCHEMA_SQL = `
-PRAGMA user_version = 5;
+PRAGMA user_version = 6;
 
 CREATE TABLE IF NOT EXISTS doc (
   id           INTEGER PRIMARY KEY,
@@ -108,11 +110,14 @@ CREATE TABLE IF NOT EXISTS entry (
   content_md  TEXT NOT NULL,
   report_id   INTEGER REFERENCES report(id) ON DELETE SET NULL,
   doc_id      INTEGER REFERENCES doc(id)    ON DELETE SET NULL,
-  created_at  INTEGER NOT NULL
+  created_at  INTEGER NOT NULL,
+  chat_id     TEXT NOT NULL DEFAULT 'aggregate'
+              CHECK (length(chat_id) BETWEEN 1 AND 128)
 );
 CREATE INDEX IF NOT EXISTS idx_entry_ts      ON entry(ts);
 CREATE INDEX IF NOT EXISTS idx_entry_pending ON entry(report_id) WHERE report_id IS NULL;
 CREATE INDEX IF NOT EXISTS idx_entry_doc     ON entry(doc_id)     WHERE doc_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_entry_chat    ON entry(chat_id, ts);
 
 CREATE TABLE IF NOT EXISTS chat_digest (
   id          INTEGER PRIMARY KEY,
@@ -164,8 +169,10 @@ CREATE INDEX IF NOT EXISTS idx_marking_target ON marking(target_ref);
 
 CREATE VIEW IF NOT EXISTS v_marking_latest AS
 SELECT m.* FROM marking m
-JOIN (SELECT target_ref, MAX(ts) AS mx, MAX(id) AS mi FROM marking GROUP BY target_ref) t
-  ON m.target_ref = t.target_ref AND m.ts = t.mx AND m.id = t.mi;
+JOIN (SELECT chat_id, target_ref, MAX(ts) AS mx, MAX(id) AS mi
+      FROM marking GROUP BY chat_id, target_ref) t
+  ON m.chat_id = t.chat_id AND m.target_ref = t.target_ref
+ AND m.ts = t.mx AND m.id = t.mi;
 
 CREATE VIEW IF NOT EXISTS v_report_revised AS
 SELECT chat_id, period_type, period_start, COUNT(*) AS revision_count, MAX(ts) AS revised_at
@@ -212,6 +219,25 @@ JOIN (SELECT target_ref, MAX(ts) AS mx, MAX(id) AS mi FROM marking GROUP BY targ
 CREATE VIEW v_report_revised AS
 SELECT chat_id, period_type, period_start, COUNT(*) AS revision_count, MAX(ts) AS revised_at
 FROM report_revision GROUP BY chat_id, period_type, period_start;
+`
+
+/**
+ * v5 → v6 迁移 DDL（与 0数据格式/schema.sql 修订11 逐字一致，工单 D-3/D-4）：
+ * entry ALTER ADD chat_id（NOT NULL DEFAULT 'aggregate'，既有行由 DEFAULT 回填）
+ * + 补索引 idx_entry_chat + DROP/重建 v_marking_latest（分组加 chat_id）。
+ * report_revision / marking 表零改动。执行须包裹在单事务内、user_version 最后置（见 db.ts）。
+ */
+export const MIGRATE_V5_TO_V6_SQL = `
+ALTER TABLE entry ADD COLUMN chat_id TEXT NOT NULL DEFAULT 'aggregate'
+     CHECK (length(chat_id) BETWEEN 1 AND 128);
+CREATE INDEX idx_entry_chat ON entry(chat_id, ts);
+DROP VIEW v_marking_latest;
+CREATE VIEW v_marking_latest AS
+SELECT m.* FROM marking m
+JOIN (SELECT chat_id, target_ref, MAX(ts) AS mx, MAX(id) AS mi
+      FROM marking GROUP BY chat_id, target_ref) t
+  ON m.chat_id = t.chat_id AND m.target_ref = t.target_ref
+ AND m.ts = t.mx AND m.id = t.mi;
 `
 
 /**

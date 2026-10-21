@@ -245,7 +245,7 @@ function makeV3Db(path) {
   db.close()
 }
 
-test('迁移：v3 样例库 → v5 后行数不变、chat_id=aggregate、entry 外键存活；重跑幂等', () => {
+test('迁移：v3 样例库 → v6 后行数不变、chat_id=aggregate、entry 外键存活；重跑幂等', () => {
   const { path, dir } = tmpDb('migrate')
   makeV3Db(path)
 
@@ -265,44 +265,47 @@ test('迁移：v3 样例库 → v5 后行数不变、chat_id=aggregate、entry �
   assert.ok(dao.upsertReport({ periodType: 'daily', periodStart: '2026-01-05', periodEnd: '2026-01-05', title: '日报', contentMd: 'x', chatId: '12345678@chatroom' }))
   db.close()
 
-  // v5 库重跑：无变化（幂等）
+  // v6 库重跑：无变化（幂等）
   const db2 = openDb(path, { logger })
   assert.ok(db2)
   const dao2 = new KnowledgeDao(db2, logger)
   assert.equal(dao2.count('report'), 3)
-  assert.equal(checkSchemaVersion(db2), 5)
+  assert.equal(checkSchemaVersion(db2), 6)
   db2.close()
 
   // 原生 sqlite3 CLI 侧核对 user_version=5（node:sqlite 视角一致）
-  assert.equal(checkSchemaVersion(new DatabaseSync(path)), 5)
+  assert.equal(checkSchemaVersion(new DatabaseSync(path)), 6)
   rmSync(dir, { recursive: true, force: true })
 })
 
-test('迁移：user_version > 5 拒开；0/新建库直接建 v5', () => {
+test('迁移：user_version > 6 拒开；0/新建库直接建 v6', () => {
   const dir = mkdtempSync(join(tmpdir(), 'lurker-db-ver-'))
   const path = join(dir, 't.db')
   const db = new DatabaseSync(path)
-  db.exec('PRAGMA user_version = 6;')
+  db.exec('PRAGMA user_version = 7;')
   db.close()
-  assert.equal(openDb(path, { logger }), null, '>5 库应拒开并 warn')
+  assert.equal(openDb(path, { logger }), null, '>6 库应拒开并 warn')
 
   const fresh = join(dir, 'fresh.db')
   const db2 = openDb(fresh, { logger })
-  assert.ok(db2, '全新库应成功创建 v5')
-  assert.equal(checkSchemaVersion(db2), 5)
+  assert.ok(db2, '全新库应成功创建 v6')
+  assert.equal(checkSchemaVersion(db2), 6)
   db2.close()
   rmSync(dir, { recursive: true, force: true })
 })
 
-test('迁移：v4 库 → v5 纯新增两表两视图，既有数据零变化；重跑幂等；<4 拒开', () => {
+test('迁移：v4 库 → v6 链式（4→5→6）纯新增两表两视图，既有数据零变化；重跑幂等；<4 拒开', () => {
   const { path, dir } = tmpDb('migrate45')
-  const db = openDb(path, { logger }) // 先建 v5 库
+  const db = openDb(path, { logger }) // 先建 v6 库
   db.close()
   // 手动降到 v4 并删掉 v0.6 新对象，模拟真实 v4 库
   const raw = new DatabaseSync(path)
   raw.exec('PRAGMA foreign_keys = OFF;')
   raw.exec('DROP VIEW IF EXISTS v_marking_latest; DROP VIEW IF EXISTS v_report_revised;')
   raw.exec('DROP TABLE IF EXISTS marking; DROP TABLE IF EXISTS report_revision;')
+  // v6 新增对象一并降级，模拟真实 v4 库（entry 尚无 chat_id）
+  raw.exec('DROP INDEX IF EXISTS idx_entry_chat;')
+  raw.exec('ALTER TABLE entry DROP COLUMN chat_id;')
   raw.exec('PRAGMA user_version = 4;')
   raw.close()
 
@@ -315,8 +318,8 @@ test('迁移：v4 库 → v5 纯新增两表两视图，既有数据零变化；
   before.close()
 
   const db2 = openDb(path, { logger })
-  assert.ok(db2, 'v4 库应成功打开并迁移到 v5')
-  assert.equal(checkSchemaVersion(db2), 5)
+  assert.ok(db2, 'v4 库应成功打开并链式迁移到 v6')
+  assert.equal(checkSchemaVersion(db2), 6)
   const after = snapshot(db2)
   assert.deepEqual(after, snap, '迁移后既有行零变化')
   const dao = new KnowledgeDao(db2, logger)
@@ -327,7 +330,7 @@ test('迁移：v4 库 → v5 纯新增两表两视图，既有数据零变化；
   // 重跑幂等
   const db3 = openDb(path, { logger })
   assert.ok(db3)
-  assert.equal(checkSchemaVersion(db3), 5)
+  assert.equal(checkSchemaVersion(db3), 6)
   db3.close()
 
   // <4（除 0/3）拒开
@@ -639,7 +642,7 @@ test('doc 提取：无 URL 报告 → 零 doc；提取失败不影响 writeRepor
 
 // ==================== v0.6：修订历史 + 完成情况标记（TECH-v0.6 §4） ====================
 
-test('v0.6 迁移：v4 样例库 → uv=5、既有数据零变化；重跑幂等（DAO 视角）', () => {
+test('v0.6 迁移：v4 样例库 → 链式到 uv=6、既有数据零变化；重跑幂等（DAO 视角）', () => {
   const { path, dir } = tmpDb('v06-mig')
   const db = openDb(path, { logger })
   const dao = new KnowledgeDao(db, logger)
@@ -648,17 +651,19 @@ test('v0.6 迁移：v4 样例库 → uv=5、既有数据零变化；重跑幂等
   const raw = new DatabaseSync(path)
   raw.exec('DROP VIEW IF EXISTS v_marking_latest; DROP VIEW IF EXISTS v_report_revised;')
   raw.exec('DROP TABLE marking; DROP TABLE report_revision;')
+  raw.exec('DROP INDEX IF EXISTS idx_entry_chat;')
+  raw.exec('ALTER TABLE entry DROP COLUMN chat_id;')   // 模拟真实 v4 库（entry 尚无 chat_id）
   raw.exec('PRAGMA user_version = 4;')
   raw.close()
 
   const db2 = openDb(path, { logger })
   const dao2 = new KnowledgeDao(db2, logger)
-  assert.equal(checkSchemaVersion(db2), 5)
+  assert.equal(checkSchemaVersion(db2), 6)
   assert.equal(dao2.count('report'), 1, '既有 report 行零变化')
   assert.equal(dao2.getReport('daily', '2026-01-05').id, rid)
   db2.close()
   const db3 = openDb(path, { logger }) // 重跑幂等
-  assert.equal(checkSchemaVersion(db3), 5)
+  assert.equal(checkSchemaVersion(db3), 6)
   db3.close()
   rmSync(dir, { recursive: true, force: true })
 })

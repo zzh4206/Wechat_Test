@@ -54,6 +54,7 @@
 - **JSONL 永远是事实源**：SQLite 只是查询层，镜像与导入器使用同一套映射口径
 - **schema v0.4**：`report` 带 `chat_id`（冲突键三元组 `(period_type, period_start, chat_id)`，不再跨群聚合分节）、新增 `media` 元数据表（媒体本体永不入库）；`user_version` 迁移幂等，旧库自动升级
 - **报告落盘并行提取资料**：报告里的 URL / 文件索引自动入 `doc` 表，与 Python 批量脚本同口径零重复
+- **schema v6（entry 群归属）**：`entry` 增 `chat_id`（迁移回填 `'aggregate'`），镜像 opportunity→entry 带群 id，`report gen --chat-id` 只归档本群条目；`v_marking_latest` 按 `(chat_id, target_ref)` 分组；store.db 连接补 `busy_timeout=5000`
 - **审批闭环与报告修订流（schema v0.6）**：`ApprovalActions` 审批动作单入口 + `ActionInbox` 动作收件箱；报告修订写入 `report_revision`（不可变历史）并级联周报/月报，完成情况以 `marking`（done/undone/deleted 追加式）标记——全部镜像进知识库，形成「单一查询副本」
 
 ## 快速开始

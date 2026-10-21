@@ -28,6 +28,8 @@ export interface EntryInput {
   contentMd: string
   reportId?: number | null
   docId?: number | null
+  /** 群归属（v6 chat_id 列；缺省 'aggregate'） */
+  chatId?: string
   createdAt?: number
 }
 

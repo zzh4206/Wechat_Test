@@ -10,6 +10,9 @@
 
 - schema v0.6（审批双通道与报告修订流，TECH-v0.6 定稿）：纯新增 `report_revision`（修订历史，`source_key` 幂等、不可变事实、不建 report 外键）与 `marking`（完成情况标记，kind 三态 done/undone/deleted，同 `target_ref` 状态演变=追加行）两表及 `v_report_revised` / `v_marking_latest` 两视图，既有表零改动；`KnowledgeDao` 增 `insertReportRevision` / `insertMarking`（source_key 冲突→返回已有 id 不更新）/ `listRevisions` / `listMarkingsLatest`，`SqliteMirror` 增 `mirrorReportRevision` / `mirrorMarking`（safe 包裹，事件源接线由插件侧后续完成）；自动迁移升 user_version 4→5 单事务幂等（v3 先升 4 再升 5，0=全新建 v5，其余 <4 或 >5 拒开），与 Python 侧（0数据格式）逻辑一致
 
+- schema v6（工单 D-3/D-4/D-5/D-7，2026-10-20）：`entry` 增列 `chat_id`（迁移回填 `'aggregate'`）+ 索引 `idx_entry_chat`，`v_marking_latest` 分组改 `(chat_id, target_ref)`（不同群同名任务各留最新态）；`KnowledgeDao.insertEntry` / 镜像 `opportunity→entry` 带群 `chatId`；自动迁移升 user_version 5→6 链式幂等（v4 先升 5 再 6、v3 先升 4 再 5 再 6，0=全新建 v6，>6 拒开），与 Python 侧逻辑一致
+- group-store：store.db 连接补 `busy_timeout=5000`（D-7），写竞争时忙等而非即刻 SQLITE_BUSY
+
 ### Fixed
 
 - T4 语义：`upsertReport` 冲突分支不再用 `excluded.status` 覆盖既有 status——`final` 报告被修订后仍 `final`（修订不降级），`draft` 也不会被自动 final（draft→final 单向定稿由 finalize 通道承载），测试钉死

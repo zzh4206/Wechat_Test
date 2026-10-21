@@ -600,6 +600,7 @@ export class GroupStore {
     this.db = new DatabaseSync(dbPath)
     this.db.exec('PRAGMA journal_mode = WAL;')
     this.db.exec('PRAGMA foreign_keys = ON;')
+    this.db.exec('PRAGMA busy_timeout = 5000;')   // D-7：写竞争时忙等 5s，避免即刻 SQLITE_BUSY
     this.migrate()
   }
 

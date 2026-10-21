@@ -9,7 +9,7 @@
 import { DatabaseSync } from 'node:sqlite'
 import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
-import { MIGRATE_V3_TO_V4_SQL, MIGRATE_V4_TO_V5_SQL, SCHEMA_SQL, SCHEMA_VERSION } from './schema.js'
+import { MIGRATE_V3_TO_V4_SQL, MIGRATE_V4_TO_V5_SQL, MIGRATE_V5_TO_V6_SQL, SCHEMA_SQL, SCHEMA_VERSION } from './schema.js'
 
 export interface DbLogger {
   warn(message: string): unknown
@@ -19,8 +19,9 @@ export interface DbLogger {
 export interface OpenOptions {
   logger: DbLogger
   /**
-   * true（默认）时执行 schema 校准：v5 库跳过、v4 单事务迁移到 v5、v3 先升 4 再升 5、
-   * user_version=0（全新库）执行全量 DDL、>5 报错拒开。
+   * true（默认）时执行 schema 校准：v6 库跳过、v5 单事务迁移到 v6（entry.chat_id 回填
+   * 'aggregate' + 重建 v_marking_latest）、v4 先升 5 再 6、v3 先升 4 再 5 再 6、
+   * user_version=0（全新库）执行全量 DDL、>6 报错拒开。
    */
   initSchema?: boolean
 }
@@ -31,10 +32,12 @@ function getUserVersion(db: DatabaseSync): number {
 }
 
 /**
- * schema 校准（幂等、自动；TECH-v0.6 §2）：
- * - =5：跳过；>5：抛错（调用方拒开）；0（全新库）：执行 v0.6 全量 DDL；
- * - =4：单事务执行 v0.6 纯新增两表两视图（零数据改动），user_version 最后置 5；
- * - =3：先 3→4（report 重建 + media），再 4→5，各在独立单事务内（TECH-v0.6 定稿链），
+ * schema 校准（幂等、自动；TECH-v0.6 §2 + 工单 D-3/D-4）：
+ * - =6：跳过；>6：抛错（调用方拒开）；0（全新库）：执行 v6 全量 DDL；
+ * - =5：单事务执行 v5→6（entry ALTER ADD chat_id 回填 'aggregate' + 重建
+ *   v_marking_latest；report_revision/marking 零改动），user_version 最后置 6；
+ * - =4：先 4→5（纯新增两表两视图），再 5→6，各在独立单事务内；
+ * - =3：先 3→4（report 重建 + media），再 4→5→6，链式独立单事务，
  *   任何一步失败整体回滚该步（重入安全：失败后停留在原版本，下次打开重试）；
  * - 其余 <4（如 1/2）：抛错拒开。
  */
@@ -44,11 +47,11 @@ function ensureSchema(db: DatabaseSync, logger: DbLogger): void {
   if (version > SCHEMA_VERSION) {
     throw new Error(`schema version ${version} > supported ${SCHEMA_VERSION}, refusing to open`)
   }
-  if (version !== 0 && version !== 3 && version !== 4) {
-    throw new Error(`unsupported schema version ${version} (supported: 0/3/4/${SCHEMA_VERSION}), refusing to open`)
+  if (version !== 0 && version !== 3 && version !== 4 && version !== 5) {
+    throw new Error(`unsupported schema version ${version} (supported: 0/3/4/5/${SCHEMA_VERSION}), refusing to open`)
   }
   if (version === 0) {
-    // 全新库：直接执行 v0.6 全量 DDL（脚本自带 user_version=5）
+    // 全新库：直接执行 v6 全量 DDL（脚本自带 user_version=6）
     db.exec(SCHEMA_SQL)
     return
   }
@@ -56,7 +59,8 @@ function ensureSchema(db: DatabaseSync, logger: DbLogger): void {
   // PRAGMA foreign_keys 不参与事务回滚，故在事务外先 OFF、成功后再 ON。
   const migrations: Array<{ from: number; sql: string }> = []
   if (version === 3) migrations.push({ from: 3, sql: MIGRATE_V3_TO_V4_SQL })
-  migrations.push({ from: 4, sql: MIGRATE_V4_TO_V5_SQL })
+  if (version <= 4) migrations.push({ from: 4, sql: MIGRATE_V4_TO_V5_SQL })
+  migrations.push({ from: 5, sql: MIGRATE_V5_TO_V6_SQL })
   db.exec('PRAGMA foreign_keys = OFF;')
   try {
     for (const m of migrations) {

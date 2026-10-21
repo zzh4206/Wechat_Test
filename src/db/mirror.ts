@@ -235,7 +235,7 @@ export function createSqliteMirror(sqlitePath: string | undefined, logger: DbLog
     }
   }
 
-  const mirrorInsight = (raw: unknown): void => {
+  const mirrorInsight = (chatId: string, raw: unknown): void => {
     const entry = (typeof raw === 'object' && raw !== null ? raw : {}) as Record<string, unknown>
     const type = typeof entry.type === 'string' ? entry.type : ''
     const text =
@@ -258,9 +258,9 @@ export function createSqliteMirror(sqlitePath: string | undefined, logger: DbLog
     const topic = typeof entry.topic === 'string' && entry.topic ? entry.topic : title
     const day = dayKeyOf(entry.ts)
     if (type === 'opportunity') {
-      // 面向报告的原子素材 → entry
+      // 面向报告的原子素材 → entry（v6：带群归属 chatId，report gen --chat-id 只归档本群）
       const ms = typeof entry.ts === 'number' ? entry.ts : typeof entry.ts === 'string' ? Date.parse(entry.ts) : Date.now()
-      safe(() => dao.insertEntry({ ts: Number.isFinite(ms) ? ms : Date.now(), kind: 'idea', contentMd: text }))
+      safe(() => dao.insertEntry({ ts: Number.isFinite(ms) ? ms : Date.now(), kind: 'idea', contentMd: text, chatId }))
       return
     }
     // topic / viewpoint / quote → chat_digest（source_key 内容级幂等）
@@ -338,7 +338,8 @@ export function createSqliteMirror(sqlitePath: string | undefined, logger: DbLog
 
   return {
     mirrorJsonl(rel, entry) {
-      if (INSIGHTS_RE.test(rel)) safe(() => mirrorInsight(entry))
+      const chat = INSIGHTS_RE.exec(rel)
+      if (chat) safe(() => mirrorInsight(chat[1], entry))
       else logger.debug?.(`mirror: no mapping for jsonl ${rel}, skipped`)
     },
 
