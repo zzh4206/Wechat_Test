@@ -10,12 +10,12 @@
 |---|---|---|
 | P0/P1/P2 | 事故/缺陷严重级别（**保留专用**，不再作他用） | 安全报告系列、验收审核 |
 | R1–R5 | 五条安全红线 | SECURITY-TEST-PLAN §0 |
-| Q1–Q5 | 前端设计待决问题 | 前端工作台设计（讨论稿，未入库） |
+| Q1–Q5 | 前端设计待决问题 | [TECH-DESIGN-frontend](TECH-DESIGN-frontend.md) §11 |
 | T1–T8 | 模板侧落点（0数据格式 协同项） | REQUIREMENT-v0.6 §8 |
 | PLG-1–3 | 插件侧职责（v0.6 追溯矩阵；原 P1–P3 规范化） | REQUIREMENT-v0.6 §8 |
 | C1–C3 | 审批闭环实施分期 | TECH-DESIGN-confirm-loop §6 |
 | M1–M3 | 审批标记实施分期 | DESIGN-approval-marking §8 |
-| FE-1–3 | 前端工作台实施分期（原 P0–P2 规范化；**已分配给前端会话**） | 前端设计讨论稿（未入库） |
+| FE-1–3 | 前端工作台实施分期（原 P0–P2 规范化；**已分配给前端会话**） | [TECH-DESIGN-frontend](TECH-DESIGN-frontend.md) §1 / §9 |
 | G1–G4 | 知识库接入缺口编号；G1 亦为 AX 能力闸门（语境区分） | 缺口分析报告 / AX 探针报告 |
 | E1/E2 | LLM 治理证据分级 | TECH-DESIGN-llm-overload-mitigation |
 | F1–F8 | 产品功能编号 | 功能文档 |

@@ -2,7 +2,7 @@
 
 - 版本：v0.2（2026-10-20 修订：§3.1 按数据负责人架构约束 1 改版——单一查询副本，插件侧不落表；出处 [REPLY-PM-v0.6-验收与架构约束.md](../../docs/REPLY-PM-v0.6-验收与架构约束.md) §二）
 - 状态：待评审
-- 关联：[TECH-DESIGN-confirm-loop.md](TECH-DESIGN-confirm-loop.md)（审批双通道代码结构）、[前端工作台设计（**讨论稿，暂未入库**——按 PM 指示维持讨论阶段，入库待定；本文件以设计草案 v0.1 微信接收件为准；）
+- 关联：[TECH-DESIGN-confirm-loop.md](TECH-DESIGN-confirm-loop.md)（审批双通道代码结构）、[TECH-DESIGN-frontend.md](TECH-DESIGN-frontend.md)（前端工作台设计草案 v0.1）
 - 核心区分：**审批 ≠ 标记**——两者独立建模，对报告的作用面不同
 
 ---

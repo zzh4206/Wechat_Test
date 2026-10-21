@@ -2,7 +2,7 @@
 
 - 版本：v0.1（草案）
 - 状态：待评审
-- 关联：[前端工作台设计（**讨论稿，暂未入库**——按 PM 指示维持讨论阶段，入库待定；本文件以设计草案 v0.1 微信接收件为准；：方案 B 动作收件箱）、[DESIGN-approval-marking.md](DESIGN-approval-marking.md)（审批与标记的报告修正流）
+- 关联：[TECH-DESIGN-frontend.md](TECH-DESIGN-frontend.md)（前端工作台设计草案 v0.1：方案 B 动作收件箱）、[DESIGN-approval-marking.md](DESIGN-approval-marking.md)（审批与标记的报告修正流）
 - 数据层依据：`src/group-store.ts`（tasks / promises / events 表）、`src/task-recognition.ts`、`src/promise-track.ts`
 
 ---
