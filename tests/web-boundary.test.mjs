@@ -2,7 +2,8 @@
 // 静态断言钉死「监听端口的进程与发送出口物理隔离」：
 // - web/ 只 import node: 内置模块或 web/ 内相对路径（不碰 src/、插件 lib/、npm 包），无动态 import/require；
 // - 无 child_process / worker_threads / 出网原语；服务端零 fetch；
-// - fs 写原语只允许出现在动作写入模块（FE-2 起的 web/lib/actions.mjs；FE-1 不存在 = 全禁）；
+// - fs 写原语只允许出现在动作写入模块 web/lib/actions.mjs，且该模块只能追加（RUNBOOK §13.1：
+//   插件水位是字节偏移，截断/改写/轮转 actions.jsonl 会让插件从头 resync）；
 // - listen 地址字面量必须为 127.0.0.1；
 // - public/ 的 fetch 只打同源 /api/，且不出现 innerHTML 类 HTML 注入原语。
 import test from 'node:test'
@@ -67,10 +68,22 @@ test('无子进程、线程与出网原语', () => {
   assert.deepEqual(bad, [])
 })
 
-test('fs 写原语只在动作写入模块（FE-1 = 全禁）', () => {
+const FS_WRITE_RE = /\b(writeFile|appendFile|createWriteStream|mkdir|rm|rmdir|unlink|rename|copyFile|cp|truncate|ftruncate|symlink|link|chmod|chown|utimes|open|write|writev)(Sync)?\s*\(/
+
+test('fs 写原语只在动作写入模块', () => {
   const others = serverSide.filter(f => !WRITE_ALLOWED.has(f.rel))
-  const bad = hits(others, /\b(writeFile|appendFile|createWriteStream|mkdir|rm|rmdir|unlink|rename|copyFile|cp|truncate|symlink|link|chmod|chown|utimes|open)(Sync)?\s*\(/)
-  assert.deepEqual(bad, [])
+  assert.deepEqual(hits(others, FS_WRITE_RE), [])
+})
+
+test('动作写入模块只追加：仅一处 appendFile、可建 web/ 目录，其余写原语全禁', () => {
+  const mod = serverSide.find(f => f.rel === join('lib', 'actions.mjs'))
+  assert.ok(mod, 'web/lib/actions.mjs 不存在')
+  const bad = hits([mod], FS_WRITE_RE).filter(l => !/\b(appendFileSync|mkdirSync)\s*\(/.test(l))
+  assert.deepEqual(bad, [], '只许 appendFileSync / mkdirSync')
+  const appends = [...mod.code.matchAll(/\bappendFileSync\s*\(([^)]*)\)/g)]
+  assert.equal(appends.length, 1, '只许一处 appendFileSync')
+  assert.doesNotMatch(appends[0][1], /flag\s*:/, '不得改 flag（appendFileSync 缺省即追加）')
+  assert.match(mod.code, /lstatSync\([^)]*\)\.isSymbolicLink\(\)/, '写前必须拒绝符号链接（R3）')
 })
 
 test('listen 地址字面量必须为 127.0.0.1', () => {
