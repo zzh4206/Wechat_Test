@@ -19,7 +19,8 @@
  *    - 只重新生成、**不创建 outbox 条目**：推送到手机须另走「排入发件箱」，发送只有一个入口；
  *    - 空产出不重试（重试是为错号切换后等消息同步，手动重跑无此前提），如实结束；
  *    - 独立轮询触发（不依赖日报 tick 与账号闸是否注入）；账号闸注入且当前错号时跳过本轮，
- *      避免用错号的空数据覆盖正常报告。
+ *      避免用错号的空数据覆盖正常报告；
+ *    - chatId='aggregate'（跨群汇总，只有日报）改调 generateSummary(该日原定生成时刻)：按各群该日现有日报重新汇总，不调 LLM。
  */
 import type { Outbox } from './outbox.js'
 import type { Store } from './store.js'
@@ -27,6 +28,13 @@ import type { StoreLogger } from './store.js'
 import type { RegenEntry, RegenQueue } from './regen-queue.js'
 
 export const REGEN_EMPTY_MAX_ATTEMPTS = 2 // 空产出重试上限（共 1+2=3 次生成尝试）
+/** 回填生成的 asOf：日报截到该日原定生成时刻；周/月报沿用 now（窗口终点口径另议） */
+function regenAsOf(deps: Pick<RegenProcessorDeps, 'now' | 'dailyReportTime'>, kind: RegenEntry['kind'], dateKey: string): number {
+  return kind === 'daily' ? dailyCutoff(dateKey, deps.dailyReportTime, deps.now()) : deps.now()
+}
+
+/** 跨群汇总的 chatId（与 store / knowledge.db 的 report.chat_id 同值） */
+export const AGGREGATE_CHAT_ID = 'aggregate'
 
 export interface RegenProcessorDeps {
   queue: RegenQueue
@@ -39,11 +47,13 @@ export interface RegenProcessorDeps {
   /** 审计出口（零正文：只记元数据） */
   audit: (entry: Record<string, unknown>) => void
   now: () => number
+  /** 日报触达时点 HH:MM（Config.dailyReportTime）：历史日的日报/汇总窗口截到该日这一刻（见 dailyCutoff） */
+  dailyReportTime?: string
 }
 
 export interface RegenProcessOutcome {
   /** handled = 已处理（出队或定稿）；deferred = 放回队首；empty = 队列空 */
-  action: 'satisfied' | 'regenerated' | 'deferred_sync_pending' | 'empty_confirmed' | 'env_deferred' | 'empty' | 'manual_regenerated' | 'manual_skipped_account'
+  action: 'satisfied' | 'regenerated' | 'deferred_sync_pending' | 'empty_confirmed' | 'env_deferred' | 'empty' | 'manual_regenerated' | 'manual_skipped_account' | 'manual_failed'
   entry: RegenEntry | null
 }
 
@@ -66,7 +76,7 @@ export async function processRegenHead(deps: RegenProcessorDeps): Promise<RegenP
 
   let rr
   try {
-    rr = await deps.report.generateReport(chatId, kind, deps.now(), dateKey)
+    rr = await deps.report.generateReport(chatId, kind, regenAsOf(deps, kind, dateKey), dateKey)
   } catch (error) {
     // 环境类失败：留在原位，不消耗重试次数（与熄屏 deferred 同语义）
     deps.audit({ result: 'regen_env_deferred', chat_id: chatId, date_key: dateKey, kind })
@@ -99,9 +109,28 @@ export async function processRegenHead(deps: RegenProcessorDeps): Promise<RegenP
 }
 
 /** 手动重跑的依赖：不需要 outbox / groupStore（不发送、不做 satisfied 检查） */
-export type ManualRegenDeps = Pick<RegenProcessorDeps, 'queue' | 'report' | 'logger' | 'notify' | 'audit' | 'now'> & {
+export type ManualRegenDeps = Pick<RegenProcessorDeps, 'queue' | 'logger' | 'notify' | 'audit' | 'now' | 'dailyReportTime'> & {
+  report: RegenProcessorDeps['report'] & {
+    /** 跨群汇总重跑（缺省 = aggregate 条目按失败出队） */
+    generateSummary?: (asOf?: number) => Promise<{ path: string | null; groupsIncluded: number }>
+  }
   /** 账号闸：返回 false = 当前错号，跳过本轮（未注入账号闸时恒 true） */
   accountOk?: () => Promise<boolean>
+}
+
+/**
+ * 历史日的窗口截止时刻 = 该日原定生成时刻（dateKey 当天 dailyReportTime），且不晚于 now。
+ * 日报重跑/补发与汇总重跑共用：之后几天的消息不进该日窗口（审批/标记的后续变化走修订流，不靠扩窗）。
+ * 时点缺失/非法时退到该日 23:59:59.999（仍落在该日：reportWindow 据 asOf 推 dateKey）。
+ */
+export function dailyCutoff(dateKey: string, dailyReportTime: string | undefined, now: number): number {
+  const d = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateKey)
+  if (!d) return now
+  const t = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(dailyReportTime ?? '')
+  const at = t
+    ? new Date(Number(d[1]), Number(d[2]) - 1, Number(d[3]), Number(t[1]), Number(t[2])).getTime()
+    : new Date(Number(d[1]), Number(d[2]) - 1, Number(d[3]) + 1).getTime() - 1
+  return Math.min(now, at)
 }
 
 /** 处理最早的一条手动重跑（每次一条）。只重新生成报告，不创建 outbox 条目 */
@@ -113,9 +142,10 @@ export async function processManualRegen(deps: ManualRegenDeps): Promise<RegenPr
     // 错号在线：重跑只会得到空数据并覆盖正常报告 → 留在原位等正号
     return { action: 'manual_skipped_account', entry }
   }
+  if (chatId === AGGREGATE_CHAT_ID) return processManualSummary(deps, entry)
   let rr
   try {
-    rr = await deps.report.generateReport(chatId, kind, deps.now(), dateKey)
+    rr = await deps.report.generateReport(chatId, kind, regenAsOf(deps, kind, dateKey), dateKey)
   } catch (error) {
     deps.audit({ result: 'regen_env_deferred', chat_id: chatId, date_key: dateKey, kind, reason: 'manual' })
     deps.logger.warn(`regen-queue: 手动重跑生成异常（留在原位） ${chatId}/${dateKey}: ${String(error).slice(0, 120)}`)
@@ -124,6 +154,28 @@ export async function processManualRegen(deps: ManualRegenDeps): Promise<RegenPr
   deps.queue.remove(entry)
   deps.audit({ result: 'regen_manual_done', chat_id: chatId, date_key: dateKey, kind, status: rr.status, messageCount: rr.messageCount })
   await deps.notify?.(`${KIND_NAME[kind]}已重新生成（${chatId} ${dateKey}）`, rr.status === 'empty' ? '本期窗口内无消息' : `关键判断 ${rr.judgmentCount} 条`)
+  return { action: 'manual_regenerated', entry }
+}
+
+/** 跨群汇总重跑：只读各群现有日报重新汇总（无 LLM）；写入失败如实出队，不无限重试 */
+async function processManualSummary(deps: ManualRegenDeps, entry: RegenEntry): Promise<RegenProcessOutcome> {
+  const { chatId, dateKey, kind } = entry
+  let s: { path: string | null; groupsIncluded: number } | null = null
+  try {
+    s = deps.report.generateSummary ? await deps.report.generateSummary(dailyCutoff(dateKey, deps.dailyReportTime, deps.now())) : null
+  } catch (error) {
+    deps.audit({ result: 'regen_env_deferred', chat_id: chatId, date_key: dateKey, kind, reason: 'manual' })
+    deps.logger.warn(`regen-queue: 跨群汇总重跑异常（留在原位） ${dateKey}: ${String(error).slice(0, 120)}`)
+    return { action: 'env_deferred', entry }
+  }
+  deps.queue.remove(entry)
+  if (!s || s.path === null) {
+    deps.audit({ result: 'regen_manual_failed', chat_id: chatId, date_key: dateKey, kind })
+    deps.logger.warn(`regen-queue: 跨群汇总重跑未产出文件（已出队） ${dateKey}`)
+    return { action: 'manual_failed', entry }
+  }
+  deps.audit({ result: 'regen_manual_done', chat_id: chatId, date_key: dateKey, kind, status: 'ok', groupsIncluded: s.groupsIncluded })
+  await deps.notify?.(`跨群汇总已重新生成（${dateKey}）`, `汇总 ${s.groupsIncluded} 个群的现有日报`)
   return { action: 'manual_regenerated', entry }
 }
 

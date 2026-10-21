@@ -514,6 +514,9 @@ Accessibility Inspector 确认元素层级）。**实证结论回填此处：___
   不重试；账号闸配置且错号在线时跳过本轮（防空数据覆盖正常报告）。审计 `regen_manual_done`。
   要推送到手机须另走「排入发件箱」（发送只有一个入口）。错号补发的 satisfied 检查、重试计数与
   outbox 条目均按条目自身周期（日/周/月）处理。
+- **回填窗口终点（2026-10-21）**：错号补发与手动重跑的**日报**，窗口 = [该日前一日 20:20, 该日
+  `dailyReportTime`]（不晚于现在），与当天定时生成一致——几天后重跑不会把之后的消息喂给 LLM。
+  条目后来的审批/标记走修订流（§13、审批标记设计），不靠扩大消息窗口体现。周/月报回填终点仍为现在。
 - **账号闸 fail-closed 强化（2026-10-21 误发事故修复）**：旧实现用 2s 写入流采样判活跃账号，
   微信空闲时返回 null 而 sender 把 null 当"不挂起"——登录大号期间照发（事件：2026-10-21 两条日报
   从大号发出，回读判 failed_wrong_target，无法撤回）。现判据三道：①2s 写入流（强信号）→
@@ -661,7 +664,16 @@ LURKER_WEB_TOKEN='<与插件 webActionsToken 相同的值>' \
 - 「重新生成」`report.regen`：入手动重跑队列（§12.5 附近「手动重新生成」），插件约 30 秒内开始、
   LLM 生成需要一会儿，稍后刷新。**只重写报告、不进发件箱**；同一份已在队列中回执 `duplicate`。
 - 参数为 `{kind, dateKey}`，dateKey 必须是周期起点（日报当天、周报周一、月报 1 号）。
-  跨群聚合报告不提供这两个操作（聚合不在群白名单内）。
+- **跨群聚合报告**（`chatId='aggregate'`，只有日报）同样可定稿、重新生成、排入发件箱（后者见 §14.5）。
+  聚合不是群、不在白名单里：插件收件箱与 web 侧只对 `report.*` 三个动作放行 `aggregate`，且只认
+  `kind: 'daily'`（其它周期回执 `bad_request`，原因 `aggregate_daily_only`），任务/承诺等动作仍回
+  `chat_not_allowed`。聚合的「重新生成」**不调 LLM**：按各群当天现有日报重新汇总，消息统计窗口截到该日原定生成时刻
+  （[前一日 20:20, 该日 `dailyReportTime`]，与当天定时生成一致，之后几天的消息不计入）；想更新某个群在汇总里的内容，先重新生成那个群的日报、再重新生成汇总。
+  周/月汇总目前**尚未生成**（knowledge.db 里的 weekly/monthly aggregate 行只是占位），详情页对它们不显示操作。
+  以后接上周/月汇总时，除 `generateSummary` 里 `writeReport` 的 kind 外，还要一起改：同函数里写死的
+  `reportWindow('daily')` 与 `reports/summary/<日期>.md` 路径、读各群报告时的 kind；调度端 `maybeSummarize`
+  （目前只在日报后触发）；手动重跑 `processManualSummary` 传 kind；收件箱与 `web/lib/actions.mjs` 的
+  `aggregate_daily_only` 两道校验；`app.js` 的 `reportActions` 周/月汇总提示。
 
 ### 14.3 拒绝启动 / 接口报错
 

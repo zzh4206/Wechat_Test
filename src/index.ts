@@ -552,6 +552,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
               notify: async (title, body) => { await notifier.notify('daily', title, body) },
               audit: (entry) => regenAudit(String(entry.result), String(entry.chat_id), String(entry.date_key), entry),
               now: () => Date.now(),
+              dailyReportTime: config.dailyReportTime,
             })
             if (outcome.action === 'regenerated') logger.info(`scheduler[daily]: 补发日报已生成并入发送队列`)
             else if (outcome.action !== 'empty') logger.warn(`scheduler[daily]: 补发队列处理结局=${outcome.action}`)
@@ -1147,6 +1148,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
             } catch { /* 审计失败不阻塞 */ }
           },
           now: () => Date.now(),
+          dailyReportTime: config.dailyReportTime,
           accountOk: accountGate
             ? async () => {
                 const active = await accountGate.activeAccount()

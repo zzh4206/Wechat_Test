@@ -15,6 +15,7 @@
 import type { Store } from './store.js'
 import type { Outbox } from './outbox.js'
 import { reportRelPath } from './report.js'
+import { AGGREGATE_CHAT_ID } from './regen-processor.js'
 
 export type ReportKind = 'daily' | 'weekly' | 'monthly'
 export type ReportOutboxResult = 'ok' | 'not_found' | 'duplicate'
@@ -46,7 +47,9 @@ export function createReportOutbox(deps: ReportOutboxDeps): (chatId: string, kin
     const revisions = deps.store.listRevisions(chatId, kind, dateKey).length
     deps.outbox.appendOutbox({
       kind,
-      title: `${KIND_NAME[kind]} ${dateKey}（${chatId}）${WEB_PUSH_MARK}`,
+      title: chatId === AGGREGATE_CHAT_ID
+        ? `跨群汇总 ${dateKey}${WEB_PUSH_MARK}`
+        : `${KIND_NAME[kind]} ${dateKey}（${chatId}）${WEB_PUSH_MARK}`,
       body: revisions > 0 ? `修订 ${revisions} 处，全文见工作台` : '全文见工作台',
       evidence_ref: rel,
     })

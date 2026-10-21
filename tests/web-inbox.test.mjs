@@ -361,7 +361,7 @@ test('重新生成：前端提交 → 插件入手动重跑队列（reason=manua
   } finally { await env.stop() }
 })
 
-test('报告操作参数校验：周报须周一、月报须 1 号、非法日期/周期、聚合与白名单外群 → 拒绝且零落盘', async () => {
+test('报告操作参数校验：周报须周一、月报须 1 号、非法日期/周期、聚合非日报与白名单外群 → 拒绝且零落盘', async () => {
   const env = await makeEnv()
   try {
     const cases = [
@@ -369,7 +369,7 @@ test('报告操作参数校验：周报须周一、月报须 1 号、非法日�
       [{ type: 'report.regen', chatId: CHAT, params: { kind: 'monthly', dateKey: '2026-10-02' } }, 400, 'not_month_start'],
       [{ type: 'report.regen', chatId: CHAT, params: { kind: 'daily', dateKey: '2026-02-30' } }, 400, 'date_format'],
       [{ type: 'report.regen', chatId: CHAT, params: { kind: 'yearly', dateKey: '2026-01-01' } }, 400, 'kind_not_allowed'],
-      [{ type: 'report.finalize', chatId: 'aggregate', params: { kind: 'daily', dateKey: ORIGIN_KEY } }, 403, undefined],
+      [{ type: 'report.finalize', chatId: 'aggregate', params: { kind: 'weekly', dateKey: '2026-10-12' } }, 400, 'aggregate_daily_only'],
       [{ type: 'report.finalize', chatId: OUTSIDE, params: { kind: 'daily', dateKey: ORIGIN_KEY } }, 403, undefined],
     ]
     for (const [body, status, reason] of cases) {
@@ -414,5 +414,45 @@ test('排入发件箱：开关开 → 提交 → 插件入队一条同形条目�
     assert.equal(entries.length, 1)
     assert.deepEqual([entries[0].kind, entries[0].status, entries[0].channel], ['daily', 'pending', 'filehelper'])
     assert.equal(JSON.stringify(entries[0]).includes('synth-0009'), false)
+  } finally { await env.stop() }
+})
+
+// —— 跨群汇总的报告操作（只有日报；聚合不是群，只放行 report.*） ——
+
+test('跨群汇总：定稿 / 重新生成（入手动重跑队列）/ 排入发件箱 闭环', async () => {
+  const env = await makeEnv({ outboxEnabled: true })
+  try {
+    env.store.writeReport('daily', 'aggregate', ORIGIN_KEY, `# 跨群汇总 · ${ORIGIN_KEY}\n\n正文\n`)
+    const rep = (await env.get('/api/reports?chat=aggregate')).body.find(r => r.periodStart === ORIGIN_KEY)
+    assert.equal(rep.status, 'draft')
+    const params = { kind: 'daily', dateKey: ORIGIN_KEY }
+    const f = await env.post({ type: 'report.finalize', chatId: 'aggregate', params })
+    const g = await env.post({ type: 'report.regen', chatId: 'aggregate', params })
+    const o = await env.post({ type: 'report.toOutbox', chatId: 'aggregate', params })
+    assert.deepEqual([f.status, g.status, o.status], [202, 202, 202])
+    await env.inbox.poll()
+    for (const p of [f, g, o]) assert.equal((await env.get(`/api/actions/${p.body.actionId}`)).body.code, 'ok')
+    assert.equal((await env.get(`/api/reports/${rep.id}`)).body.status, 'final')
+    assert.deepEqual(env.regenQueue.list().map(e => [e.chatId, e.kind, e.dateKey, e.reason]), [['aggregate', 'daily', ORIGIN_KEY, 'manual']])
+    const entries = new Outbox({ store: env.store }).listOutbox()
+    assert.deepEqual(entries.map(e => [e.title, e.evidence_ref]), [[`跨群汇总 ${ORIGIN_KEY}（前端补推）`, `reports/summary/${ORIGIN_KEY}.md`]])
+  } finally { await env.stop() }
+})
+
+test('跨群汇总：手写行绕过 web——非报告操作 chat_not_allowed、周报 bad_request，均不执行', async () => {
+  const env = await makeEnv()
+  try {
+    const { appendFileSync } = await import('node:fs')
+    const op = fingerprint(TOKEN)
+    const lines = [
+      { actionId: 'a-1760000000001-00000001', type: 'task.confirm', targetId: env.ids.pendingTask },
+      { actionId: 'a-1760000000002-00000002', type: 'report.regen', params: { kind: 'weekly', dateKey: '2026-10-12' } },
+    ]
+    for (const l of lines) appendFileSync(join(env.dir, 'web', 'actions.jsonl'), JSON.stringify({ ts: 1, chatId: 'aggregate', operator: op, ...l }) + '\n')
+    await env.inbox.poll()
+    assert.equal((await env.get('/api/actions/a-1760000000001-00000001')).body.code, 'chat_not_allowed')
+    assert.equal((await env.get('/api/actions/a-1760000000002-00000002')).body.code, 'bad_request')
+    assert.equal(env.regenQueue.list().length, 0)
+    assert.equal(env.groupStore.getTask(CHAT, env.ids.pendingTask).status, 'pending_confirm')
   } finally { await env.stop() }
 })

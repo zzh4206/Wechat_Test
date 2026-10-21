@@ -184,13 +184,15 @@ async function openReport(id, into) {
 
 // —— 报告操作（FE-3：定稿 / 重新生成不发送；排入发件箱走既有发送链路） ——
 
-/** 详情页操作条。跨群聚合不是群，插件白名单里没有它，不提供操作 */
+/** 详情页操作条。跨群聚合（只有日报）同样可定稿 / 重新生成 / 排入发件箱；它的重新生成只是按各群现有日报重新汇总 */
 function reportActions(r, into) {
-  if (r.chatId === AGGREGATE) return null
+  const aggregate = r.chatId === AGGREGATE
+  // 周/月汇总尚未生成（knowledge.db 里只是占位行），插件只认日报汇总的操作
+  if (aggregate && r.periodType !== 'daily') return h('div', { class: 'actions report-actions' }, h('span', { class: 'muted' }, '周/月汇总暂未生成，不提供操作'))
   const status = h('span', { class: 'status' })
   const buttons = []
   const params = { kind: r.periodType, dateKey: r.periodStart }
-  const label = `${PERIOD_NAME[r.periodType]} ${r.periodStart}`
+  const label = aggregate ? `跨群汇总 ${r.periodStart}` : `${PERIOD_NAME[r.periodType]} ${r.periodStart}`
   const finalize = r.status === 'draft'
     ? h('button', { type: 'button', class: 'primary', disabled: !state.actions.enabled, onclick: async () => {
         if (!confirm(`把「${label}」定稿？定稿是单向的，之后不能改回草稿（修订和重新生成仍会更新正文）。`)) return
@@ -200,9 +202,10 @@ function reportActions(r, into) {
       } }, '定稿')
     : null
   const regen = h('button', { type: 'button', disabled: !state.actions.enabled, onclick: async () => {
-    if (!confirm(`重新生成「${label}」？会用当前消息重写正文（${r.status === 'final' ? '定稿状态保持；' : ''}修订历史保留），不会发送。`)) return
+    const how = aggregate ? '会按各群当天现有的日报重新汇总（不调用 LLM；想更新某个群的内容，先重新生成那个群的日报）' : '会用当前消息重写正文'
+    if (!confirm(`重新生成「${label}」？${how}（${r.status === 'final' ? '定稿状态保持；' : ''}修订历史保留），不会发送。`)) return
     await submitAction({ type: 'report.regen', chatId: r.chatId, params }, status, buttons,
-      { ok: '已排入重新生成：插件约 30 秒内开始，LLM 生成需要一会儿，稍后刷新查看', duplicate: '已在重新生成队列中' })
+      { ok: aggregate ? '已排入重新汇总：插件约 30 秒内处理，稍后刷新查看' : '已排入重新生成：插件约 30 秒内开始，LLM 生成需要一会儿，稍后刷新查看', duplicate: '已在重新生成队列中' })
   } }, '重新生成')
   // 排入发件箱：唯一会走向发送的操作。插件开关关时置灰；开着也要二次确认，并说明之后仍受发送层四道闸约束
   const outboxOn = state.actions.enabled && state.actions.outboxEnabled === true
