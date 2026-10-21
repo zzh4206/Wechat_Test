@@ -33,8 +33,20 @@ export interface ApprovalActionsDeps {
   revision: { onApproval: (chatId: string, targetKind: 'task' | 'promise' | 'event', targetId: number, summary: string, source: 'chat' | 'web') => Promise<boolean> }
   /** 标记通道（必选；完成语义统一：complete 转调 markTarget('completed')——完成状态单一事实源） */
   marks: { markTarget: (chatId: string, targetKind: 'task' | 'promise', targetId: number, status: 'completed' | 'incomplete' | 'deleted', source: 'chat' | 'web') => Promise<boolean> }
+  /**
+   * 报告定稿通道（knowledge.db；接线层注入 Store.finalizeReport + 修订镜像）。
+   * 缺省 = reportFinalize 返回 'unavailable'。
+   */
+  reports?: {
+    finalizeReport: (chatId: string, kind: ReportKind, periodStart: string) => 'ok' | 'not_found' | 'already_final' | 'error' | 'unavailable'
+    /** 定稿成功后记一条修订（type='status'），详情页修订历史可见 */
+    recordRevision: (chatId: string, kind: ReportKind, periodStart: string, ts: number, summary: string, source: 'chat' | 'web') => boolean
+  }
   now?: () => number
 }
+
+/** 定稿结果：ok / 目标不存在 / 已是定稿 / 未启用知识库镜像 / 写库失败 */
+export type FinalizeResult = 'ok' | 'not_found' | 'already_final' | 'unavailable' | 'error'
 
 /** 审批动作门面：所有通道的唯一入口（零直改 SQL——全部经既有服务方法） */
 export class ApprovalActions {
@@ -157,6 +169,22 @@ export class ApprovalActions {
   async personUnfollow(chatId: string, pid: string): Promise<boolean> {
     const ok = await this.deps.store.setIdentityWatchLevel(chatId, pid, 'off')
     return this.receipt(ok, 'approval', '已取消关注', ok ? `已取消关注 ${pid}（${chatId}）` : `取消关注失败：${pid} 不在 ${chatId} 的 identities 中`)
+  }
+
+  // —— 报告定稿（FE-3：draft → final 单向） ——
+
+  /**
+   * 定稿：periodStart = 周期起点（日报当天 / 周报周一 / 月报 1 号）。
+   * 返回细分结果供收件箱映射回执码（already_final → status_conflict）。
+   */
+  async reportFinalize(chatId: string, periodStart: string, kind: ReportKind = 'daily', source: 'chat' | 'web' = 'chat'): Promise<FinalizeResult> {
+    if (!this.deps.reports) return 'unavailable'
+    const r = this.deps.reports.finalizeReport(chatId, kind, periodStart)
+    if (r === 'ok') {
+      this.deps.reports.recordRevision(chatId, kind, periodStart, this.now(), '报告定稿（draft → final）', source)
+      await this.deps.notify('approval', '报告已定稿', `${kind} ${periodStart}（${chatId}）已定稿`)
+    }
+    return r
   }
 
   // —— 报告补生成（经泛化后的 regen 队列，阶段三接线） ——

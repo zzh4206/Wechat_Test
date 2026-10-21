@@ -105,3 +105,83 @@ test('index.ts 把 resolveInboxTarget 注入 ActionInbox（未注入时收件箱
   const src = readFileSync(join(import.meta.dirname, '..', 'src', 'index.ts'), 'utf8')
   assert.match(src, /resolveTarget: resolveInboxTarget/)
 })
+
+test('report.finalize：draft → final + 修订行（source=web）；重复定稿 status_conflict；不存在 not_found；定稿后重写正文仍 final', async () => {
+  const env = makeEnv()
+  const { ActionInbox, ACTIONS_REL, ACTION_RESULTS_REL } = await import('../lib/action-inbox.js')
+  try {
+    env.store.writeReport('daily', CHAT, ORIGIN_KEY, `# 日报 ${ORIGIN_KEY}\n\n初稿\n`)
+    assert.equal(env.dao.getReport('daily', ORIGIN_KEY, CHAT).status, 'draft')
+    const inbox = new ActionInbox({ store: env.store, actions: env.approvalActions, groups: [CHAT], logger: { warn() {}, error() {} } })
+    const lines = [
+      { actionId: 'f1', type: 'report.finalize', params: { kind: 'daily', dateKey: ORIGIN_KEY } },
+      { actionId: 'f2', type: 'report.finalize', params: { kind: 'daily', dateKey: ORIGIN_KEY } },
+      { actionId: 'f3', type: 'report.finalize', params: { kind: 'daily', dateKey: '2026-10-15' } },
+      { actionId: 'f4', type: 'report.finalize', params: { kind: 'weekly', dateKey: '2026-10-14' } }, // 周二不是周期起点
+    ]
+    env.store.ensureDir('web')
+    env.store.writeText(ACTIONS_REL, lines.map(l => JSON.stringify({ ts: 1, chatId: CHAT, ...l })).join('\n') + '\n')
+    await inbox.poll()
+    const codes = env.store.readText(ACTION_RESULTS_REL).trim().split('\n').map(JSON.parse).map(r => [r.actionId, r.code])
+    assert.deepEqual(codes, [['f1', 'ok'], ['f2', 'status_conflict'], ['f3', 'not_found'], ['f4', 'bad_request']])
+    assert.equal(env.dao.getReport('daily', ORIGIN_KEY, CHAT).status, 'final')
+    const revs = env.dao.listRevisions(CHAT, 'daily').filter(r => r.type === 'status')
+    assert.equal(revs.length, 1)
+    assert.equal(revs[0].source, 'web')
+    // 重新生成/修订改写正文：upsertReport 冲突分支不覆盖 status（T4）
+    env.store.writeReport('daily', CHAT, ORIGIN_KEY, `# 日报 ${ORIGIN_KEY}\n\n重写后\n`)
+    const after = env.dao.getReport('daily', ORIGIN_KEY, CHAT)
+    assert.deepEqual([after.status, after.content_md.includes('重写后')], ['final', true])
+  } finally {
+    env.cleanup()
+  }
+})
+
+test('report.finalize：未启用知识库镜像 → unsupported（status 只存在于 knowledge.db）', async () => {
+  const { Store: S } = await import('../lib/store.js')
+  const { ActionInbox, ACTIONS_REL, ACTION_RESULTS_REL } = await import('../lib/action-inbox.js')
+  const dir = resolve(mkdtempSync(join(tmpdir(), 'finalize-nodb-')))
+  const logger = { warn() {}, error() {}, info() {} }
+  const groupStore = new GroupStoreService(dir, logger)
+  const store = new S(dir, logger) // 无 sqlitePath = 无镜像
+  const llm = { async complete() { return '{}' } }
+  const task = new TaskRecognitionService({ groupStore, llm, logger, enabled: true, store })
+  const promise = new PromiseRecognitionService({ groupStore, llm, logger, enabled: true })
+  const { approvalActions } = createApprovalWiring({ store, groupStore, task, promise, notify: () => {}, logger })
+  try {
+    const inbox = new ActionInbox({ store, actions: approvalActions, groups: [CHAT], logger })
+    store.ensureDir('web')
+    store.writeText(ACTIONS_REL, JSON.stringify({ actionId: 'n1', ts: 1, chatId: CHAT, type: 'report.finalize', params: { kind: 'daily', dateKey: ORIGIN_KEY } }) + '\n')
+    await inbox.poll()
+    assert.equal(JSON.parse(store.readText(ACTION_RESULTS_REL).trim()).code, 'unsupported')
+  } finally {
+    groupStore.dispose()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('report.regen：入队 ok；同一报告已在队列 → duplicate（不是 not_found）', async () => {
+  const env = makeEnv()
+  const { ActionInbox, ACTIONS_REL, ACTION_RESULTS_REL } = await import('../lib/action-inbox.js')
+  const { RegenQueue } = await import('../lib/regen-queue.js')
+  const queue = new RegenQueue({ store: env.store, logger: { warn() {}, error() {} } })
+  const logger = { warn() {}, error() {}, info() {} }
+  const task = new TaskRecognitionService({ groupStore: env.groupStore, llm: { async complete() { return '{}' } }, logger, enabled: true, store: env.store })
+  const promise = new PromiseRecognitionService({ groupStore: env.groupStore, llm: { async complete() { return '{}' } }, logger, enabled: true })
+  const { approvalActions } = createApprovalWiring({
+    store: env.store, groupStore: env.groupStore, task, promise, notify: () => {}, logger,
+    enqueueReportRegen: (c, d, k) => queue.enqueue(c, d, 1, k, 'manual') !== 'deduped',
+  })
+  try {
+    const inbox = new ActionInbox({ store: env.store, actions: approvalActions, groups: [CHAT], logger })
+    env.store.ensureDir('web')
+    const l = (id) => JSON.stringify({ actionId: id, ts: 1, chatId: CHAT, type: 'report.regen', params: { kind: 'daily', dateKey: ORIGIN_KEY } })
+    env.store.writeText(ACTIONS_REL, [l('r1'), l('r2')].join('\n') + '\n')
+    await inbox.poll()
+    const codes = env.store.readText(ACTION_RESULTS_REL).trim().split('\n').map(JSON.parse).map(r => r.code)
+    assert.deepEqual(codes, ['ok', 'duplicate'])
+    assert.deepEqual(queue.list().map(e => e.reason), ['manual'])
+  } finally {
+    env.cleanup()
+  }
+})
