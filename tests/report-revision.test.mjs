@@ -1,4 +1,5 @@
-// report-revision.test.mjs —— 标记/审批修订流（存在性校验 + origin 归属 + 镜像直连 + 内存队列）。
+// report-revision.test.mjs —— 标记/审批修订流（存在性校验 + 归属日 + 镜像直连 + 内存队列）。
+// 归属日：标记 → 标记发生当天；审批 → 条目出身日（两者语义不同，2026-10-21 纠正）。
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs'
@@ -12,6 +13,7 @@ const CHAT = '12345678@chatroom'
 const NOW = new Date(2026, 9, 21, 9, 12).getTime()          // 标记时刻 10-21 09:12
 const ORIGIN = new Date(2026, 9, 20, 9, 0).getTime()        // 条目出身 10-20 09:00
 const ORIGIN_DAY = '2026-10-20'
+const MARK_DAY = '2026-10-21'
 
 function makeEnv({ mirror, maxQueue, errors, origin } = {}) {
   const dir = resolve(mkdtempSync(join(tmpdir(), 'rev-')))
@@ -53,7 +55,7 @@ test('① 不存在目标 → 整链零副作用 + false（无镜像/无修订�
   rmSync(dir, { recursive: true, force: true })
 })
 
-test('② 存在目标 → 修订行落 origin 日报（非标记日）+ 镜像 + 级联跟随 origin 周/月', async () => {
+test('② 标记 → 修订行落标记当天日报（非出身日）+ 镜像 + 级联跟随标记日所在周/月', async () => {
   const mirrorRows = []
   const { dir, store, svc } = makeEnv({
     mirror: {
@@ -61,20 +63,23 @@ test('② 存在目标 → 修订行落 origin 日报（非标记日）+ 镜像 
       mirrorReportRevision: (c, pt, ps, ts, type, opts) => { mirrorRows.push(['revision', pt, ps]); return true },
     },
   })
-  // origin 日报 + origin 所在周周一的周报 + 当月 1 号月报都存在
+  // 出身日报、标记当天日报、当周周一的周报、当月 1 号月报都存在
   store.ensureDir(`reports/${CHAT}`)
-  store.writeText(`reports/${CHAT}/${ORIGIN_DAY}.md`, '# 日报\n')
   store.ensureDir(`reports/${CHAT}/weekly`)
   store.ensureDir(`reports/${CHAT}/monthly`)
   store.writeText(`reports/${CHAT}/${ORIGIN_DAY}.md`, '# 日报\n')
+  store.writeText(`reports/${CHAT}/${MARK_DAY}.md`, '# 日报\n')
   store.writeText(`reports/${CHAT}/weekly/2026-10-19.md`, '# 周报\n')
   store.writeText(`reports/${CHAT}/monthly/2026-10-01.md`, '# 月报\n')
   await svc.markTarget(CHAT, 'task', 3, 'completed', 'chat')
-  // 修订行落 origin 日报（非标记日 10-21）
-  const daily = md(store, `reports/${CHAT}/${ORIGIN_DAY}.md`)
+  // 修订行落标记当天日报（10-21），出身日报（10-20）不动
+  const daily = md(store, `reports/${CHAT}/${MARK_DAY}.md`)
   assert.match(daily, /## 修订记录/)
   assert.match(daily, /task「#3」→ 已完成/)
-  // 级联跟随 origin 周/月
+  assert.ok(!md(store, `reports/${CHAT}/${ORIGIN_DAY}.md`).includes('修订记录'), '出身日报不追加')
+  assert.ok(mirrorRows.some((r) => r[0] === 'revision' && r[1] === 'daily' && r[2] === MARK_DAY))
+  assert.ok(!mirrorRows.some((r) => r[0] === 'revision' && r[2] === ORIGIN_DAY))
+  // 级联跟随标记日所在周/月
   assert.match(md(store, `reports/${CHAT}/weekly/2026-10-19.md`), /修订记录/)
   assert.match(md(store, `reports/${CHAT}/monthly/2026-10-01.md`), /修订记录/)
   // 镜像：1 marking + 3 revision（daily+weekly+monthly）
@@ -84,7 +89,7 @@ test('② 存在目标 → 修订行落 origin 日报（非标记日）+ 镜像 
   rmSync(dir, { recursive: true, force: true })
 })
 
-test('③ origin 日无报告文件 → 无 .md 追加，但 revisions+镜像照记、级联照常', async () => {
+test('③ 标记当天日报还没生成 → 无 .md 追加，但 revisions+镜像照记（生成时渲染进去）、级联照常', async () => {
   const mirrorRows = []
   const { dir, store, svc } = makeEnv({
     mirror: {
@@ -92,18 +97,18 @@ test('③ origin 日无报告文件 → 无 .md 追加，但 revisions+镜像照
       mirrorReportRevision: (c, pt, ps) => { mirrorRows.push(['revision', pt, ps]); return true },
     },
   })
-  // 只建周报（origin 日报不建）
+  // 只建周报（当天日报未生成）
   store.ensureDir(`reports/${CHAT}/weekly`)
   store.writeText(`reports/${CHAT}/weekly/2026-10-19.md`, '# 周报\n')
   await svc.markTarget(CHAT, 'task', 3, 'completed', 'chat')
-  assert.ok(!existsSync(join(dir, `reports/${CHAT}/${ORIGIN_DAY}.md`)), 'origin 日报不落盘')
+  assert.ok(!existsSync(join(dir, `reports/${CHAT}/${MARK_DAY}.md`)), '当天日报不被提前创建')
   const weekly = md(store, `reports/${CHAT}/weekly/2026-10-19.md`)
   assert.match(weekly, /修订记录/)
-  assert.ok(mirrorRows.some((r) => r[0] === 'revision' && r[2] === ORIGIN_DAY), 'origin 修订行照记')
+  assert.ok(mirrorRows.some((r) => r[0] === 'revision' && r[2] === MARK_DAY), '当天修订行照记')
   rmSync(dir, { recursive: true, force: true })
 })
 
-test('④ onApproval 同修：origin 归属 + 不存在目标零副作用', async () => {
+test('④ 审批仍归出身日报（与标记不同）+ 不存在目标零副作用', async () => {
   const mirrorRows = []
   const { dir, store, svc } = makeEnv({
     mirror: {
@@ -113,6 +118,7 @@ test('④ onApproval 同修：origin 归属 + 不存在目标零副作用', asyn
   })
   store.ensureDir(`reports/${CHAT}`)
   store.writeText(`reports/${CHAT}/${ORIGIN_DAY}.md`, '# 日报\n')
+  store.writeText(`reports/${CHAT}/${MARK_DAY}.md`, '# 日报\n')
   // 不存在（独立 env：origin=null）
   const missingEnv = makeEnv({ origin: null, mirror: { mirrorMarking: () => true, mirrorReportRevision: () => true } })
   assert.equal(await missingEnv.svc.onApproval(CHAT, 'task', 999999, '任务「x」确认为真', 'chat'), false)
@@ -122,6 +128,7 @@ test('④ onApproval 同修：origin 归属 + 不存在目标零副作用', asyn
   const daily = md(store, `reports/${CHAT}/${ORIGIN_DAY}.md`)
   assert.match(daily, /审批：任务「x」确认为真/)
   assert.ok(mirrorRows.some((r) => r[0] === 'revision' && r[2] === ORIGIN_DAY))
+  assert.ok(!md(store, `reports/${CHAT}/${MARK_DAY}.md`).includes('修订记录'), '审批不落操作当天')
   rmSync(dir, { recursive: true, force: true })
 })
 

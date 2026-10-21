@@ -1,5 +1,5 @@
 // approval-wiring.test.mjs —— createApprovalWiring 组装出的 taskComplete 必须走完整标记链
-// （reportRevision.markTarget：存在性校验 → 镜像 → 出身日报修订段），
+// （reportRevision.markTarget：存在性校验 → 镜像 → 标记当天日报修订段），
 // 与 ActionInbox 的 task.mark 同源同效。直连 store.mirrorMarking 会跳过校验与修订段。
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -19,6 +19,8 @@ const { KnowledgeDao } = await import('../lib/db/dao.js')
 const CHAT = '12345678@chatroom'
 const ORIGIN = new Date(2026, 9, 14, 10, 0, 0).getTime() // 本地时间 2026-10-14 10:00
 const ORIGIN_KEY = '2026-10-14'
+const MARK_AT = new Date(2026, 9, 16, 21, 0, 0).getTime() // 标记发生 2026-10-16 21:00（当天日报已生成）
+const MARK_KEY = '2026-10-16'
 
 function makeEnv() {
   const dir = resolve(mkdtempSync(join(tmpdir(), 'approval-wiring-')))
@@ -29,7 +31,7 @@ function makeEnv() {
   const llm = { async complete() { return '{}' } } // 本文件不触发识别
   const task = new TaskRecognitionService({ groupStore, llm, logger, enabled: true, store })
   const promise = new PromiseRecognitionService({ groupStore, llm, logger, enabled: true })
-  const { approvalActions } = createApprovalWiring({ store, groupStore, task, promise, notify: () => {}, logger })
+  const { approvalActions } = createApprovalWiring({ store, groupStore, task, promise, notify: () => {}, logger, now: () => MARK_AT })
   const db = openDb(dbPath, { logger })
   const dao = new KnowledgeDao(db, logger)
   const cleanup = () => {
@@ -51,20 +53,23 @@ test('taskComplete：目标不存在 → false，marking 零行', async () => {
   }
 })
 
-test('taskComplete：修订行写入条目出身日报（与 ActionInbox task.mark 同链）', async () => {
+test('taskComplete：修订行写入标记当天的日报、出身日报不动（与 ActionInbox task.mark 同链）', async () => {
   const env = makeEnv()
   try {
     const tid = await env.groupStore.appendTask(CHAT, { statement: '交材料', status: 'active' }, ORIGIN)
     assert.ok(tid)
-    const rel = reportRelPath(CHAT, ORIGIN_KEY, 'daily')
+    const originRel = reportRelPath(CHAT, ORIGIN_KEY, 'daily')
+    const rel = reportRelPath(CHAT, MARK_KEY, 'daily')
     env.store.ensureDir(`reports/${CHAT}`)
-    env.store.writeText(rel, `# 日报 ${ORIGIN_KEY}\n\n正文\n`)
+    env.store.writeText(originRel, `# 日报 ${ORIGIN_KEY}\n\n正文\n`)
+    env.store.writeText(rel, `# 日报 ${MARK_KEY}\n\n正文\n`)
 
     const ok = await env.approvalActions.taskComplete(CHAT, tid, 'chat')
     assert.equal(ok, true)
     const md = env.store.readText(rel)
-    assert.ok(md.includes('## 修订记录'), '出身日报追加修订段')
+    assert.ok(md.includes('## 修订记录'), '标记当天日报追加修订段')
     assert.ok(md.includes(`标记：task「#${tid}」→ 已完成（来源：对话框）`), '修订行含目标与来源')
+    assert.equal(env.store.readText(originRel).includes('修订记录'), false, '出身日报不追加（标记是工作流演化，落当天）')
     const latest = env.dao.listMarkingsLatest()
     assert.equal(latest.length, 1)
     assert.equal(latest[0].kind, 'done')

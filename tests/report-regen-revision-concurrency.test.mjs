@@ -14,7 +14,7 @@ const { Store } = await import('../lib/store.js')
 const CHAT = '12345678@chatroom'
 const DAY = '2026-10-20'
 const REL = `reports/${CHAT}/${DAY}.md`
-const NOW = new Date(2026, 9, 21, 9, 12).getTime()
+const NOW = new Date(2026, 9, 20, 21, 12).getTime() // 标记发生在 DAY 当天（日报已生成）——标记修订归属当天日报
 const tick = (ms = 0) => new Promise((r) => setTimeout(r, ms))
 
 function makeEnv() {
