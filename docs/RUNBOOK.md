@@ -573,6 +573,42 @@ Accessibility Inspector 确认元素层级）。**实证结论回填此处：___
   无 `id` 的旧行按 ts+kind+行号兜底（W-10 兼容规则）。
 - 条目 `evidence_ref` 指向报告 md 路径、`outbox/<id>`（详情在 body 的速览类）或消息 msg_id。
 
+## 14. 前端工作台（FE-1 只读回溯）
+
+本地网页，按 日期 × 群 × 周期 回看报告，另有资料库、媒体清单、会话要点、人员关注摘要。
+它是**独立 node 进程**（`web/server.mjs`），不在插件里：不持有任何发送能力，只读本项目自己的库，FE-1 不写任何文件。
+
+### 14.1 启动
+
+```bash
+# 前提：插件至少启动过一次——它会写 <stateDir>/web/allowed-chats.json（白名单 + knowledge.db 路径）
+LURKER_WEB_TOKEN='<与插件 webActionsToken 相同的值>' \
+  node web/server.mjs --state-dir "$HOME/.dsh/dsh-group-lurker" [--db /path/to/knowledge.db] [--port 8787]
+```
+
+- 浏览器打开 `http://127.0.0.1:8787/#token=<token>`。页面把 token 存进当前标签页的 sessionStorage 后立即从地址栏抹掉；
+  关掉标签页即失效，再开需重新带 `#token=`。
+- 不设 `LURKER_WEB_TOKEN` 时进程生成一次性随机 token，**只在启动时打印一次**——适合临时查看；
+  FE-2 起动作通道要求与插件 `webActionsToken` 一致（RUNBOOK §13.3），届时须用环境变量传入。
+  token 不走命令行参数，避免出现在 `ps` 输出里。
+- `--db` 缺省取清单里的路径（即插件 `sqlitePath`）；插件 `sqlitePath='off'` 时回溯类页面提示不可用，人员关注照常。
+- 只监听 `127.0.0.1`，**没有**改监听地址的参数（手机直连不在本期范围，见前端设计 §11-Q4）。
+
+### 14.2 拒绝启动 / 接口报错
+
+| 现象 | 原因 | 处置 |
+|---|---|---|
+| 启动即退出：「未找到有效白名单」 | 清单缺失，或插件 `groups` 为空（R2 fail-closed） | 配好 `groups` 后启动一次插件 |
+| 页面提示 token 无效（401） | 地址没带 `#token=`，或与进程的 token 不一致 | 用启动时的 token 重开 |
+| 403 `bad_host` / `bad_origin` | 用了 127.0.0.1/localhost 以外的主机名访问，或其它网页在跨站请求 | 预期行为（防 DNS rebinding / CSRF），用 `127.0.0.1` 访问 |
+| 503 `knowledge_db_unavailable` | knowledge.db 不存在或镜像已关 | 检查 `sqlitePath` / `--db` |
+
+白名单每个请求都重读：插件改 `groups` 重启后，web 进程无需重启即生效。
+
+### 14.3 停用
+
+`Ctrl-C`（或 SIGTERM）即可。web 进程没有后台任务、不写文件，停掉不影响插件。
+
 ## 排障：重新登录/切换微信账号后读取失效（code 15）
 
 **现象**：微信重新登录（或切换账号）后，读取层报 SQLCipher code 15 / audit 出现 ok:false / 报告与摘要停更。

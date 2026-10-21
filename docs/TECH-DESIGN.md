@@ -23,8 +23,12 @@ dsh-group-lurker/
 │   ├── persona.ts          # 人格加载与按群覆盖
 │   ├── store.ts            # state 目录 JSONL/Markdown 写入（唯一写文件处）
 │   └── guard.ts            # 注入防护、限流、写入路径校验
+├── web/                    # 本地前端工作台：独立 node 进程，只读 + 只监听 127.0.0.1（见 TECH-DESIGN-frontend.md）
 └── tests/
 ```
+
+> 插件与 web 进程只经 stateDir 下的 `web/` 子目录交换文件：插件启动时写 `web/allowed-chats.json`（白名单 + knowledge.db 路径），
+> web 进程只读它；动作通道 `web/actions.jsonl` / `web/action-results.jsonl` 的约定见 RUNBOOK §13。
 
 `package.json` 关键字段（对照 im-connect）：
 
