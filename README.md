@@ -31,7 +31,7 @@
 | `src/` | 插件本体：白名单读取、每群缓冲、LLM 提炼、日报、受控单出口发送、SQLite 镜像数据层（`src/db/`） |
 | `0数据格式/` | **知识库纯模板**：三层 schema（资料 `doc` + 日志 `report`/`entry` + 会话要点 `chat_digest`）+ 3 个 Python 工具。**不录入任何数据** |
 | `scripts/` | `check-sensitive.sh`（敏感信息扫描）、`llm-cost.mjs`（费用汇总）、`import-state-to-sqlite.mjs`（一次性导入器） |
-| `tests/` | 50 个测试文件、440 例，全离线 mock，不碰真实库 |
+| `tests/` | 53 个测试文件、463 例，全离线 mock，不碰真实库 |
 
 ## 架构：从聊天到知识库
 
@@ -206,7 +206,7 @@ node scripts/import-state-to-sqlite.mjs --state-dir ~/.dsh/dsh-group-lurker
 ```bash
 npm install
 npm run build   # tsc → lib/
-npm test        # node --test，50 文件 / 440 例，全离线 mock
+npm test        # node --test，53 文件 / 463 例，全离线 mock
 ./scripts/check-sensitive.sh   # 提交前必跑，CI 会拦
 ```
 
