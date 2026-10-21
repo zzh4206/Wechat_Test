@@ -52,9 +52,8 @@ import { FileIndexService, linkFilesToEvents } from './file-index.js'
 import { createAccountGate, listAccounts, sampleAccount, diffActivity, wxidFromDbRoot, XWECHAT_FILES_REL, type FsLike } from './account-probe.js'
 import { RegenQueue, REGEN_QUEUE_REL } from './regen-queue.js'
 import { processRegenHead } from './regen-processor.js'
-import { ApprovalActions } from './approval-actions.js'
 import { ActionInbox } from './action-inbox.js'
-import { ReportRevisionService } from './report-revision.js'
+import { createApprovalWiring } from './approval-wiring.js'
 import { homedir } from 'node:os'
 // M6：保留期清理（T1.1 遗留）+ A/B 脚手架类型（新增行，不动他人行）
 import { RetentionService } from './retention.js'
@@ -712,37 +711,15 @@ export function apply(ctx: Context, config: PluginConfig): void {
   }
 
   // —— 审批双通道（confirm-loop C1/C2）+ 标记修订流（approval-marking M1/M2）接线 ——
-  const reportRevision = new ReportRevisionService({
+  const { reportRevision, approvalActions } = createApprovalWiring({
     store,
+    groupStore,
+    task: taskRecognition,
+    promise: promiseRecognition,
+    notify: async (kind2, title, body) => { await notifier.notify(kind2, title, body) },
     logger: logger as unknown as StoreLogger,
-    resolveTarget: (chatId2, kind2, id2) => {
-      // event 行无时间列——出身时刻取其证据消息 ts（事件被识别的那条消息）
-      if (kind2 === 'event') {
-        const ev = groupStore.getEvent(chatId2, id2)
-        if (!ev) return null
-        const msg = ev.evidenceMsgId ? groupStore.getMessage(chatId2, ev.evidenceMsgId) : null
-        return msg ? { createdAt: msg.ts } : null
-      }
-      const row = kind2 === 'task' ? groupStore.getTask(chatId2, id2) : groupStore.getPromise(chatId2, id2)
-      return row ? { createdAt: row.createdAt } : null
-    },
-    mirror: {
-      mirrorMarking: (c, k, r, ts, o) => store.mirrorMarking(c, k, r, ts, o),
-      mirrorReportRevision: (c, p2, ps, ts, t, o) => store.mirrorReport(c, p2, ps, ts, t, o),
-    },
+    enqueueReportRegen: (chatId2, dateKey2, kind2) => regenQueue.enqueue(chatId2, dateKey2, Date.now(), kind2, 'manual') !== 'deduped',
   })
-  const approvalActions = taskRecognition && promiseRecognition
-    ? new ApprovalActions({
-        task: taskRecognition,
-        promise: promiseRecognition,
-        store: groupStore,
-        notify: async (kind2, title, body) => { await notifier.notify(kind2, title, body) },
-        logger: logger as unknown as StoreLogger,
-        enqueueReportRegen: (chatId2, dateKey2, kind2) => regenQueue.enqueue(chatId2, dateKey2, Date.now(), kind2, 'manual') !== 'deduped',
-        revision: reportRevision,
-        marks: { markTarget: async (chatId2, kind2, targetId2, status2, source2) => store.mirrorMarking(chatId2, status2 === 'completed' ? 'done' : status2 === 'incomplete' ? 'undone' : 'deleted', `${chatId2}:${kind2}:${targetId2}`, Date.now(), { source: source2 }) },
-      })
-    : null
   // W-2：总闸开但依赖缺失 → 启动即 error 指明缺谁（不再静默零消费，前端排障有据）
   if (config.webActionsEnabled && !approvalActions) {
     const missing = [
