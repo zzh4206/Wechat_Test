@@ -1,8 +1,8 @@
 # 设计：审批与标记——报告修正流
 
-- 版本：v0.1（草案）
+- 版本：v0.2（2026-10-20 修订：§3.1 按数据负责人架构约束 1 改版——单一查询副本，插件侧不落表；出处 [REPLY-PM-v0.6-验收与架构约束.md](../../docs/REPLY-PM-v0.6-验收与架构约束.md) §二）
 - 状态：待评审
-- 关联：[TECH-DESIGN-confirm-loop.md](TECH-DESIGN-confirm-loop.md)（审批双通道代码结构）、[TECH-DESIGN-frontend.md](TECH-DESIGN-frontend.md)（前端工作台）
+- 关联：[TECH-DESIGN-confirm-loop.md](TECH-DESIGN-confirm-loop.md)（审批双通道代码结构）、[前端工作台设计（**讨论稿，暂未入库**——按 PM 指示维持讨论阶段，入库待定；本文件以设计草案 v0.1 微信接收件为准；）
 - 核心区分：**审批 ≠ 标记**——两者独立建模，对报告的作用面不同
 
 ---
@@ -57,23 +57,24 @@
 
 ## 3. 数据结构
 
-### 3.1 标记表（每群库新增，独立于审批）
+### 3.1 标记事件（v0.2 修订：单一查询副本，插件侧不落表）
 
-```sql
-CREATE TABLE IF NOT EXISTS markings (
-  id         INTEGER PRIMARY KEY,
-  kind       TEXT NOT NULL CHECK (kind IN ('task','promise','event')),
-  target_id  INTEGER NOT NULL,            -- tasks/promises 的行 id（事件暂不标记）
-  status     TEXT NOT NULL CHECK (status IN ('completed','incomplete','deleted')),
-  source     TEXT NOT NULL DEFAULT 'chat',-- 'chat' | 'web'
-  ts         INTEGER NOT NULL,
-  UNIQUE (kind, target_id)                -- 一条资料一个当前标记（重标记覆盖）
-);
-```
+~~原设计：每群库新增 markings 表（UNIQUE 覆盖式）~~ **已废弃**——数据负责人架构约束 1：
+「同一事实两个家」是本周两次口径事故（summary chat_id 分裂、msg_id 命名空间）的共同根因。
+裁定：**marking 的唯一查询副本是 knowledge.db**（`marking` 表 + `v_marking_latest` 视图，TECH-v0.6 §1.2），
+插件侧**不落任何第二持久真相**。
 
-- **独立于审批**：tasks.status 管确认状态，markings 管完成状态——两棵树；
-- `deleted` 标记：报告渲染时跳过该条（日报/周报/月报一致），库行保留（可逆）；
-- **写入只经服务方法** `markTarget(chatId, kind, targetId, status, source)`（新方法，落 group-store）——**绝不直改 SQL**：直改会绕过修订流的级联触发，也违反 chat_digest 单写者约束的同一精神。
+现行实现：
+
+- `markTarget(chatId, targetRef, status, source)` 构造标记事件（target_ref=`<chatId>:<kind>:<id>` 全局唯一；
+  状态映射 completed→done / incomplete→undone / deleted→deleted）→ **直连镜像通道**
+  （knowledge.db `marking` 表，source_key 幂等不可变追加）；
+- 镜像失败 → 有界内存队列（500，溢出丢最旧）+ error 日志（含完整事件 JSON 供重放）；
+  重放源 = `web/actions.jsonl` 动作日志（本身持久）——重启丢失内存队列可接受；
+- 独立于审批的性质不变：tasks.status 管确认状态，marking 管完成状态——两棵树；
+- `deleted` 标记：报告渲染时跳过该条，库行保留（可逆）；
+- **写入只经服务方法** `markTarget`——**绝不直改 SQL**（直改绕过修订流级联，违反单写者精神）；
+- 镜像结果 ≠ 同步可见：前端以 knowledge.db 为准并容忍镜像延迟（已列入数据库负责人函 §三.6）。
 
 ### 3.2 修订记录（两级）
 
