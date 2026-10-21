@@ -10,7 +10,7 @@
 import { appendFileSync, lstatSync, mkdirSync, readFileSync, realpathSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import { join, sep } from 'node:path'
-import { ID_RE } from './manifest.mjs'
+import { AGGREGATE, ID_RE } from './manifest.mjs'
 
 export const ACTIONS_FILE = join('web', 'actions.jsonl')
 export const RESULTS_FILE = join('web', 'action-results.jsonl')
@@ -68,7 +68,9 @@ export function buildAction(body, allowedGroups, operator, now = Date.now()) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return { error: 'bad_request', reason: 'body' }
   const spec = Object.hasOwn(WEB_ACTIONS, body.type) ? WEB_ACTIONS[body.type] : null
   if (!spec) return { error: 'type_not_allowed' }
-  if (typeof body.chatId !== 'string' || !allowedGroups.has(body.chatId)) return { error: 'chat_not_allowed' }
+  // 跨群汇总不是群：只允许报告操作，且只有日报（插件侧同口径再校验一遍）
+  const aggregate = body.chatId === AGGREGATE && body.type.startsWith('report.')
+  if (typeof body.chatId !== 'string' || (!aggregate && !allowedGroups.has(body.chatId))) return { error: 'chat_not_allowed' }
   const [needsTarget, check] = spec
   // operator = 本进程 token 的指纹：插件核对它与 webActionsToken 一致才执行，审计 operator 因此可信
   const line = { actionId: `a-${now}-${randomBytes(4).toString('hex')}`, ts: now, type: body.type, chatId: body.chatId, operator }
@@ -78,6 +80,7 @@ export function buildAction(body, allowedGroups, operator, now = Date.now()) {
   }
   const params = check(body.params)
   if (typeof params === 'string') return { error: 'bad_request', reason: params }
+  if (aggregate && params.kind !== 'daily') return { error: 'bad_request', reason: 'aggregate_daily_only' }
   if (params) line.params = params
   return { line }
 }
