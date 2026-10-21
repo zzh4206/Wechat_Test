@@ -207,7 +207,7 @@ function reportActions(r, into) {
   // 排入发件箱：唯一会走向发送的操作。插件开关关时置灰；开着也要二次确认，并说明之后仍受发送层四道闸约束
   const outboxOn = state.actions.enabled && state.actions.outboxEnabled === true
   const toOutbox = h('button', { type: 'button', disabled: !outboxOn, title: outboxOn ? '' : ACTIONS_OFF_TEXT.outbox_disabled, onclick: async () => {
-    if (!confirm(`把「${label}」排入发件箱？\n\n会往文件传输助手推一条提醒（只有标题与修订数，不含正文）。是否真正发出仍由发送层开关决定（senderEnabled / sendDryRun）。10 分钟内重复排入会被忽略。`)) return
+    if (!confirm(`把「${label}」排入发件箱？\n\n会往目标会话推一条提醒（只有标题与修订数，不含正文；目标由插件配置决定）。是否真正发出仍由发送层开关决定（senderEnabled / sendDryRun）。10 分钟内重复排入会被忽略。`)) return
     await submitAction({ type: 'report.toOutbox', chatId: r.chatId, params }, status, buttons,
       { ok: '已排入发件箱（是否真发由发送层开关决定）', duplicate: '10 分钟内已排入过，已忽略', not_found: '报告文件不存在', unsupported: '插件未开启排入发件箱' })
   } }, '排入发件箱')
