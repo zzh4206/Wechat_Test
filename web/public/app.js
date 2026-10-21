@@ -1,6 +1,7 @@
-// app.js —— FE-1 只读回溯页面：报告日历/详情、资料库、媒体、会话要点、人员关注。
+// app.js —— FE-1 只读回溯（报告日历/详情、资料库、媒体、会话要点、人员关注）+ FE-2 审批收件箱。
 // 数据只经 /api/*（同源相对路径）取得；正文块交给 render.js 用 textContent 搭 DOM。
-import { h, renderBlocks } from './render.js'
+// 审批提交 = POST /api/actions 追加一行，插件轮询执行后写回执；页面轮询回执展示「已提交 → 已生效/失败」。
+import { fill, h, renderBlocks } from './render.js'
 
 const TOKEN_KEY = 'lurker-web-token'
 const PERIOD_LABEL = { daily: '日', weekly: '周', monthly: '月' }
@@ -18,17 +19,23 @@ function readToken() {
   try { return sessionStorage.getItem(TOKEN_KEY) ?? '' } catch { return '' }
 }
 
-const state = { token: readToken(), chats: [], chat: '', tab: 'reports', month: '', period: '' }
+const state = { token: readToken(), chats: [], chat: '', tab: 'reports', month: '', period: '', actions: { enabled: false, reason: null } }
 
 class ApiError extends Error {
-  constructor(status, code) { super(code); this.status = status; this.code = code }
+  constructor(status, code, reason) { super(code); this.status = status; this.code = code; this.reason = reason }
 }
 
-async function api(path, params = {}) {
+async function api(path, params = {}, post = undefined) {
   const qs = new URLSearchParams(Object.entries(params).filter(([, v]) => v !== undefined && v !== ''))
-  const res = await fetch(`/api/${path}${qs.size ? `?${qs}` : ''}`, { headers: { Authorization: `Bearer ${state.token}` } })
+  const init = { headers: { Authorization: `Bearer ${state.token}` } }
+  if (post !== undefined) {
+    init.method = 'POST'
+    init.headers['Content-Type'] = 'application/json'
+    init.body = JSON.stringify(post)
+  }
+  const res = await fetch(`/api/${path}${qs.size ? `?${qs}` : ''}`, init)
   const body = await res.json().catch(() => ({}))
-  if (!res.ok) throw new ApiError(res.status, body.error ?? 'error')
+  if (!res.ok) throw new ApiError(res.status, body.error ?? 'error', body.reason)
   return body
 }
 
@@ -38,12 +45,31 @@ const ERROR_TEXT = {
   knowledge_db_unavailable: 'knowledge.db 不可用（sqlitePath 为 off 或文件不存在）：回溯功能暂不可用。',
   chat_not_allowed: '该群不在白名单内。',
   not_found: '没有找到。',
+  actions_disabled: '审批动作不可用。',
+}
+
+// 插件回执码（RUNBOOK §13.2）→ 页面文案
+const RESULT_TEXT = {
+  ok: '已生效',
+  duplicate: '重复提交，已忽略',
+  not_found: '目标不存在',
+  status_conflict: '状态已变化（可能已在别处处理），刷新看看',
+  chat_not_allowed: '该群不在插件白名单内',
+  type_not_allowed: '插件不支持该动作',
+  unsupported: '插件未接通该动作',
+  bad_request: '参数不合法',
+  error: '插件执行出错，查看插件日志',
+}
+
+const ACTIONS_OFF_TEXT = {
+  no_shared_token: '只读模式：web 进程未用 LURKER_WEB_TOKEN 启动，审批动作不可用（见 RUNBOOK §14）。',
+  inbox_disabled: '只读模式：插件未开启前端收件箱（webActionsEnabled=false 或依赖缺失），审批动作不可用。',
 }
 
 const view = () => document.getElementById('view')
 
 function showError(err, into = view()) {
-  into.replaceChildren(h('p', { class: 'error' }, ERROR_TEXT[err.code] ?? `出错了（${err.code ?? err.message}）`))
+  fill(into, h('p', { class: 'error' }, ERROR_TEXT[err.code] ?? `出错了（${err.code ?? err.message}）`))
 }
 
 // 插件写毫秒、0数据格式的 Python CLI 写秒：小于 1e12 的按秒处理
@@ -55,6 +81,7 @@ const today = () => new Date().toISOString().slice(0, 10)
 
 const TABS = [
   ['reports', '报告'],
+  ['inbox', '审批'],
   ['docs', '资料'],
   ['media', '媒体'],
   ['digests', '会话要点'],
@@ -62,13 +89,13 @@ const TABS = [
 ]
 
 function renderTabs() {
-  document.getElementById('tabs').replaceChildren(...TABS.map(([key, label]) =>
+  fill(document.getElementById('tabs'), ...TABS.map(([key, label]) =>
     h('button', { type: 'button', class: key === state.tab ? 'tab active' : 'tab', 'aria-pressed': String(key === state.tab), onclick: () => { state.tab = key; renderTabs(); load() } }, label)))
 }
 
 function renderChatPicker() {
   const sel = document.getElementById('chat')
-  sel.replaceChildren(...state.chats.map(c => h('option', { value: c.chatId, selected: c.chatId === state.chat }, chatLabel(c.chatId))))
+  fill(sel, ...state.chats.map(c => h('option', { value: c.chatId, selected: c.chatId === state.chat }, chatLabel(c.chatId))))
   sel.onchange = () => { state.chat = sel.value; state.month = ''; load() }
 }
 
@@ -109,7 +136,7 @@ async function loadReports() {
     h('option', { value: '', selected: !state.period }, '全部周期'),
     ...Object.entries(PERIOD_NAME).map(([k, v]) => h('option', { value: k, selected: state.period === k }, v)))
 
-  view().replaceChildren(h('div', { class: 'split' },
+  fill(view(), h('div', { class: 'split' },
     h('section', { class: 'side' },
       h('div', { class: 'month-nav' },
         h('button', { type: 'button', onclick: () => { state.month = shiftMonth(state.month, -1); load() } }, '‹'),
@@ -130,7 +157,7 @@ async function loadReports() {
 async function openReport(id, into) {
   try {
     const r = await api(`reports/${id}`)
-    into.replaceChildren(
+    fill(into, 
       h('div', { class: 'detail-head' },
         h('button', { type: 'button', disabled: !r.prev, onclick: () => r.prev && openReport(r.prev.id, into) }, r.prev ? `‹ ${r.prev.periodStart}` : '‹'),
         h('div', { class: 'grow' },
@@ -147,6 +174,140 @@ async function openReport(id, into) {
   }
 }
 
+// —— 审批收件箱（FE-2） ——
+
+const KIND_NAME = { task: '任务', promise: '承诺', event: '事件' }
+const RESULT_POLL_MS = 2000
+const RESULT_WAIT_MS = 60000
+
+const sleep = (ms) => new Promise(ok => setTimeout(ok, ms))
+
+/**
+ * 提交一条动作并等回执：status 元素依次显示「已提交…」→ 结果。
+ * 插件按 webActionsPollSec（默认 5s）轮询，超过 60s 没回执多半是插件没在跑。
+ */
+async function submitAction(action, statusEl, buttons) {
+  for (const b of buttons) b.disabled = true
+  statusEl.className = 'status'
+  statusEl.textContent = '已提交，等待插件处理…'
+  try {
+    const { actionId } = await api('actions', {}, action)
+    const deadline = Date.now() + RESULT_WAIT_MS
+    while (Date.now() < deadline) {
+      await sleep(RESULT_POLL_MS)
+      const r = await api(`actions/${actionId}`)
+      if (r.status === 'done') {
+        statusEl.className = r.ok ? 'status ok' : 'status error'
+        statusEl.textContent = RESULT_TEXT[r.code] ?? r.code
+        if (!r.ok) for (const b of buttons) b.disabled = false
+        return r.ok
+      }
+    }
+    statusEl.className = 'status error'
+    statusEl.textContent = '60 秒内插件未处理：确认插件在运行且 webActionsEnabled=true。动作已入队，插件恢复后仍会执行。'
+  } catch (err) {
+    statusEl.className = 'status error'
+    statusEl.textContent = err.code === 'actions_disabled' ? (ACTIONS_OFF_TEXT[err.reason] ?? ERROR_TEXT.actions_disabled) : `提交失败（${err.reason ?? err.code}）`
+    for (const b of buttons) b.disabled = false
+  }
+  return false
+}
+
+function deadlineText(it) {
+  if (!it.deadline) return null
+  return `时限 ${fmtTime(it.deadline)}${it.deadlineConfidence < 1 ? `（识别置信度 ${Math.round(it.deadlineConfidence * 100)}%）` : '（人工指定）'}`
+}
+
+/** datetime-local 的值（本地时区）→ 毫秒 */
+const localInputToMs = (v) => (v ? new Date(v).getTime() : NaN)
+const msToLocalInput = (ms) => {
+  const d = new Date(ms - new Date(ms).getTimezoneOffset() * 60000)
+  return d.toISOString().slice(0, 16)
+}
+
+function inboxCard(it, onDone) {
+  const status = h('span', { class: 'status' })
+  const buttons = []
+  const btn = (label, type, extra = {}, cls = '') => {
+    const b = h('button', { type: 'button', class: cls, disabled: !state.actions.enabled, onclick: async () => {
+      const ok = await submitAction({ type, chatId: it.chatId, targetId: it.id, ...extra() }, status, buttons)
+      if (ok) onDone()
+    } }, label)
+    buttons.push(b)
+    return b
+  }
+  const none = () => ({})
+  const pending = it.status === 'pending_confirm'
+  const actionsRow = []
+  let deadlineInput = null
+  if (it.kind === 'task') {
+    if (pending) actionsRow.push(btn('确认', 'task.confirm', none, 'primary'), btn('取消（误报）', 'task.cancel', none))
+    else actionsRow.push(btn('完成', 'task.complete', none, 'primary'), btn('取消', 'task.cancel', none))
+    deadlineInput = h('input', { type: 'datetime-local', value: it.deadline ? msToLocalInput(it.deadline) : '', disabled: !state.actions.enabled })
+    buttons.push(deadlineInput)
+    actionsRow.push(h('span', { class: 'deadline-set' }, deadlineInput,
+      btn(it.deadline ? '改时间' : '定时间', 'task.set_deadline', () => ({ params: { deadline: localInputToMs(deadlineInput.value) } }))))
+  } else if (it.kind === 'promise') {
+    if (pending) actionsRow.push(btn('确认', 'promise.confirm', none, 'primary'), btn('取消（误报）', 'promise.cancel', none))
+    else actionsRow.push(btn('已兑现', 'promise.fulfilled', none, 'primary'), btn('关闭不再追踪', 'promise.close', none))
+  } else if (it.kind === 'event') {
+    actionsRow.push(btn('确认', 'event.confirm', none, 'primary'))
+  }
+
+  const evidenceBox = h('div', { class: 'evidence' })
+  const ev = it.evidence
+  const meta = [
+    KIND_NAME[it.kind],
+    pending ? '待确认' : '进行中',
+    it.assigner ? `指派：${it.assigner}` : null,
+    it.category || null,
+    it.confidence ? `置信度 ${Math.round(it.confidence * 100)}%` : null,
+    it.kind === 'task' ? deadlineText(it) : null,
+  ].filter(Boolean).join(' · ')
+  return h('div', { class: it.kind === 'task' && !it.deadline ? 'card inbox-card no-deadline' : 'card inbox-card' },
+    h('div', { class: 'inbox-head' },
+      h('strong', { class: 'grow' }, it.statement),
+      it.kind === 'task' && !it.deadline ? h('span', { class: 'pill warn' }, '待定时间') : null),
+    h('p', { class: 'muted' }, meta),
+    ev ? h('div', { class: 'evidence-line' },
+      h('span', { class: 'muted' }, `证据${ev.ts ? `（${fmtTime(ev.ts)}${ev.sender ? ` ${ev.sender}` : ''}）` : ''}：`),
+      h('span', {}, ev.preview || '（消息已不在库内）'),
+      ev.ts ? h('button', { type: 'button', class: 'link', onclick: () => toggleEvidence(it.chatId, ev.msgId, evidenceBox) }, '上下文') : null) : null,
+    evidenceBox,
+    h('div', { class: 'actions' }, actionsRow, status))
+}
+
+async function toggleEvidence(chatId, msgId, box) {
+  if (box.childElementCount) { fill(box); return }
+  try {
+    const r = await api('evidence', { chat: chatId, msg: msgId, around: 5 })
+    fill(box, h('ol', { class: 'context' }, r.messages.map(m =>
+      h('li', { class: m.isEvidence ? 'is-evidence' : '' },
+        h('span', { class: 'muted' }, `${fmtTime(m.ts)} ${m.sender}：`), m.kind === 'text' || m.kind === 'quote' ? m.text : `[${m.kind}] ${m.text}`))))
+  } catch (err) {
+    showError(err, box)
+  }
+}
+
+async function loadInbox() {
+  const chat = state.chat === AGGREGATE ? undefined : state.chat
+  const items = await api('inbox', { chat })
+  const reload = () => { setTimeout(() => { if (state.tab === 'inbox') load() }, 1500) }
+  const section = (title, list) => list.length
+    ? h('section', {}, h('h2', { class: 'section-title' }, `${title}（${list.length}）`), list.map(it => inboxCard(it, reload)))
+    : null
+  const pending = items.filter(it => it.status === 'pending_confirm')
+  const undated = items.filter(it => it.status === 'active' && it.kind === 'task' && !it.deadline)
+  const active = items.filter(it => it.status === 'active' && !(it.kind === 'task' && !it.deadline))
+  fill(view(), 
+    state.actions.enabled ? null : h('p', { class: 'banner' }, ACTIONS_OFF_TEXT[state.actions.reason] ?? ERROR_TEXT.actions_disabled),
+    h('p', { class: 'muted' }, chat ? `群 ${chat}` : '全部白名单群（选「跨群聚合」时显示所有群）'),
+    items.length ? null : h('p', { class: 'muted' }, '没有待处理的任务、承诺或事件。'),
+    section('待确认', pending),
+    section('待定时间的任务', undated),
+    section('进行中', active))
+}
+
 // —— 资料库 ——
 
 async function loadDocs(filters = {}) {
@@ -159,7 +320,7 @@ async function loadDocs(filters = {}) {
   search.addEventListener('keydown', e => { if (e.key === 'Enter') apply() })
   tagSel.onchange = apply
   catSel.onchange = apply
-  view().replaceChildren(h('div', { class: 'split' },
+  fill(view(), h('div', { class: 'split' },
     h('section', { class: 'side' },
       h('div', { class: 'filters' }, search, tagSel, catSel),
       h('ul', { class: 'list' }, data.docs.map(d => h('li', {},
@@ -172,7 +333,7 @@ async function loadDocs(filters = {}) {
 async function openDoc(id, into) {
   try {
     const d = await api(`docs/${id}`)
-    into.replaceChildren(
+    fill(into, 
       h('h2', {}, d.title),
       h('p', { class: 'muted' }, [d.category, d.sourceType, d.sourceRef, d.filePath ? `文件：${d.filePath}` : null].filter(Boolean).join(' · ')),
       h('article', { class: 'md' }, d.blocks.length ? renderBlocks(d.blocks) : h('p', { class: 'muted' }, '（无正文摘录）')))
@@ -193,7 +354,7 @@ async function loadMedia(filters = {}) {
   const apply = () => loadMedia({ type: typeSel.value, status: statusSel.value }).catch(e => showError(e))
   typeSel.onchange = apply
   statusSel.onchange = apply
-  view().replaceChildren(
+  fill(view(), 
     h('div', { class: 'filters' }, typeSel, statusSel, h('span', { class: 'muted' }, `${rows.length} 条（只列元数据，不提供下载）`)),
     h('div', { class: 'table-wrap' }, h('table', {},
       h('thead', {}, h('tr', {}, ['时间', '类型', '文件名', '大小', '状态', '地址'].map(c => h('th', {}, c)))),
@@ -211,7 +372,7 @@ async function loadMedia(filters = {}) {
 async function loadDigests(day = '') {
   const data = await api('digests', { day })
   const picker = h('input', { type: 'date', value: day, onchange: (e) => loadDigests(e.target.value).catch(err => showError(err)) })
-  view().replaceChildren(
+  fill(view(), 
     h('div', { class: 'filters' }, picker, h('span', { class: 'muted' }, day ? `${data.digests.length} 条` : '最近的会话要点')),
     ...data.digests.map(d => h('section', { class: 'card' },
       h('h3', {}, d.chatTopic), h('p', { class: 'muted' }, d.happenedOn ?? ''),
@@ -224,27 +385,40 @@ const WATCH_NAME = { global: '全局关注', group: '本群关注', off: '未关
 
 async function loadPersons() {
   if (state.chat === AGGREGATE) {
-    view().replaceChildren(h('p', { class: 'muted' }, '人员关注按群查看：请在右上角选择一个具体的群。'))
+    fill(view(), h('p', { class: 'muted' }, '人员关注按群查看：请在右上角选择一个具体的群。'))
     return
   }
   const persons = await api('persons', { chat: state.chat })
   const detail = h('section', { class: 'detail' }, h('p', { class: 'muted' }, '选一位成员与日期。'))
-  view().replaceChildren(h('div', { class: 'split' },
+  fill(view(), h('div', { class: 'split' },
     h('section', { class: 'side' },
       persons.length ? null : h('p', { class: 'muted' }, '本群暂无关注成员或个人摘要。'),
       ...persons.map(p => h('div', { class: 'card' },
         h('strong', {}, p.remark || p.groupNick || p.pid), ' ',
-        h('span', { class: 'pill' }, WATCH_NAME[p.watchLevel] ?? p.watchLevel),
+        h('span', { class: 'pill' }, WATCH_NAME[p.watchLevel] ?? p.watchLevel), ' ',
+        followButton(p),
         h('div', { class: 'days' }, p.days.length
           ? p.days.map(day => h('button', { type: 'button', class: 'chip', onclick: () => openPersonDigest(p, day, detail) }, day))
           : h('span', { class: 'muted' }, '暂无摘要'))))),
     detail))
 }
 
+function followButton(p) {
+  const status = h('span', { class: 'status' })
+  const following = p.watchLevel === 'group' || p.watchLevel === 'global'
+  // 全局关注来自配置 watchList，前端不改；只切换本群关注
+  if (p.watchLevel === 'global') return null
+  const b = h('button', { type: 'button', class: 'chip', disabled: !state.actions.enabled, onclick: async () => {
+    const ok = await submitAction({ type: following ? 'person.unfollow' : 'person.follow', chatId: state.chat, params: { pid: p.pid } }, status, [b])
+    if (ok) setTimeout(() => { if (state.tab === 'persons') load() }, 1500)
+  } }, following ? '取消关注' : '关注')
+  return h('span', {}, b, ' ', status)
+}
+
 async function openPersonDigest(p, day, into) {
   try {
     const d = await api(`persons/${encodeURIComponent(p.pid)}/digests`, { chat: state.chat, day })
-    into.replaceChildren(h('h2', {}, `${p.remark || p.groupNick || p.pid} · ${day}`), h('article', { class: 'md' }, renderBlocks(d.blocks)))
+    fill(into, h('h2', {}, `${p.remark || p.groupNick || p.pid} · ${day}`), h('article', { class: 'md' }, renderBlocks(d.blocks)))
   } catch (err) {
     showError(err, into)
   }
@@ -252,10 +426,10 @@ async function openPersonDigest(p, day, into) {
 
 // —— 入口 ——
 
-const LOADERS = { reports: loadReports, docs: () => loadDocs(), media: () => loadMedia(), digests: () => loadDigests(), persons: loadPersons }
+const LOADERS = { reports: loadReports, inbox: loadInbox, docs: () => loadDocs(), media: () => loadMedia(), digests: () => loadDigests(), persons: loadPersons }
 
 async function load() {
-  view().replaceChildren(h('p', { class: 'muted' }, '加载中…'))
+  fill(view(), h('p', { class: 'muted' }, '加载中…'))
   try {
     await LOADERS[state.tab]()
   } catch (err) {
@@ -268,6 +442,7 @@ async function boot() {
   try {
     const data = await api('chats')
     state.chats = data.chats
+    state.actions = data.actions ?? state.actions
     state.chat = data.chats.find(c => c.latestReport)?.chatId ?? data.chats[0]?.chatId ?? ''
     renderChatPicker()
     await load()

@@ -28,5 +28,7 @@ export function loadManifest(stateDir) {
   const groups = raw.groups.filter(g => typeof g === 'string' && ID_RE.test(g) && g !== AGGREGATE)
   if (groups.length === 0) return null
   const knowledgeDb = typeof raw.knowledgeDb === 'string' && raw.knowledgeDb ? raw.knowledgeDb : null
-  return { groups, knowledgeDb }
+  // 插件收件箱是否在消费 actions.jsonl（旧清单无此字段 = 否）
+  const actionsEnabled = raw.actionsEnabled === true
+  return { groups, knowledgeDb, actionsEnabled }
 }

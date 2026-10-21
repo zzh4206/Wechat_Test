@@ -18,18 +18,21 @@ export interface WebManifest {
   groups: string[]
   /** knowledge.db 绝对路径；null = 镜像已关闭（sqlitePath='off'），前端回溯不可用 */
   knowledgeDb: string | null
+  /** 插件收件箱是否消费 web/actions.jsonl（= webActionsEnabled 且依赖齐全）；false 时前端禁用审批按钮 */
+  actionsEnabled: boolean
   updatedAt: number
 }
 
 /** 写入清单；返回是否成功 */
 export function writeWebManifest(
   store: Pick<Store, 'ensureDir' | 'writeText'>,
-  opts: { groups: readonly string[]; knowledgeDb: string | null; now?: () => number },
+  opts: { groups: readonly string[]; knowledgeDb: string | null; actionsEnabled?: boolean; now?: () => number },
 ): boolean {
   const manifest: WebManifest = {
     version: 1,
     groups: [...opts.groups],
     knowledgeDb: opts.knowledgeDb,
+    actionsEnabled: opts.actionsEnabled ?? false,
     updatedAt: (opts.now ?? Date.now)(),
   }
   if (!store.ensureDir('web')) return false

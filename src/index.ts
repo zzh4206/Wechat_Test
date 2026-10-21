@@ -382,8 +382,6 @@ export function apply(ctx: Context, config: PluginConfig): void {
   const store = new Store(stateDir, logger, mirrorPath)
   // 初始化即建目录；失败只记日志，不阻断宿主。
   store.ensureDir('.')
-  // 前端 web 进程的只读清单（白名单 + knowledge.db 路径，设计 §11-Q5 b）；失败只 warn。
-  writeWebManifest(store, { groups: config.groups ?? [], knowledgeDb: mirrorPath ? resolve(mirrorPath) : null })
 
   // —— T3：LLM 调用结构化观测（report/distiller 共用同一记录器；JSONL 落 groups/<chatId>/） ——
   // T9：模型名与价格表在 llmClient 就绪后注入（成本五字段进每行 llm_call）。
@@ -747,6 +745,12 @@ export function apply(ctx: Context, config: PluginConfig): void {
         pollSec: config.webActionsPollSec,
       })
     : null
+  // 前端 web 进程的只读清单（白名单 + knowledge.db 路径 + 收件箱是否在消费，设计 §11-Q5 b）；失败只 warn。
+  writeWebManifest(store, {
+    groups: config.groups ?? [],
+    knowledgeDb: mirrorPath ? resolve(mirrorPath) : null,
+    actionsEnabled: actionInbox !== null,
+  })
 
   // —— M5-T5.3：文件索引（默认关 = 零活动）。 ——
   // —— M6-T2：wx_path 定位接线——工具 `files` 子命令按会话查路径，异步刷新进缓存，
