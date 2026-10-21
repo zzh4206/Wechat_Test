@@ -147,21 +147,18 @@ node scripts/import-state-to-sqlite.mjs --state-dir ~/.dsh/dsh-group-lurker
 
 ## 产出
 
-状态目录（默认 `$DSH_HOME/dsh-group-lurker/`）：`groups/<chatId>/{insights.jsonl, llm-calls.jsonl, distill-state.json, store.db}`、`reports/<chatId>/YYYY-MM-DD.md`（周报/日报分目录互不覆盖）、`audit.log`（仅元数据）、`cursor.json`、`outbox.jsonl`、`notify/ retention/ scheduler/`。
-
-`distill-state.json`（成本治理 C1+C2）：每群提炼器状态——连续失败次数、下次允许尝试时间（失败退避 1→2→4→8→16 分钟、30 分钟封顶；连续 5 次失败熔断 1 小时并告警一次）、上次成功时间与增量水位（`lastDistilledMsgTs/Id`，只喂水位之后的新消息）。持久化后可跨重启生效；损坏即作废重来。
+状态目录（默认 `$DSH_HOME/dsh-group-lurker/`）：`groups/<chatId>/{insights.jsonl, llm-calls.jsonl, store.db}`、`reports/<chatId>/YYYY-MM-DD.md`（周报/日报分目录互不覆盖）、`audit.log`（仅元数据）、`cursor.json`、`outbox.jsonl`、`notify/ retention/ scheduler/`。
 
 知识库（`~/WeChat/1数据/knowledge.db`）核心对象：五张事实表 `doc`（资料，`content_hash` 查重）、`entry`（随手记）、`report`（日报/周报/月报，draft → final）、`chat_digest`（**只存要点不存原文**，`source_key` 幂等）、`media`（媒体元数据，本体永不入库）；v0.6 增 `report_revision`（报告修订，不可变历史）与 `marking`（完成情况标记）两表，配 `v_report_revised` / `v_marking_latest` 视图。schema 迁移幂等（`user_version` 逐级升级），旧库自动升级不丢数据。
 
 日报末尾自带成本统计行（模型 / token / 花费）：
 
 ```text
-> 统计：批 1（失败 0）· 最大批耗时 0.0 s · 缓存命中 0 · LLM 调用 1 次 / 5.6 s · 模型 glm-5.3 · 输入 ~618 / 输出 ~178 tok · ≈¥0.0099（固定前缀命中缓存可再省 ≈3.7%；≈¥ 为未命中上界）
+> 统计：批 1（失败 0）· 最大批耗时 0.0 s · 缓存命中 0 · LLM 调用 1 次 / 5.6 s · 模型 glm-5.3 · 输入 ~618 / 输出 ~178 tok · ≈¥0.0099
 ```
 
 - token 拿不到真实 usage 时按 GLM 官方比例估算（**汉字 : token ≈ 1 : 1.6**），带 `~` 前缀与 `tokensEst: true` 标记；费用恒带 `≈`
 - 调价不改代码：改 `llmPricing` 配置（见[智谱定价页](https://docs.bigmodel.cn/cn/guide/start/pricing)）
-- 固定前缀可命中供应商上下文缓存：指令区（人格 + schema + wire 格式说明，逐字节稳定、置于最前）命中部分按 `cacheInput` 计价（默认价格表 GLM-5.3 ¥2、GLM-5.3-flash ¥0.23 每百万 tokens），报告尾会注明「固定前缀命中缓存可再省 ≈X%」；`costCny` 与 ≈¥ 仍是**未命中上界**（统计口径不变）。缓存节省用 `estimateCostWithCache()` 纯函数估算，`cacheInput` 缺省时按 input 计价（不虚报）
 - 汇总：`node scripts/llm-cost.mjs`（`--month` / `--day` / `--chat` / `--state`）；细节见 [docs/RUNBOOK.md](docs/RUNBOOK.md) §7.11
 
 ## 安全模型：五条红线

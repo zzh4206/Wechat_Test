@@ -1,0 +1,16 @@
+#!/bin/sh
+# pre-push：阻止直接推送 main（分支策略闸门）。
+# 安装：cp scripts/git-hooks/pre-push .git/hooks/pre-push && chmod +x .git/hooks/pre-push
+# 设计意图：LLM 等未经真实验证的改动一律走分支 → 审查/合并后再进 main。
+# 如确需紧急直推（如恢复线上故障），用 git push --no-verify 并事后在 CHANGELOG 记录原因。
+while read local_ref local_sha remote_ref remote_sha; do
+  case "$remote_ref" in
+    refs/heads/main|refs/heads/master)
+      echo "❌ 直接推送 $remote_ref 已被 pre-push 闸门阻止。" >&2
+      echo "   请推到分支（如 llm/<topic>、fix/<topic>），经审查后合并。" >&2
+      echo "   确需紧急直推：git push --no-verify（需在 CHANGELOG 记录原因）。" >&2
+      exit 1
+      ;;
+  esac
+done
+exit 0

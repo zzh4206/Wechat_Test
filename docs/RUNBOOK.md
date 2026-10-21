@@ -100,8 +100,6 @@ pnpm add file:/path/to/2水群
 ```sh
 ls ~/.dsh/dsh-group-lurker
 # groups/<chatId>/insights.jsonl   每群提炼产出（引用 ≤50 字，无消息全文）
-# groups/<chatId>/llm-calls.jsonl  每次 LLM 调用一行（模型/tokens/费用/errKind/errMsg；失败行含脱敏错误摘要）
-# groups/<chatId>/distill-state.json 提炼器状态（失败退避/熔断/增量水位；C1+C2）
 # groups/<chatId>/cursor.json     读取游标（只记消息 id，不记内容）
 # reports/YYYY-MM-DD.md           每日日报
 # scheduler/state.json            调度器已触发时点（只记 kind/时间戳，不记内容）
@@ -251,13 +249,11 @@ testKindIntervalMin: 10       # 启动后每 10 分钟依次强制触发一次 w
 
 ```yaml
 llmPricing:
-  glm-5.3: { input: 8, output: 28, cacheInput: 2 }          # 元/百万 tokens，智谱官方定价页 2026-10 抓取
-  glm-5.3-flash: { input: 0.8, output: 2.8, cacheInput: 0.23 }
+  glm-5.3: { input: 8, output: 28 }        # 元/百万 tokens，智谱官方定价页 2026-10 抓取
+  glm-5.3-flash: { input: 0.8, output: 2.8 }
 ```
 
 默认值即上表；**以供应商页面为准**：<https://docs.bigmodel.cn/cn/guide/start/pricing>。换模型（改 `llmModel`）记得同步补价格表条目，否则费用记 0。
-
-`cacheInput`（C4，可选）= 缓存命中输入价：指令区（人格 + schema + wire 格式说明）逐字节稳定、置于最前，可命中供应商上下文缓存；报告尾据此追加「固定前缀命中缓存可再省 ≈X%（≈¥ 为未命中上界）」，估算用纯函数 `estimateCostWithCache()`（缺省按指令前缀占输入 10% 的保守假设）。**`costCny` 与 ≈¥ 仍是未命中上界，统计口径不变**；不配 `cacheInput` 时估算退化为按 `input` 计（不虚报）。
 
 **费用汇总（推荐：内置命令）**：
 
@@ -285,6 +281,24 @@ jq -s '[.[] | select((.ts/1000|floor|strftime("%Y-%m"))=="2026-10") | .costCny] 
 ```
 
 （`ts` 为毫秒时间戳；`costCny` 逐行累加即总费用，与报告尾 ≈¥ 同口径。）
+
+## 7.12 分支策略与 main 保护（2026-10-21 起）
+
+**规则：main 只接受经审查的合并，禁止直接推送。** 未经真实验证的功能改动一律先落分支。
+
+```sh
+# 一次性安装本地闸门（每个克隆各装一次；钩子不进版本库）
+cp scripts/git-hooks/pre-push .git/hooks/pre-push && chmod +x .git/hooks/pre-push
+
+# 日常流程
+git checkout -b <topic>                # 如 llm/<topic>、fix/<topic>、feat/<topic>
+# …改动 + ./scripts/check-sensitive.sh + npm run build && npm test…
+git push -u origin <topic>             # 钩子只拦 main，分支正常推
+# 审查后由维护者合并进 main（--no-ff），或开 PR
+```
+
+- 确需紧急直推（线上故障恢复）：`git push --no-verify`，并在 CHANGELOG 记录原因与时间。
+- 闸门只是本地防线；服务端保护（GitHub branch protection / 仅 PR 合并）需在仓库设置里开，二者互补。
 
 ## 8. 排障
 

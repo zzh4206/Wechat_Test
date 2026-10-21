@@ -83,10 +83,8 @@ test('② 批 2 调用失败重试一次仍失败 → 该批跳过、批 1/3 照
     async complete(prompt) {
       calls.push(prompt)
       const data = JSON.parse(prompt.trimEnd().split('\n').pop())
-      // C3 wire：ts 收为秒级整数（样例毫秒时间戳全落在 1 秒内）、n 为批内序号，
-      // 故改用首条原文识别批次（批 1 消息0 起、批 2 消息25 起、批 3 消息50 起）
-      const first = Number(data[0].text.replace('消息', ''))
-      if (first === 25) throw new Error('connection reset')
+      const first = data[0].ts // ts=1000+i：批 1 首 1000、批 2 首 1025、批 3 首 1050
+      if (first === 1025) throw new Error('connection reset')
       return JSON.stringify([{ type: 'quote', text: `引用-${first}`, reason: 'r' }])
     },
   }
@@ -99,7 +97,7 @@ test('② 批 2 调用失败重试一次仍失败 → 该批跳过、批 1/3 照
   assert.ok(logger.warnings.some((w) => /batch 2\/3 .*batch skipped/.test(w)), `跳过 warn 缺批号：${logger.warnings}`)
   assert.deepEqual(
     produced[0][1].map((i) => i.text).sort(),
-    ['引用-0', '引用-50'],
+    ['引用-1000', '引用-1050'],
     '批 2 的产出被跳过，批 1/3 照常合并',
   )
 })
@@ -110,10 +108,9 @@ test('③ timeout 批对半切分自愈：批 2 整批 timeout → 对半为 12+
     async complete(prompt) {
       calls.push(prompt)
       const data = JSON.parse(prompt.trimEnd().split('\n').pop())
-      // 批 2（25 条，首条消息25）整批调用 timeout；左右半批（12/13 条）正常成功
-      const first = Number(data[0].text.replace('消息', ''))
-      if (first === 25 && data.length === 25) throw new Error('llm stream finished with error: Request timed out.')
-      return JSON.stringify([{ type: 'quote', text: `引用-${first}`, reason: 'r' }])
+      // 批 2（25 条，首 ts=1025）整批调用 timeout；左右半批（12/13 条）正常成功
+      if (data[0].ts === 1025 && data.length === 25) throw new Error('llm stream finished with error: Request timed out.')
+      return JSON.stringify([{ type: 'quote', text: `引用-${data[0].ts}`, reason: 'r' }])
     },
   }
   const { distiller, produced, logger } = setup({ llm })
@@ -123,8 +120,8 @@ test('③ timeout 批对半切分自愈：批 2 整批 timeout → 对半为 12+
   assert.equal(calls.length, 5, `期望 5 次调用（对半自愈），实际 ${calls.length}`)
   assert.deepEqual(
     produced[0][1].map((i) => i.text).sort(),
-    ['引用-0', '引用-25', '引用-37', '引用-50'],
-    '对半子批产出并入合并（批 2 左半消息25 起 / 右半消息37 起）',
+    ['引用-1000', '引用-1025', '引用-1037', '引用-1050'],
+    '对半子批产出并入合并（批 2 左半 1025 起 / 右半 1037 起）',
   )
   // timeout 自愈成功 → 无"跳过"warn
   assert.ok(!logger.warnings.some((w) => /batch skipped/.test(w)))
@@ -134,10 +131,9 @@ test('③b 叶子批（<5 条）仍 timeout → 该批跳过、其余照常', as
   const llm = {
     async complete(prompt) {
       const data = JSON.parse(prompt.trimEnd().split('\n').pop())
-      // 批 1（消息0–24）整条对半链（25→12→6→3 叶子）全 timeout → 跳过
-      const first = Number(data[0].text.replace('消息', ''))
-      if (first < 25) throw new Error('Request timed out.')
-      return JSON.stringify([{ type: 'quote', text: `引用-${first}`, reason: 'r' }])
+      // 批 1（首 ts=1000）整条对半链（25→12→6→3 叶子）全 timeout → 跳过
+      if (data[0].ts < 1025) throw new Error('Request timed out.')
+      return JSON.stringify([{ type: 'quote', text: `引用-${data[0].ts}`, reason: 'r' }])
     },
   }
   const { distiller, produced, logger } = setup({ llm })
@@ -145,7 +141,7 @@ test('③b 叶子批（<5 条）仍 timeout → 该批跳过、其余照常', as
   assert.equal(ok, true, '批 1 整链超时被跳过，批 2/3 照常')
   assert.deepEqual(
     produced[0][1].map((i) => i.text).sort(),
-    ['引用-25', '引用-50'],
+    ['引用-1025', '引用-1050'],
   )
   assert.ok(logger.warnings.some((w) => /timeout at leaf/.test(w)), '叶子批跳过 warn')
 })

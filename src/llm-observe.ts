@@ -16,60 +16,16 @@
  * 不引入新依赖；durMs 恒为正数（单调时钟 + 下限 1ms）。
  */
 import type { Store } from './store.js'
-import { redactSecretLike } from './guard.js'
 
 /**
- * 失败分类（C1：由 timeout|other 二值细分为六类）。
- *
- * 动机：成本分析（docs/COST-ANALYSIS-2026-10-21.md §3.3）显示 5 天内 1807 次失败
- * 全被记成 `other`，"other" 的真身（限流？5xx？鉴权？）至今不可见 → 5 天后才从
- * 账单发现。这里先把失败分类做细，让下一次真实失败立刻可归因。
- *
- * 判定优先级（自上而下，先匹配先返回）：
- * 1. timeout —— `/timed?\s?out|timeout/i`（覆盖 timeout / timed out / timedout 等变体。
- *    **必须最先判**：report.ts / distiller.ts 的"对半切分重试"只认 timeout，
- *    语义与 T1 完全向后兼容）；
- * 2. rate_limit —— 429 / rate limit / too many requests；
- * 3. auth —— 401 / 403 / unauthorized / forbidden / invalid api key（须在 bad_request 之前，
- *    否则 "invalid api key" 会被 /invalid/ 抢走）；
- * 4. server —— 5xx / 500 / 502 / 503 / internal server error / bad gateway；
- * 5. bad_request —— 400 / 422 / invalid / bad request / validation；
- * 6. other —— 其余（解析失败、未知异常）。
+ * 错误分类（T1，技术文档 §3.3）：timeout 类故障对半切分重试（改变参数重试），
+ * 非 timeout（断言/解析失败、其他异常）保持"重试一次"。
+ * 匹配 distiller 抛出的 `llm stream finished with error: Request timed out.`
+ * 用 `/timed?\s?out|timeout/i` 容错匹配（覆盖 timeout / timed out / timedout 等变体）。
  */
-export type LlmErrKind = 'timeout' | 'rate_limit' | 'auth' | 'server' | 'bad_request' | 'other'
-
-/** 失败分类（函数名保持 `errKindOf` 不变：report.ts 再导出与既有测试零改动） */
-export function errKindOf(error: unknown): LlmErrKind {
+export function errKindOf(error: unknown): 'timeout' | 'other' {
   const msg = error instanceof Error ? error.message : String(error ?? '')
-  // ① timeout 优先：对半切分重试的判据只看这一类，语义不得变
-  if (/timed?\s?out|timeout/i.test(msg)) return 'timeout'
-  // ② 限流
-  if (/429|rate[\s_-]?limit|too many requests/i.test(msg)) return 'rate_limit'
-  // ③ 鉴权（先于 bad_request：避免 "invalid api key" 被 /invalid/ 归到 400）
-  if (/\b40[13]\b|unauthori[sz]ed|forbidden|invalid api key|authentication|permission denied/i.test(msg)) return 'auth'
-  // ④ 服务端（5xx）
-  if (/\b5\d{2}\b|internal server error|bad gateway|service unavailable|server error/i.test(msg)) return 'server'
-  // ⑤ 请求非法（400/422）
-  if (/\b4(?:00|22)\b|bad request|invalid|validation|unprocessable|malformed/i.test(msg)) return 'bad_request'
-  return 'other'
-}
-
-/** 失败调用错误摘要的字符上限（errMsg 落盘前截断——只留定位线索，不留全文） */
-export const ERR_MSG_MAX_CHARS = 160
-
-/**
- * 失败调用错误摘要（C1）：message 先过 redactSecretLike（≥32 位密钥形态串替换为
- * `[redacted-token:N]`）再截断到 ERR_MSG_MAX_CHARS 字符。
- * 只用于失败行（成功行不写 errMsg），保证 API key 绝不进 JSONL。
- */
-export function summarizeErrMsg(error: unknown): string {
-  const raw =
-    error instanceof Error
-      ? error.message !== ''
-        ? error.message
-        : error.name
-      : String(error ?? '')
-  return redactSecretLike(raw).slice(0, ERR_MSG_MAX_CHARS)
+  return /timed?\s?out|timeout/i.test(msg) ? 'timeout' : 'other'
 }
 
 /**
@@ -97,12 +53,6 @@ export interface ModelPricing {
   input: number
   /** 输出价格（元/百万 tokens） */
   output: number
-  /**
-   * C4：缓存命中输入价（元/百万 tokens，可选）。供应商上下文缓存命中的部分按此计价
-   * （智谱 GLM 官方缓存价约为输入价 1/4）。缺省 = 无缓存价，estimateCostWithCache
-   * 退化为按 input 计价（与 computeCostCny 同值）。
-   */
-  cacheInput?: number
 }
 
 /** 价格表：模型名 → 价格（Config.llmPricing 的形状） */
@@ -110,13 +60,12 @@ export type LlmPricingTable = Record<string, ModelPricing>
 
 /**
  * 默认价格表（智谱官方定价页 2026-10 抓取：GLM-5.3 输入 ¥8 / 输出 ¥28 每百万 tokens，
- * GLM-5.3-flash 输入 ¥0.8 / 输出 ¥2.8；C4 缓存命中输入价 GLM-5.3 ¥2、
- * GLM-5.3-flash ¥0.23）。**以供应商页面为准**：
+ * GLM-5.3-flash 输入 ¥0.8 / 输出 ¥2.8）。**以供应商页面为准**：
  * https://docs.bigmodel.cn/cn/guide/start/pricing —— 调价改 llmPricing 配置即可，无需改代码。
  */
 export const DEFAULT_LLM_PRICING: LlmPricingTable = {
-  'glm-5.3': { input: 8, output: 28, cacheInput: 2 },
-  'glm-5.3-flash': { input: 0.8, output: 2.8, cacheInput: 0.23 },
+  'glm-5.3': { input: 8, output: 28 },
+  'glm-5.3-flash': { input: 0.8, output: 2.8 },
 }
 
 /**
@@ -127,43 +76,6 @@ export function computeCostCny(model: string, inTokens: number, outTokens: numbe
   const p = pricing?.[model]
   if (!p || typeof p.input !== 'number' || typeof p.output !== 'number') return 0
   const cny = (inTokens / 1_000_000) * p.input + (outTokens / 1_000_000) * p.output
-  return Math.round(cny * 1_000_000) / 1_000_000
-}
-
-/**
- * C4：指令区缓存前缀占输入 token 的保守假设比例（10%）。指令区（人格 + schema +
- * 约束）约 600–900 tokens，小窗口调用里占比可达 80%+，大窗口里约 5–10%——取 10%
- * 作为「可再省多少」的保守口径，只用于报告尾估算，**不改 costCny 统计口径**。
- */
-export const CACHE_PREFIX_RATIO_ASSUMED = 0.1
-
-/**
- * C4 缓存价估算（纯函数）：与 computeCostCny 同口径，但把输入 token 中
- * `cacheRatio` 比例视为「命中供应商上下文缓存」，该部分按 cacheInput 计价。
- *
- * - `cacheRatio` 缺省 = CACHE_PREFIX_RATIO_ASSUMED（报告尾「可再省 X%」用）；
- * - 价格表未命中 / 无 cacheInput → 退化为 computeCostCny（无缓存价即无节省，保守）；
- * - cacheRatio 会 clamp 到 [0, 1]；返回四舍五入到 1e-6 元。
- *
- * 注意：它**不参与** llm_call 逐行 costCny 与 BatchStats.costCny（那两者仍是未命中
- * 上界，保守不变）——只用于向用户解释「前缀命中缓存还能再省多少」。
- */
-export function estimateCostWithCache(
-  model: string,
-  inTokens: number,
-  outTokens: number,
-  pricing: LlmPricingTable,
-  cacheRatio: number = CACHE_PREFIX_RATIO_ASSUMED,
-): number {
-  const p = pricing?.[model]
-  if (!p || typeof p.input !== 'number' || typeof p.output !== 'number') return 0
-  const ratio = Number.isFinite(cacheRatio) ? Math.min(1, Math.max(0, cacheRatio)) : 0
-  const cachedTokens = inTokens > 0 ? inTokens * ratio : 0
-  const cachedPrice = typeof p.cacheInput === 'number' ? p.cacheInput : p.input
-  const cny =
-    (cachedTokens / 1_000_000) * cachedPrice +
-    ((inTokens - cachedTokens) / 1_000_000) * p.input +
-    (outTokens / 1_000_000) * p.output
   return Math.round(cny * 1_000_000) / 1_000_000
 }
 
@@ -183,12 +95,7 @@ export interface LlmCallEntry {
   durMs: number
   ok: boolean
   /** 失败分类（复用 errKindOf；成功为空串） */
-  errKind: LlmErrKind | ''
-  /**
-   * C1：失败调用的错误摘要（redactSecretLike 脱敏 + 截断 160 字符）。
-   * 可选字段——**只对失败调用记录**，成功行不写（向后兼容：旧读取方忽略即可）。
-   */
-  errMsg?: string
+  errKind: 'timeout' | 'other' | ''
   ts: number
   /** T9：模型名（来源 LlmClient.modelId()；缺省 'unknown'） */
   model: string
@@ -334,7 +241,7 @@ export class LlmCallRecorder {
       this.record(chatId, kind, phase, batch, msgs, prompt.length, sinceMs(t0), true, '', text.length, usage)
       return text
     } catch (error) {
-      this.record(chatId, kind, phase, batch, msgs, prompt.length, sinceMs(t0), false, errKindOf(error), 0, null, summarizeErrMsg(error))
+      this.record(chatId, kind, phase, batch, msgs, prompt.length, sinceMs(t0), false, errKindOf(error), 0, null)
       throw error
     }
   }
@@ -349,13 +256,11 @@ export class LlmCallRecorder {
     promptChars: number,
     durMs: number,
     ok: boolean,
-    errKind: LlmErrKind | '',
+    errKind: 'timeout' | 'other' | '',
     /** T9：输出字符数（估算 outTokens 用；失败调用传 0） */
     outChars: number,
     /** T9：宿主回传的真实 usage（无则 null → 走估算） */
     usage: { inTok: number; outTok: number } | null,
-    /** C1：失败调用的错误摘要（已脱敏截断；成功调用不传 → 字段不出现） */
-    errMsg?: string,
   ): void {
     this.stats.calls++
     if (ok) this.stats.okCalls++
@@ -376,8 +281,6 @@ export class LlmCallRecorder {
     this.stats.costCny = Math.round((this.stats.costCny + costCny) * 1_000_000) / 1_000_000
     if (tokensEst) this.stats.tokensEst = true
     const entry: LlmCallEntry = { ev: 'llm_call', chat: chatId, kind, phase, batch, msgs, promptChars, durMs, ok, errKind, ts: this.now(), model: this.model, inTokens, outTokens, costCny, tokensEst }
-    // C1：错误摘要只进失败行（空串不写，保持成功行字段集与旧版完全一致）
-    if (!ok && errMsg !== undefined && errMsg !== '') entry.errMsg = errMsg
     this.store.ensureDir(['groups', chatId].join('/'))
     this.store.appendJsonl(llmCallRelPath(chatId), entry)
   }
@@ -442,31 +345,17 @@ function fmtTok(n: number): string {
 }
 
 /**
- * 报告尾统计行（技术文档 §7 + T9 成本透明 + C4 缓存估算）：
+ * 报告尾统计行（技术文档 §7 + T9 成本透明）：
  * `> 统计：批 x（失败 y）· 最大批耗时 z s · 缓存命中 n · LLM 调用 c 次 / t s · 模型 m · 输入 ~12.3k / 输出 ~4.5k tok · ≈¥0.0223`
  * —— 估算 token 带 `~`、费用带 `≈`（保留 4 位小数，日级费用常在分厘级）；
  * 真实 usage（tokensEst=false）时去掉 `~`；model 未提供（如 empty 路径）省略成本段（向后兼容）。
- * C4：价格表含 cacheInput 时追加「固定前缀命中缓存可再省 ≈X%；≈¥ 为未命中上界」——
- * `pricing` 缺省 DEFAULT_LLM_PRICING，只影响这句估算，不改变 costCny 口径。
  */
-export function renderBatchStatsLine(
-  s: Readonly<BatchStats>,
-  pricing: LlmPricingTable = DEFAULT_LLM_PRICING,
-): string {
+export function renderBatchStatsLine(s: Readonly<BatchStats>): string {
   const sec = (ms: number) => (ms / 1000).toFixed(1)
   let line = `> 统计：批 ${s.batches}（失败 ${s.failedBatches}）· 最大批耗时 ${sec(s.maxBatchMs)} s · 缓存命中 ${s.ckptHits} · LLM 调用 ${s.totalCalls} 次 / ${sec(s.totalMs)} s`
   if (s.model !== undefined) {
     const tilde = s.tokensEst === false ? '' : '~'
     line += ` · 模型 ${s.model} · 输入 ${tilde}${fmtTok(s.inTokens ?? 0)} / 输出 ${tilde}${fmtTok(s.outTokens ?? 0)} tok · ≈¥${(s.costCny ?? 0).toFixed(4)}`
-    // C4：固定前缀（人格+schema+wire 说明）逐字节稳定，可命中供应商上下文缓存。
-    // 这里只给「若命中可再省多少」的保守估算——costCny 与 ≈¥ 仍是未命中上界（统计口径不变）。
-    const p = pricing[s.model]
-    if (p?.cacheInput !== undefined && (s.inTokens ?? 0) > 0) {
-      const base = computeCostCny(s.model, s.inTokens ?? 0, s.outTokens ?? 0, pricing)
-      const cached = estimateCostWithCache(s.model, s.inTokens ?? 0, s.outTokens ?? 0, pricing)
-      const savePct = base > 0 ? Math.round((1 - cached / base) * 1000) / 10 : 0
-      if (savePct > 0) line += `（固定前缀命中缓存可再省 ≈${savePct}%；≈¥ 为未命中上界）`
-    }
   }
   // T7：ab 双跑模式追加 refine（方案 B）侧对比段——两管线各自调用数/耗时/费用，供人工评审定位
   if (s.pipeline === 'ab' && s.refine) {
