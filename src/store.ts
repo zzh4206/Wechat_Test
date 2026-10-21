@@ -112,6 +112,15 @@ export class Store {
     }
   }
 
+  /** 读原始字节（W-3：收件箱水位=字节偏移，按字节扫描切片解析行）；不存在/失败返回 null */
+  readBuffer(rel: string): Buffer | null {
+    try {
+      return readFileSync(join(this.baseDir, rel))
+    } catch {
+      return null
+    }
+  }
+
   /** 追加文本（自管换行） */
   appendText(rel: string, text: string): boolean {
     const target = join(this.baseDir, rel)

@@ -10,6 +10,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import Schema from '@deepseek-ai/schemastery'
 import { join } from 'node:path'
+import { createHash } from 'node:crypto'
 import { existsSync as fsExistsSync, readdirSync as fsReaddirSync, statSync as fsStatSync } from 'node:fs'
 import { execFile } from 'node:child_process'
 import { Store } from './store.js'
@@ -184,6 +185,8 @@ export interface PluginConfig {
   sendSearchViaClipboard: boolean
   webActionsEnabled: boolean
   webActionsPollSec: number
+  /** W-1：前端动作通道共享 token（真实值放 cordis.patch.yml；审计只记 sha256 前 8 位） */
+  webActionsToken: string
   /** T4：自适应批大小（默认 true：timeout 压缩 ×0.7 / 连续成功扩张 ×1.2，按群按 kind 持久化；false = 固定 batchThreshold 回退通道） */
   adaptiveBatch: boolean
   /** T7：报告归纳管线（'map-reduce' | 'refine' | 'ab'；默认 'map-reduce' 安全默认，BooookScore 修正案不预设 B 优） */
@@ -275,6 +278,7 @@ export const Config: Schema<PluginConfig> = Schema.object({
     sendTargetChat: Schema.string().default('').description('发送目标会话名（搜索词；真实值放运行配置。默认空 = fail-closed 不发送；搜索结果多条时 Enter 选第一个，异常由 DB 回读兜底报警）'),
   webActionsEnabled: Schema.boolean().default(false).description('前端动作收件箱（审批双通道 web 侧）：消费 web/actions.jsonl 调 ApprovalActions，写结果/审计文件。默认关'),
   webActionsPollSec: Schema.number().default(5).description('动作收件箱轮询周期秒（默认 5）'),
+    webActionsToken: Schema.string().default('').description('前端动作通道共享 token（与前端 web 进程一致；真实值放 cordis.patch.yml，绝不入日志/审计原文）。审计只记 sha256 前 8 位操作者标识（W-1）；空 = 审计 operator 记 unknown'),
     readbackChatId: Schema.string().default('').description('DB 回读验证目标会话 wxid（P0 兜底闸目标；必填——缺失 fail-closed 不发送。真实值放 cordis.patch.yml）'),
   sendSearchViaClipboard: Schema.boolean().default(false).description('搜索词键入走剪贴板回退（默认 false = System Events 直接键入；CJK IME 拦截实测失败时开启）'),
     idleSkipBelowSec: Schema.number().default(10).description('用户空闲让路阈值秒（默认 10 = 系统空闲 <10s 视为正在操作→跳过本轮让路；0 = 不让路，空闲检测失效直接抢前台发送。日常单日报场景可设 0——每天一次的抢前台可接受；频繁发送建议保持 10）'),
@@ -730,12 +734,25 @@ export function apply(ctx: Context, config: PluginConfig): void {
         enqueueReportRegen: (chatId2, dateKey2, kind2) => regenQueue.enqueue(chatId2, dateKey2, Date.now(), kind2, 'manual') !== 'deduped',
       })
     : null
+  // W-2：总闸开但依赖缺失 → 启动即 error 指明缺谁（不再静默零消费，前端排障有据）
+  if (config.webActionsEnabled && !approvalActions) {
+    const missing = [
+      ...(taskRecognition ? [] : ['taskRecognition']),
+      ...(promiseRecognition ? [] : ['promiseRecognition']),
+    ]
+    logger.error(`web-actions: webActionsEnabled=true 但收件箱依赖缺失（${missing.join('、')}）——收件箱不消费 web/actions.jsonl，前端将永远等不到 action-results 回执`)
+  }
+  // W-1：操作者标识 = 共享 token 的 sha256 前 8 位（绝不落原 token；空 token 记 unknown）
+  const webActionsOperator = config.webActionsToken
+    ? createHash('sha256').update(config.webActionsToken, 'utf8').digest('hex').slice(0, 8)
+    : undefined
   const actionInbox = config.webActionsEnabled && approvalActions
     ? new ActionInbox({
         store,
         actions: approvalActions,
         marks: { markTarget: (chatId2, kind2, targetId2, status2, source2) => reportRevision.markTarget(chatId2, kind2, targetId2, status2, source2) },
         groups: config.groups,
+        operator: webActionsOperator,
         logger: logger as unknown as StoreLogger,
         pollSec: config.webActionsPollSec,
       })

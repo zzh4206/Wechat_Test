@@ -2,7 +2,8 @@
  * action-inbox.ts：前端动作收件箱消费（confirm-loop 设计 §2.2，前端设计 §4.3 行格式）。
  *
  * 数据流：前端进程唯一写入 <stateDir>/web/actions.jsonl → 本消费器只读该文件，
- * 经水位 web/actions.offset（Store.writeText，跨重启续读）逐行处理：
+ * 经水位 web/actions.offset（JSON {byteOffset, lastActionId}，W-3：水位=字节偏移，
+ * 每行处理后立即落盘；轮转/截断→resync + error；连续性不符→resync + warn）逐行处理：
  *   校验（R2: chatId ∈ groups / type 白名单 / targetId 正整数 / actionId 幂等）
  *   → 调 ApprovalActions / MarkActions（单入口，双通道同源）
  *   → web/action-results.jsonl（{actionId, ok, code, ts}，不含语句原文）
@@ -70,9 +71,22 @@ export interface ActionOutcome {
   reason?: string
 }
 
+/**
+ * W-3 连续性校验辅助：取 buf 前 end 字节里最后一条完整行的 actionId。
+ * 无完整行 / 行不可解析 → null（校验不过 → resync）。
+ */
+function lastCompleteLineActionId(buf: Buffer, end: number): string | null {
+  if (end <= 0 || end > buf.length) return null
+  const text = buf.slice(0, end).toString('utf8')
+  const lines = text.split('\n')
+  if (lines[lines.length - 1] === '') lines.pop() // 偏移恒在 '\n' 之后 → 末元素为空串
+  if (lines.length === 0) return null
+  return parseActionLine(lines[lines.length - 1])?.actionId ?? null
+}
+
 /** 解析一行（坏行返回 null——跳过并计数，不中断水位） */
 export function parseActionLine(line: string): ActionLine | null {
-  try {
+    try {
     const v = JSON.parse(line) as Record<string, unknown>
     if (typeof v.actionId !== 'string' || v.actionId === '') return null
     if (typeof v.chatId !== 'string' || v.chatId === '') return null
@@ -112,6 +126,20 @@ function staleOf(deps: Pick<ActionInboxDeps, 'resolveTarget'>, a: ActionLine): {
   if (!t) return { code: 'not_found' }
   return { code: 'status_conflict' }
 }
+
+/** 水位文件（W-3：字节偏移制，设计前端 §5「水位=字节偏移」）：JSON 一行落盘 */
+export interface ActionOffsetFile {
+  /** 已消费到的字节偏移（下一行起点；行尾 '\n' 之后） */
+  byteOffset: number
+  /** 偏移前最后一条已处理行的 actionId（连续性校验锚点；坏行为 ''） */
+  lastActionId: string
+}
+
+/** W-9：writeResult 写失败时的内存墓碑行（有界，下轮 poll 先行补写） */
+interface ResultTombstone { actionId: string; ok: boolean; code: string }
+
+/** W-9 墓碑队列上限（防磁盘长期满时无界增长） */
+export const RESULT_TOMBSTONE_MAX = 100
 
 /** 前端动作 → ApprovalActions / MarkActions 单入口分发。返回 code（stale = 服务返回 false） */
 export async function dispatchAction(
@@ -186,46 +214,133 @@ export class ActionInbox {
     this.loadOffsetSeen()
   }
 
-  /** 水位 = 已处理行数（按行计）；seen 载入本会话处理过的 actionId（防同文件重放） */
+  /**
+   * 水位载入（W-3 字节偏移制）：
+   * - seen 预载自 web/action-results.jsonl（持久幂等源：重启/轮转后重复 actionId 也不会重复执行）；
+   * - 水位文件 JSON {byteOffset, lastActionId}；旧版行计数格式无法映射到字节 → 从头 resync（seen 兜底防重放）；
+   * - 连续性校验：byteOffset 前最后一条完整行的 actionId ≠ lastActionId → 水位失效，resync + warn。
+   */
   private loadOffsetSeen(): void {
+    // 持久幂等源：结果文件里出现过的 actionId 一律视为已处理
+    const results = this.deps.store.readText(ACTION_RESULTS_REL)
+    if (results) {
+      for (const line of results.split('\n')) {
+        try {
+          const v = JSON.parse(line) as { actionId?: unknown }
+          if (typeof v.actionId === 'string' && v.actionId !== '') this.seen.add(v.actionId)
+        } catch { /* 损坏行跳过 */ }
+      }
+    }
     const offRaw = this.deps.store.readText(ACTIONS_OFFSET_REL)
-    const offset = offRaw ? Number(offRaw.trim()) || 0 : 0
-    this.offset = Number.isFinite(offset) && offset >= 0 ? offset : 0
-    const raw = this.deps.store.readText(ACTIONS_REL)
-    if (!raw) return
-    const lines = raw.split('\n').filter((l) => l.trim() !== '')
-    for (let i = 0; i < Math.min(this.offset, lines.length); i++) {
-      const a = parseActionLine(lines[i])
-      if (a) this.seen.add(a.actionId)
+    if (!offRaw) return
+    let parsed: ActionOffsetFile | null = null
+    try { parsed = JSON.parse(offRaw) as ActionOffsetFile } catch { parsed = null }
+    if (!parsed || typeof parsed.byteOffset !== 'number' || !Number.isFinite(parsed.byteOffset) || parsed.byteOffset < 0 || typeof parsed.lastActionId !== 'string') {
+      this.deps.logger.warn('action-inbox: 水位文件为旧版行计数/损坏格式——从头 resync（结果文件幂等兜底）')
+      this.byteOffset = 0
+      this.lastActionId = ''
+      return
+    }
+    this.byteOffset = Math.floor(parsed.byteOffset)
+    this.lastActionId = parsed.lastActionId
+    // 连续性校验：偏移前的最后一条完整行必须就是记录的 lastActionId
+    const buf = this.deps.store.readBuffer(ACTIONS_REL)
+    if (this.byteOffset === 0) return
+    if (!buf || this.byteOffset > buf.length) {
+      this.deps.logger.warn('action-inbox: 水位字节偏移超过文件长度（文件被轮转/截断）——从头 resync')
+      this.byteOffset = 0
+      this.lastActionId = ''
+      return
+    }
+    const anchor = lastCompleteLineActionId(buf, this.byteOffset)
+    if (anchor === null || anchor !== this.lastActionId) {
+      this.deps.logger.warn(`action-inbox: 水位连续性校验失败（offset 前 actionId=${anchor ?? '无'} ≠ 记录 ${this.lastActionId}）——从头 resync`)
+      this.byteOffset = 0
+      this.lastActionId = ''
     }
   }
 
-  private offset = 0
+  private byteOffset = 0
+  private lastActionId = ''
   private lastError: string | null = null
+  /** W-9：写失败的回执墓碑（FIFO 有界；下轮 poll 先补写再消费新行） */
+  private tombstones: ResultTombstone[] = []
+  private writeFailStreak = 0
 
-  /** 单轮消费：读 actions.jsonl，从水位行起逐行处理。返回处理条数 */
+  /** 落盘水位（每行处理后立即调用——中途崩溃不重放已执行动作） */
+  private persistOffset(): void {
+    const file: ActionOffsetFile = { byteOffset: this.byteOffset, lastActionId: this.lastActionId }
+    if (!this.deps.store.writeText(ACTIONS_OFFSET_REL, `${JSON.stringify(file)}\n`)) {
+      this.deps.logger.error('action-inbox: 水位落盘失败——重启可能重放（结果文件幂等兜底防重复执行）')
+    }
+  }
+
+  /** W-9：poll 开头先补写上一轮失败的回执墓碑（连续失败计数 error 告警） */
+  private flushTombstones(): void {
+    while (this.tombstones.length > 0) {
+      const t = this.tombstones[0]
+      if (this.appendResult(t.actionId, t.ok, t.code)) {
+        this.tombstones.shift()
+        this.writeFailStreak = 0
+      } else {
+        this.writeFailStreak += 1
+        this.alertWriteStreak()
+        return
+      }
+    }
+  }
+
+  private alertWriteStreak(): void {
+    // 连续失败 3 次起 error 告警，此后每 20 次再提一次（磁盘满/权限类持续故障不刷屏）
+    if (this.writeFailStreak === 3 || (this.writeFailStreak > 3 && this.writeFailStreak % 20 === 0)) {
+      this.deps.logger.error(`action-inbox: 回执写失败连续 ${this.writeFailStreak} 次（含 ${this.tombstones.length} 条墓碑待补）——前端将等不到 actionId 回执`)
+    }
+  }
+
+  /** 单轮消费：按字节扫描 actions.jsonl，从水位字节偏移起逐行处理，每行处理后立即落盘水位。返回处理条数 */
   async poll(): Promise<number> {
-    const raw = this.deps.store.readText(ACTIONS_REL)
-    if (!raw) return 0
-    const lines = raw.split('\n').filter((l) => l.trim() !== '')
+    this.flushTombstones() // W-9：先补上轮失败的回执
+    const buf = this.deps.store.readBuffer(ACTIONS_REL)
+    if (!buf) return 0
+    // 轮转/截断检测：水位超出当前文件字节长度 → 文件被前端轮转或截断 → 从头 resync（seen 兜底防重复执行）
+    if (this.byteOffset > buf.length) {
+      this.deps.logger.error(`action-inbox: actions.jsonl 字节长度 ${buf.length} < 水位 ${this.byteOffset}——文件被轮转/截断，从头 resync`)
+      this.byteOffset = 0
+      this.lastActionId = ''
+      this.persistOffset()
+    }
     let processed = 0
-    while (this.offset < lines.length) {
-      const line = lines[this.offset]
-      this.offset += 1 // 无论成败都推进水位（坏行跳过不卡队列；结果文件承载失败）
-      const a = parseActionLine(line)
+    let pos = this.byteOffset
+    while (pos < buf.length) {
+      const nl = buf.indexOf(0x0a, pos)
+      if (nl === -1) break // 尾部无换行的半行（前端写一半）→ 留待下轮，绝不消费残行
+      const lineEnd = nl + 1
+      const text = buf.slice(pos, nl).toString('utf8')
+      pos = lineEnd
+      const a = parseActionLine(text)
       if (!a) {
         this.writeResult('bad-line', false, 'bad_request')
+        this.byteOffset = lineEnd // 坏行也推进水位（不卡队列；结果文件承载失败）
+        this.lastActionId = ''
+        this.persistOffset()
         continue
       }
-      if (this.seen.has(a.actionId)) continue // 幂等：重复 actionId 跳过（不重复执行）
+      if (this.seen.has(a.actionId)) { // 幂等：重复 actionId 跳过（不重复执行）
+        this.byteOffset = lineEnd
+        this.lastActionId = a.actionId
+        this.persistOffset()
+        continue
+      }
       this.seen.add(a.actionId)
       const outcome = await this.process(a)
       this.writeResult(a.actionId, outcome.ok, outcome.code)
       this.audit(a, outcome)
       if (!outcome.ok) this.lastError = `${a.actionId}:${outcome.code}`
       processed += 1
+      this.byteOffset = lineEnd // 每行处理后立即落盘（中途崩溃不重放）
+      this.lastActionId = a.actionId
+      this.persistOffset()
     }
-    this.deps.store.writeText(ACTIONS_OFFSET_REL, `${this.offset}\n`)
     return processed
   }
 
@@ -255,15 +370,30 @@ export class ActionInbox {
     }
   }
 
+  /** W-9：写回执；失败入内存墓碑（有界），下轮 poll 补写；连续失败计数 error 告警 */
   private writeResult(actionId: string, ok: boolean, code: string): void {
+    if (this.appendResult(actionId, ok, code)) {
+      this.writeFailStreak = 0
+      return
+    }
+    this.writeFailStreak += 1
+    this.alertWriteStreak()
+    this.tombstones.push({ actionId, ok, code })
+    if (this.tombstones.length > RESULT_TOMBSTONE_MAX) {
+      const dropped = this.tombstones.shift()
+      this.deps.logger.error(`action-inbox: 回执墓碑队列溢出丢弃最旧 ${JSON.stringify(dropped)}——该 actionId 前端将永远等不到回执`)
+    }
+  }
+
+  private appendResult(actionId: string, ok: boolean, code: string): boolean {
     this.deps.store.ensureDir('web')
-    this.deps.store.appendJsonl(ACTION_RESULTS_REL, { actionId, ok, code, ts: this.now() })
+    return this.deps.store.appendJsonl(ACTION_RESULTS_REL, { actionId, ok, code, ts: this.now() })
   }
 
   private audit(a: ActionLine, outcome: ActionOutcome): void {
     this.deps.store.ensureDir('audit')
-    // 只记元数据：actionId/type/chatId/code——绝无语句原文
-    this.deps.store.appendJsonl(WEB_ACTIONS_AUDIT_REL, { ts: this.now(), actionId: a.actionId, type: a.type, chatId: a.chatId, code: outcome.code, ok: outcome.ok })
+    // 只记元数据：actionId/type/chatId/code/operator（W-1：操作者=web token 哈希前缀，绝不落原 token/语句原文）
+    this.deps.store.appendJsonl(WEB_ACTIONS_AUDIT_REL, { ts: this.now(), actionId: a.actionId, type: a.type, chatId: a.chatId, code: outcome.code, ok: outcome.ok, operator: this.deps.operator ?? 'unknown' })
   }
 
   /** 启动轮询（接线层 ctx.effect 挂 dispose） */
@@ -275,15 +405,24 @@ export class ActionInbox {
     return () => this.dispose()
   }
 
-  /** W-6：只读运行状态（积压/水位/最近错误） */
+  /** W-6：只读运行状态（积压/水位/最近错误）。水位=字节偏移（W-3）；积压按未消费完整行数计 */
   status(): { enabled: boolean; ready: { taskRecognition: boolean; promiseRecognition: boolean }; backlog: number; offset: number; lastError: string | null } {
-    const raw = this.deps.store.readText(ACTIONS_REL)
-    const backlog = raw ? raw.split('\n').filter((l) => l.trim() !== '').length - this.offset : 0
+    const buf = this.deps.store.readBuffer(ACTIONS_REL)
+    let backlog = 0
+    if (buf && this.byteOffset <= buf.length) {
+      let pos = this.byteOffset
+      while (pos < buf.length) {
+        const nl = buf.indexOf(0x0a, pos)
+        if (nl === -1) break
+        backlog += 1
+        pos = nl + 1
+      }
+    }
     return {
       enabled: true,
       ready: { taskRecognition: true, promiseRecognition: true },
-      backlog: Math.max(0, backlog),
-      offset: this.offset,
+      backlog,
+      offset: this.byteOffset,
       lastError: this.lastError,
     }
   }
