@@ -21,22 +21,35 @@ export type ApprovalNotify = (kind: string, title: string, body: string) => Prom
 export type ReportKind = 'daily' | 'weekly' | 'monthly'
 
 export interface ApprovalActionsDeps {
-  task: Pick<TaskRecognitionService, 'confirmTask' | 'cancelTask' | 'completeTask' | 'confirmEvent'>
+  task: Pick<TaskRecognitionService, 'confirmTask' | 'cancelTask' | 'completeTask' | 'confirmEvent' | 'updateTaskText'>
   promise: Pick<PromiseRecognitionService, 'confirmPromise' | 'cancelPromise' | 'confirmFulfilled' | 'closePromise'>
   store: GroupStoreService
   notify: ApprovalNotify
   logger: StoreLogger
   /** regen 补发队列入队钩子（阶段三泛化后由接线层注入；缺省 = reportRegen 返回 false） */
   enqueueReportRegen?: (chatId: string, dateKey: string, kind: ReportKind, reason?: 'manual' | 'wrong_account') => boolean
+  /** 修订流接线（M1）：审批成功后调 onApproval（origin 归属在 revision 侧解析）。缺省 = 不写修订 */
+  revision?: { onApproval: (chatId: string, targetKind: 'task' | 'promise' | 'event', targetId: number, summary: string, source: string) => Promise<boolean> }
+  /** 标记通道（完成语义统一：complete 转调 markTarget('completed')——完成状态单一事实源） */
+  marks?: { markTarget: (chatId: string, targetKind: 'task' | 'promise', targetId: number, status: 'completed' | 'incomplete' | 'deleted', source: string) => Promise<boolean> }
+  /** 对话框/前端通道名（回执/修订 source；默认 'chat'，前端 ActionInbox 注入 'web'） */
+  source?: string
   now?: () => number
 }
 
 /** 审批动作门面：所有通道的唯一入口（零直改 SQL——全部经既有服务方法） */
 export class ApprovalActions {
   private readonly now: () => number
+  private readonly source: string
 
   constructor(private readonly deps: ApprovalActionsDeps) {
     this.now = deps.now ?? (() => Date.now())
+    this.source = deps.source ?? 'chat'
+  }
+
+  /** 审批成功后的修订接线（origin 归属在 revision 侧解析；失败不影响审批本身） */
+  private revise(chatId: string, targetKind: 'task' | 'promise' | 'event', targetId: number, summary: string): void {
+    void this.deps.revision?.onApproval(chatId, targetKind, targetId, summary, this.source)
   }
 
   private async receipt(ok: boolean, kind: string, title: string, body: string): Promise<boolean> {
@@ -49,24 +62,53 @@ export class ApprovalActions {
   /** 任务确认（pending_confirm → active，登记模式学习） */
   async taskConfirm(chatId: string, taskId: number): Promise<boolean> {
     const ok = await this.deps.task.confirmTask(chatId, taskId)
+    if (ok) this.revise(chatId, 'task', taskId, `任务「#${taskId}」确认为真`)
     return this.receipt(ok, 'approval', '任务已确认', ok ? `任务 #${taskId} 确认为真（${chatId}）` : `任务 #${taskId} 确认失败（不存在或状态非法）`)
   }
 
   /** 任务取消（误报处置 → cancelled） */
   async taskCancel(chatId: string, taskId: number): Promise<boolean> {
     const ok = await this.deps.task.cancelTask(chatId, taskId)
+    if (ok) this.revise(chatId, 'task', taskId, `任务「#${taskId}」已取消`)
     return this.receipt(ok, 'approval', '任务已取消', ok ? `任务 #${taskId} 已取消（${chatId}）` : `任务 #${taskId} 取消失败`)
   }
 
-  /** 任务完成（active → done） */
+  /**
+   * 任务完成（完成语义统一，用户裁定）：转调 markTarget('completed')——完成状态单一事实源
+   * 在 markings（knowledge.db v_marking_latest），tasks.status 不再承担完成语义。
+   */
   async taskComplete(chatId: string, taskId: number): Promise<boolean> {
-    const ok = await this.deps.task.completeTask(chatId, taskId)
-    return this.receipt(ok, 'approval', '任务已完成', ok ? `任务 #${taskId} 标记完成（${chatId}）` : `任务 #${taskId} 完成失败（需为 active 状态）`)
+    const ok = await this.mark(chatId, 'task', taskId, 'completed')
+    return this.receipt(ok, 'approval', '任务已完成', ok ? `任务 #${taskId} 标记完成（${chatId}）` : `任务 #${taskId} 完成失败（目标不存在）`)
+  }
+
+  /** 任务改写（人工修正识别错误 + 强化学习信号） */
+  async taskRewrite(chatId: string, taskId: number, newText: string): Promise<boolean> {
+    if (!this.deps.task.updateTaskText) {
+      this.deps.logger.warn('approval-actions: updateTaskText 未注入——taskRewrite 不可用')
+      return false
+    }
+    const ok = await this.deps.task.updateTaskText(chatId, taskId, newText)
+    if (ok) this.revise(chatId, 'task', taskId, `任务「#${taskId}」文本改写：${newText.slice(0, 40)}`)
+    return this.receipt(ok, 'approval', '任务已改写', ok ? `任务 #${taskId} 文本已改写（识别学习信号已登记）` : `任务 #${taskId} 改写失败`)
+  }
+
+  /** 任务推迟（= taskSetDeadline 别名：人工指定时限，置信度 1） */
+  async taskPostpone(chatId: string, taskId: number, deadline: number): Promise<boolean> {
+    return this.taskSetDeadline(chatId, taskId, deadline)
+  }
+
+  /** 标记通道统一入口（taskComplete/ActionInbox task.mark 共用） */
+  private async mark(chatId: string, targetKind: 'task' | 'promise', targetId: number, status: 'completed' | 'incomplete' | 'deleted'): Promise<boolean> {
+    return this.deps.marks
+      ? this.deps.marks.markTarget(chatId, targetKind, targetId, status, this.source)
+      : false
   }
 
   /** 人工指定任务截止时间（deadline_confidence 置 1） */
   async taskSetDeadline(chatId: string, taskId: number, deadline: number): Promise<boolean> {
     const ok = await this.deps.store.updateTaskDeadline(chatId, taskId, deadline, 1)
+    if (ok) this.revise(chatId, 'task', taskId, `任务「#${taskId}」时限人工指定`)
     return this.receipt(ok, 'approval', '任务时限已更新', ok ? `任务 #${taskId} 时限人工指定（置信度 1）` : `任务 #${taskId} 时限更新失败`)
   }
 
@@ -75,6 +117,7 @@ export class ApprovalActions {
   /** 事件确认（pending_confirm → active） */
   async eventConfirm(chatId: string, eventId: number): Promise<boolean> {
     const ok = await this.deps.task.confirmEvent(chatId, eventId)
+    if (ok) this.revise(chatId, 'event', eventId, `事件「#${eventId}」确认为真`)
     return this.receipt(ok, 'approval', '事件已确认', ok ? `事件 #${eventId} 确认为真（${chatId}）` : `事件 #${eventId} 确认失败`)
   }
 
@@ -83,12 +126,14 @@ export class ApprovalActions {
   /** 承诺确认（登记模式学习） */
   async promiseConfirm(chatId: string, promiseId: number): Promise<boolean> {
     const ok = await this.deps.promise.confirmPromise(chatId, promiseId)
+    if (ok) this.revise(chatId, 'promise', promiseId, `承诺「#${promiseId}」确认为真`)
     return this.receipt(ok, 'approval', '承诺已确认', ok ? `承诺 #${promiseId} 确认为真（${chatId}）` : `承诺 #${promiseId} 确认失败`)
   }
 
   /** 承诺取消（误报处置） */
   async promiseCancel(chatId: string, promiseId: number): Promise<boolean> {
     const ok = await this.deps.promise.cancelPromise(chatId, promiseId)
+    if (ok) this.revise(chatId, 'promise', promiseId, `承诺「#${promiseId}」已取消`)
     return this.receipt(ok, 'approval', '承诺已取消', ok ? `承诺 #${promiseId} 已取消（${chatId}）` : `承诺 #${promiseId} 取消失败`)
   }
 
@@ -101,6 +146,7 @@ export class ApprovalActions {
   /** 承诺关闭（跳票不再追踪） */
   async promiseClose(chatId: string, promiseId: number): Promise<boolean> {
     const ok = await this.deps.promise.closePromise(chatId, promiseId)
+    if (ok) this.revise(chatId, 'promise', promiseId, `承诺「#${promiseId}」关闭不再追踪`)
     return this.receipt(ok, 'approval', '承诺已关闭', ok ? `承诺 #${promiseId} 关闭（不再追踪）` : `承诺 #${promiseId} 关闭失败`)
   }
 

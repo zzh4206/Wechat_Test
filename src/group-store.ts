@@ -1173,6 +1173,15 @@ export class GroupStore {
     })
   }
 
+  /** 改写任务文本（人工修正识别错误；learned_pattern 由调用方随后登记）。返回是否成功。 */
+  async updateTaskStatement(taskId: number, statement: string): Promise<boolean> {
+    if (statement.trim() === '') return false
+    return this.write((db) => {
+      const r = db.prepare('UPDATE tasks SET statement = ? WHERE task_id = ?').run(statement, taskId)
+      return Number(r.changes) > 0
+    })
+  }
+
   /** 登记模式学习指纹（确认时调用）。返回是否成功。 */
   async setTaskLearnedPattern(taskId: number, pattern: string): Promise<boolean> {
     return this.write((db) => {
@@ -1847,6 +1856,13 @@ getReportMetas(chatId: string, opts: { kind?: ReportMetaRow['kind']; limit?: num
     const st = this.stores.get(chatId)
     if (!st) return false
     return st.updateTaskStatus(taskId, status)
+  }
+
+  /** 改写任务文本；失败返回 false */
+  async updateTaskStatement(chatId: string, taskId: number, statement: string): Promise<boolean> {
+    const st = this.stores.get(chatId)
+    if (!st) return false
+    return st.updateTaskStatement(taskId, statement)
   }
 
   /** 登记模式学习指纹；失败返回 false */

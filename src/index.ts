@@ -321,6 +321,26 @@ export interface GroupLurker {
   readonly sender: SenderService
   /** 任务/事件识别 + 待确认闭环（M4-T4.1/T4.2）；taskRecognitionEnabled=false 时为 null（零活动） */
   readonly taskRecognition: TaskRecognitionService | null
+  /** 审批 API 面（对话框通道：DSH 助手层据此执行审批；web 通道走 ActionInbox） */
+  readonly approval: {
+    taskConfirm(chatId: string, taskId: number): Promise<boolean>
+    taskCancel(chatId: string, taskId: number): Promise<boolean>
+    taskComplete(chatId: string, taskId: number): Promise<boolean>
+    taskRewrite(chatId: string, taskId: number, text: string): Promise<boolean>
+    taskSetDeadline(chatId: string, taskId: number, deadline: number): Promise<boolean>
+    taskPostpone(chatId: string, taskId: number, deadline: number): Promise<boolean>
+    eventConfirm(chatId: string, eventId: number): Promise<boolean>
+    promiseConfirm(chatId: string, promiseId: number): Promise<boolean>
+    promiseCancel(chatId: string, promiseId: number): Promise<boolean>
+    promiseFulfilled(chatId: string, promiseId: number): Promise<boolean>
+    promiseClose(chatId: string, promiseId: number): Promise<boolean>
+    markTarget(chatId: string, targetKind: 'task' | 'promise', targetId: number, status: 'completed' | 'incomplete' | 'deleted', source: string): Promise<boolean>
+    personFollow(chatId: string, pid: string): Promise<boolean>
+    personUnfollow(chatId: string, pid: string): Promise<boolean>
+    reportRegen(chatId: string, dateKey: string, kind: 'daily' | 'weekly' | 'monthly'): Promise<boolean>
+  } | null
+  /** 只读运行状态（W-6） */
+  readonly inboxStatus: () => { enabled: boolean; ready: { taskRecognition: boolean; promiseRecognition: boolean }; backlog: number; offset: number; lastError: string | null }
   /** 提醒计划器（M4-T4.3）；reminderEnabled=false 时为 null（零活动） */
   readonly reminder: ReminderService | null
   /** 承诺识别（M5-T5.1）；promiseRecognitionEnabled=false 时为 null（零活动） */
@@ -979,6 +999,29 @@ export function apply(ctx: Context, config: PluginConfig): void {
     sender,
     taskRecognition,
     reminder,
+    approval: approvalActions
+      ? {
+          taskConfirm: (chatId: string, taskId: number) => approvalActions.taskConfirm(chatId, taskId),
+          taskCancel: (chatId: string, taskId: number) => approvalActions.taskCancel(chatId, taskId),
+          taskComplete: (chatId: string, taskId: number) => approvalActions.taskComplete(chatId, taskId),
+          taskRewrite: (chatId: string, taskId: number, text: string) => approvalActions.taskRewrite(chatId, taskId, text),
+          taskSetDeadline: (chatId: string, taskId: number, deadline: number) => approvalActions.taskSetDeadline(chatId, taskId, deadline),
+          taskPostpone: (chatId: string, taskId: number, deadline: number) => approvalActions.taskPostpone(chatId, taskId, deadline),
+          eventConfirm: (chatId: string, eventId: number) => approvalActions.eventConfirm(chatId, eventId),
+          promiseConfirm: (chatId: string, promiseId: number) => approvalActions.promiseConfirm(chatId, promiseId),
+          promiseCancel: (chatId: string, promiseId: number) => approvalActions.promiseCancel(chatId, promiseId),
+          promiseFulfilled: (chatId: string, promiseId: number) => approvalActions.promiseFulfilled(chatId, promiseId),
+          promiseClose: (chatId: string, promiseId: number) => approvalActions.promiseClose(chatId, promiseId),
+          markTarget: (chatId: string, targetKind: 'task' | 'promise', targetId: number, status: 'completed' | 'incomplete' | 'deleted', source: 'chat' | 'web') => reportRevision.markTarget(chatId, targetKind, targetId, status, source),
+          personFollow: (chatId: string, pid: string) => approvalActions.personFollow(chatId, pid),
+          personUnfollow: (chatId: string, pid: string) => approvalActions.personUnfollow(chatId, pid),
+          reportRegen: (chatId: string, dateKey: string, kind: 'daily' | 'weekly' | 'monthly') => approvalActions.reportRegen(chatId, dateKey, kind),
+        }
+      : null,
+    inboxStatus: () =>
+      actionInbox
+        ? actionInbox.status()
+        : { enabled: false, ready: { taskRecognition: !!taskRecognition, promiseRecognition: !!promiseRecognition }, backlog: 0, offset: 0, lastError: null },
     promiseRecognition,
     promiseReminder,
     fileIndex,
@@ -1100,7 +1143,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
       stopPromiseReminder?.() // M5：承诺提醒心跳唯一释放点
       stopRetention() // M6：保留期清理心跳唯一释放点
       stopSender()
-      stopInbox?.() // 发送 worker 心跳唯一释放点（senderEnabled=false 时 noop）
+      stopInbox?.() // 收件箱心跳唯一释放点（webActionsEnabled=false 时 null）
       distiller.dispose()
       journal.dispose() // 无定时器，清计数/日报内存引用
       personDigest?.dispose() // M2-T2.3：无定时器，清并发去重表

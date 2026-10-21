@@ -626,6 +626,21 @@ export class TaskRecognitionService {
     return this.options.groupStore.updateTaskStatus(chatId, taskId, 'done')
   }
 
+  /**
+   * 改写任务文本（人工修正识别错误）：statement 更新 + **登记强化学习信号**
+   * （learned_pattern = `${assignerPid}:rewrite:${patternFingerprint(newText)}`——
+   * 改写 = 识别出错的强信号，同句式原样不再误识别）。返回是否成功。
+   */
+  async updateTaskText(chatId: string, taskId: number, newText: string): Promise<boolean> {
+    const row = this.options.groupStore.getTask(chatId, taskId)
+    if (!row || newText.trim() === '') return false
+    const ok = await this.options.groupStore.updateTaskStatement(chatId, taskId, newText)
+    if (!ok) return false
+    const pattern = `${row.assignerPid ?? ''}:rewrite:${patternFingerprint(newText)}`
+    await this.options.groupStore.setTaskLearnedPattern(chatId, taskId, pattern)
+    return true
+  }
+
   /** 确认事件：pending_confirm → active。 */
   async confirmEvent(chatId: string, eventId: number): Promise<boolean> {
     const row = this.options.groupStore.getEvent(chatId, eventId)

@@ -34,11 +34,17 @@ test('门面转发 + 回执：taskConfirm 成功 → notify 一句话；失败 �
   const store = new GroupStoreService(dir, { warn() {}, error() {} })
   const svc = fakeServices()
   const notified = []
+  const marksCalls = []
+  const reviseCalls = []
   const actions = new ApprovalActions({
     task: svc.task, promise: svc.promise, store,
     notify: (kind, title, body) => notified.push({ kind, title, body }),
     logger: { warn() {}, error() {} },
+    marks: { markTarget: async (c, k, tid, status, source) => { marksCalls.push([c, k, tid, status, source]); return true } },
+    revision: { onApproval: async (c, tk, tid, summary, source) => { reviseCalls.push([c, tk, tid, summary, source]) } },
+    source: 'chat',
   })
+  void marksCalls; void reviseCalls
   const ok = await actions.taskConfirm(CHAT, 7)
   assert.equal(ok, true)
   assert.deepEqual(svc.calls, [['task.confirmTask', CHAT, 7]], '转发既有服务方法（逻辑不搬）')
@@ -71,12 +77,13 @@ test('其余动作转发：cancel/complete/event/promise 四动作/ deadline 置
   await actions.promiseCancel(CHAT, 5)
   await actions.promiseFulfilled(CHAT, 6)
   await actions.promiseClose(CHAT, 7)
-  assert.equal(svc.calls.length, 7)
+  assert.equal(svc.calls.filter((c) => c[0] !== 'task.complete').length, 6, 'complete 转调 markTarget（不再走 completeTask）')
+  assert.ok(!svc.calls.some((c) => c[0] === 'task.complete'), '完成语义统一：不走 completeTask')
   assert.ok(svc.calls.some((c) => c[0] === 'promise.confirmFulfilled' && c[3] === null), 'fulfilled 转发（msgId null）')
   const dl = 1234567890
   await actions.taskSetDeadline(CHAT, 8, dl)
   assert.deepEqual(deadlineCalls, [[CHAT, 8, dl, 1]], '人工指定 → confidence 1')
-  assert.equal(notified.length, 8)
+  assert.equal(notified.length, 7, 'complete 走 markTarget 通道仍回执一次')
   rmSync(dir, { recursive: true, force: true })
 })
 
@@ -142,4 +149,43 @@ test('reportRegen：未接队列 → false + warn；接钩子 → 转发并回�
   })
   assert.equal(await actions2.reportRegen(CHAT, '2026-06-10', 'weekly'), true)
   assert.deepEqual(enqueued, [[CHAT, '2026-06-10', 'weekly']])
+})
+
+
+test('taskRewrite：转发 updateTaskText + 强化学习信号 + 修订接线', async () => {
+  const dir = resolve(mkdtempSync(join(tmpdir(), 'appr6-')))
+  const store = new GroupStoreService(dir, { warn() {}, error() {} })
+  const svc = fakeServices()
+  const updateCalls = []
+  const reviseCalls = []
+  const notified = []
+  const actions = new ApprovalActions({
+    task: { ...svc.task, updateTaskText: async (c, id, t) => { updateCalls.push([c, id, t]); return true } },
+    promise: svc.promise, store,
+    notify: (k, t2, b) => notified.push(b),
+    logger: { warn() {}, error() {} },
+    revision: { onApproval: async (c, tk, tid, summary) => { reviseCalls.push([c, tk, tid, summary]) } },
+  })
+  const ok = await actions.taskRewrite(CHAT, 3, '周三交材料（修正）')
+  assert.equal(ok, true)
+  assert.deepEqual(updateCalls, [[CHAT, 3, '周三交材料（修正）']])
+  assert.equal(reviseCalls.length, 1)
+  assert.match(reviseCalls[0][3], /改写/)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('taskPostpone：别名转发 taskSetDeadline（置信度 1）', async () => {
+  const dir = resolve(mkdtempSync(join(tmpdir(), 'appr7-')))
+  const store = new GroupStoreService(dir, { warn() {}, error() {} })
+  const deadlineCalls = []
+  store.updateTaskDeadline = async (c, id, dl, conf) => { deadlineCalls.push([c, id, dl, conf]); return true }
+  const notified = []
+  const actions = new ApprovalActions({
+    task: fakeServices().task, promise: fakeServices().promise, store,
+    notify: (k, t, b) => notified.push(b),
+    logger: { warn() {}, error() {} },
+  })
+  await actions.taskPostpone(CHAT, 9, 999)
+  assert.deepEqual(deadlineCalls, [[CHAT, 9, 999, 1]])
+  rmSync(dir, { recursive: true, force: true })
 })

@@ -21,7 +21,7 @@ export const WEB_ACTIONS_AUDIT_REL = 'audit/web-actions.jsonl'
 
 /** 动作白名单（前端设计 §5 + 审批标记设计 §5 增补） */
 export const ACTION_TYPES = [
-  'task.confirm', 'task.cancel', 'task.complete', 'task.set_deadline',
+  'task.confirm', 'task.cancel', 'task.complete', 'task.set_deadline', 'task.rewrite', 'task.postpone',
   'event.confirm',
   'promise.confirm', 'promise.cancel', 'promise.fulfilled', 'promise.close',
   'person.follow', 'person.unfollow',
@@ -91,6 +91,16 @@ export async function dispatchAction(deps: Pick<ActionInboxDeps, 'actions' | 'ma
       if (typeof dl !== 'number' || !Number.isFinite(dl)) return 'bad_request'
       return (await A.taskSetDeadline(a.chatId, id, dl)) ? 'ok' : 'stale'
     }
+    case 'task.postpone': {
+      const dl = a.params?.deadline
+      if (typeof dl !== 'number' || !Number.isFinite(dl)) return 'bad_request'
+      return (await A.taskPostpone(a.chatId, id, dl)) ? 'ok' : 'stale'
+    }
+    case 'task.rewrite': {
+      const text = a.params?.text
+      if (typeof text !== 'string' || text.trim() === '') return 'bad_request'
+      return (await A.taskRewrite(a.chatId, id, text)) ? 'ok' : 'stale'
+    }
     case 'event.confirm': return (await A.eventConfirm(a.chatId, id)) ? 'ok' : 'stale'
     case 'promise.confirm': return (await A.promiseConfirm(a.chatId, id)) ? 'ok' : 'stale'
     case 'promise.cancel': return (await A.promiseCancel(a.chatId, id)) ? 'ok' : 'stale'
@@ -153,6 +163,7 @@ export class ActionInbox {
   }
 
   private offset = 0
+  private lastError: string | null = null
 
   /** 单轮消费：读 actions.jsonl，从水位行起逐行处理。返回处理条数 */
   async poll(): Promise<number> {
@@ -173,6 +184,7 @@ export class ActionInbox {
       const outcome = await this.process(a)
       this.writeResult(a.actionId, outcome.ok, outcome.code)
       this.audit(a, outcome)
+      if (!outcome.ok) this.lastError = `${a.actionId}:${outcome.code}`
       processed += 1
     }
     this.deps.store.writeText(ACTIONS_OFFSET_REL, `${this.offset}\n`)
@@ -212,6 +224,19 @@ export class ActionInbox {
     }, this.pollMs)
     void this.poll().catch(() => {})
     return () => this.dispose()
+  }
+
+  /** W-6：只读运行状态（积压/水位/最近错误） */
+  status(): { enabled: boolean; ready: { taskRecognition: boolean; promiseRecognition: boolean }; backlog: number; offset: number; lastError: string | null } {
+    const raw = this.deps.store.readText(ACTIONS_REL)
+    const backlog = raw ? raw.split('\n').filter((l) => l.trim() !== '').length - this.offset : 0
+    return {
+      enabled: true,
+      ready: { taskRecognition: true, promiseRecognition: true },
+      backlog: Math.max(0, backlog),
+      offset: this.offset,
+      lastError: this.lastError,
+    }
   }
 
   dispose(): void {
