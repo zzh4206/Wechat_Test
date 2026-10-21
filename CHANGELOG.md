@@ -8,6 +8,7 @@
 
 ### Added
 
+- 合成基准（`scripts/synth-profile.mjs` / `synth-gen.mjs` / `lib/fault-llm.mjs` / `bench.mjs` / `bench-quality.mjs`，文档 `docs/SYNTHETIC-BENCH.md`）：不依赖真实群聊验证 LLM 成本与鲁棒性策略——画像只输出统计量（无文本/ID/ts）；固定种子合成会话 + 植入真值；故障注入可编排 timeout/429/5xx/auth/坏 JSON/延迟；重放复刻生产语义并输出 I1–I5 不变量判定，变体感知 guard/legacy
 - 前端工作台：跨群汇总报告（`chatId='aggregate'`，只有日报）也可「定稿」「重新生成」「排入发件箱」。插件收件箱与 web 侧对 `aggregate` 只放行 `report.*` 且只认日报（其它周期回执 `bad_request`/`aggregate_daily_only`，非报告动作仍 `chat_not_allowed`；周/月汇总尚未生成，详情页不显示操作）；手动重跑遇到 `aggregate` 条目改调 `generateSummary(该日原定生成时刻)`，按各群该日现有日报重新汇总、不调 LLM，写入失败如实出队；排入发件箱的标题为「跨群汇总 <日期>（前端补推）」。同时修正回填窗口终点（`docs/ANALYSIS-2026-10-21-report-cutoff-window.md`）：汇总重跑、群日报的错号补发与手动重跑，窗口终点由「现在」改为该日 `dailyReportTime`（`dailyCutoff`），之后几天的消息不再计入统计或喂给 LLM；周/月报回填不变
 - 前端工作台 FE-3「排入发件箱」：报告详情页可把一份报告排入 outbox，条目与定时报告同形（kind=周期、evidence_ref=报告路径、标题带「（前端补推）」、正文只含修订数），之后完全走既有 sender 链路（四道闸、配额、回读验证不变）。新增插件配置 `webOutboxEnabled`（默认 false）：关闭时收件箱不注入入队函数、`report.toOutbox` 回执 `unsupported`，web 侧按钮置灰并回 409；同一报告 10 分钟内重复排入回执 `duplicate`。新模块 `src/report-outbox.ts`；启用步骤见 RUNBOOK §14.5
 - 前端工作台 FE-3（报告操作，均不发送）：报告详情页新增「定稿」「重新生成」。插件收件箱新增动作 `report.finalize`（draft → final 单向，`KnowledgeDao.finalizeReport` → Store 透传，记一条 `status` 修订；已定稿回执 `status_conflict`、未启用知识库镜像回执 `unsupported`），对话框通道同步暴露 `reportFinalize`；前端开放 `report.finalize` / `report.regen`，参数 `{kind, dateKey}` 两侧同口径校验（周报须周一、月报须 1 号）。重新生成只入手动重跑队列、不进发件箱。「排入发件箱」另行实施
