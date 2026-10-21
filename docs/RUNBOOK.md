@@ -251,11 +251,13 @@ testKindIntervalMin: 10       # 启动后每 10 分钟依次强制触发一次 w
 
 ```yaml
 llmPricing:
-  glm-5.3: { input: 8, output: 28 }        # 元/百万 tokens，智谱官方定价页 2026-10 抓取
-  glm-5.3-flash: { input: 0.8, output: 2.8 }
+  glm-5.3: { input: 8, output: 28, cacheInput: 2 }          # 元/百万 tokens，智谱官方定价页 2026-10 抓取
+  glm-5.3-flash: { input: 0.8, output: 2.8, cacheInput: 0.23 }
 ```
 
 默认值即上表；**以供应商页面为准**：<https://docs.bigmodel.cn/cn/guide/start/pricing>。换模型（改 `llmModel`）记得同步补价格表条目，否则费用记 0。
+
+`cacheInput`（C4，可选）= 缓存命中输入价：指令区（人格 + schema + wire 格式说明）逐字节稳定、置于最前，可命中供应商上下文缓存；报告尾据此追加「固定前缀命中缓存可再省 ≈X%（≈¥ 为未命中上界）」，估算用纯函数 `estimateCostWithCache()`（缺省按指令前缀占输入 10% 的保守假设）。**`costCny` 与 ≈¥ 仍是未命中上界，统计口径不变**；不配 `cacheInput` 时估算退化为按 `input` 计（不虚报）。
 
 **费用汇总（推荐：内置命令）**：
 

@@ -35,6 +35,7 @@ import { LlmCallRecorder, errKindOf, monotonicMs } from './llm-observe.js'
 import type { BatchStats } from './llm-observe.js'
 import { twoStageCall } from './two-stage.js'
 import { redactSecretLike } from './guard.js'
+import { toWireMessages, WIRE_FORMAT_HINT } from './message-wire.js'
 
 // —————————————————— σ 状态 schema（固定 JSON，技术文档 §4.2） ——————————————————
 
@@ -156,12 +157,6 @@ interface SegMsg {
   overlap: boolean
 }
 
-function fmtLocal(ts: number): string {
-  const d = new Date(ts)
-  const p = (n: number) => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
-}
-
 function isoDay(ts: number): string {
   const d = new Date(ts)
   const p = (n: number) => String(n).padStart(2, '0')
@@ -183,19 +178,18 @@ function wireOf(
   msgs: readonly SegMsg[],
   persons: ReadonlyArray<{ name: string; line: string }>,
 ): string {
+  // C3：消息走共享 wire（n 沿用段内全局序号）；重叠带标记是 B 管线特有的段语义，
+  // 在 wire 行后追加 overlap=true（与 A 路径同样的 {n,name,ts,text,q,trunc} + 1 个可选字段）。
+  const wireMessages = toWireMessages(
+    msgs.map((s) => s.m),
+    { nOf: (_m, i) => msgs[i]!.n },
+  ).map((line, i) => (msgs[i]!.overlap ? { ...line, overlap: true as const } : line))
   return JSON.stringify({
     window: { kind, start: isoDay(winStart), end: isoDay(winEnd - 1) },
     segment: { index: segIndex + 1, count: segCount },
     // 首段的 prior_state = 群记忆（"此前状态"，跨窗口背景）；后续段 = 上一段 σ；null = 无
     prior_state: priorState,
-    messages: msgs.map((s) => ({
-      n: s.n,
-      who: s.m.senderName || '（未知成员）',
-      ts: fmtLocal(s.m.ts),
-      text: s.m.text,
-      // 重叠带 = 上一段已归纳过的上下文，仅供衔接理解
-      ...(s.overlap ? { overlap: true } : {}),
-    })),
+    messages: wireMessages,
     persons: persons.map((p) => ({ name: p.name, digest: p.line })),
   })
 }
@@ -223,6 +217,7 @@ export function buildRefineStatePrompt(args: {
   return [
     '[指令区]',
     `任务：滚动归纳流水线。这是「${chatId}」${kindName(kind)}窗口（${isoDay(winStart)} 至 ${isoDay(winEnd - 1)}）的第 ${segIndex + 1}/${segCount} 段消息。`,
+    WIRE_FORMAT_HINT,
     '根据【数据区】的本段消息与「此前状态 prior_state」，输出两样东西：',
     '1. summary：本段消息的两三句话摘要（完整陈述句，结论先行，谁/什么事/什么变化）；',
     '2. state：更新后的全量滚动状态 σ——在 prior_state 基础上合并本段新信息后输出**全量**（不是增量），形如：',
@@ -254,6 +249,7 @@ export function buildRefineFinalPrompt(args: {
   return [
     '[指令区]',
     `任务：滚动归纳流水线末段出稿。这是「${chatId}」${kindName(kind)}窗口（${isoDay(winStart)} 至 ${isoDay(winEnd - 1)}）的最后一段（第 ${segIndex + 1}/${segCount} 段）。`,
+    WIRE_FORMAT_HINT,
     '根据【数据区】的末段消息与此前各段累计的滚动状态 prior_state，生成**整个窗口**的金字塔报告稿 report，并输出更新后的最终状态 state。',
     '',
     '三条硬性写作原则（违反任一条即视为非法输出）：',
