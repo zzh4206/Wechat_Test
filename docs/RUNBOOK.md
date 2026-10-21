@@ -441,12 +441,20 @@ Accessibility Inspector 确认元素层级）。**实证结论回填此处：___
 
 ### 首次启用步骤（两段式：dry_run 人工确认定位 → 真发）
 
-1. TCC"辅助功能"+"屏幕录制"授权（合规闸必需，缺屏幕录制 = 恒 deferred，reason='tcc_denied'）+ 配置 `sourceToolDir`/`sourceDbRoot`（回读验证必需）；
+0. **启用前人工检查（键序前提，每次换机 / 改热键 / 改 `sendTargetChat` 后都要重做）**：
+   - **快捷键不冲突**：键序依赖 Cmd+Shift+W（调出微信，用户自定义热键）与 Cmd+F（微信搜索框）。
+     确认这两个组合没有被系统或其它常驻应用（输入法、截图、窗口管理、剪贴板工具等）占用——
+     被抢走时按键会落到别的应用上，微信这边毫无反应或停在错误界面；
+   - **搜索第一条结果就是目标会话**：键入搜索词后插件**直接按 Return，进入的是第一个搜索结果**，
+     不做二次选择。人工在微信搜索框里输入 `sendTargetChat` 的值，看排在**第一条**的是不是要发的那个会话；
+     若第一条是别的联系人 / 群 / 聊天记录 / 搜一搜条目，换一个更独特的搜索词（例如给目标会话设唯一备注），
+     直到第一条稳定命中为止。DB 回读只能事后报警，挡不住发错会话。
+1. TCC"辅助功能"+"屏幕录制"授权（合规闸必需，缺屏幕录制 = 恒 deferred，reason='tcc_denied'）+ 配置 `sourceToolDir`/`sourceDbRoot`（回读验证必需）+ `sendTargetChat`/`readbackChatId`（缺失 fail-closed 不发送）；
 2. 配置保持 `senderEnabled: true`、`sendDryRun: true`（默认），重启插件；
-3. **第一段（干跑）**：触发消费（或调 `groupLurker.sender.sendTestSample()`）——keyboard 模式
-   dry_run **确认前台后直接结束**（不碰输入框不回车）——人工确认微信在前台且当前会话是文件传输助手，**不粘贴消息不回车**。
-   人工确认微信确实定位到"文件传输助手"会话（这是本方案最重要的安全特性：干跑即可验证搜索定位）；
-4. **第二段（真发）**：确认定位正确后配置 `sendDryRun: false` 重启，再跑一次——文件传输助手收到
+3. **第一段（干跑）**：触发消费（或调 `groupLurker.sender.sendTestSample()`）——dry_run 执行到
+   「Return 进入对话」为止即停（**不粘贴消息不回车发送**）。人工确认微信停在的正是目标会话、
+   光标在输入框（这是本方案最重要的安全特性：干跑即可验证搜索定位）；
+4. **第二段（真发）**：确认定位正确后配置 `sendDryRun: false` 重启，再跑一次——目标会话收到
    `【lurker】…` 消息，且 `audit/sender.jsonl` 出现 `result:'sent', method:'keyboard'` 行（DB 回读已验证）；
 5. 之后真实 pending 报告条目由消费循环（`sendIntervalSec`，默认 300s）自然发送。
 
@@ -688,7 +696,8 @@ LURKER_WEB_TOKEN='<与插件 webActionsToken 相同的值>' \
    - 10 分钟内再点一次 → 回执「10 分钟内已排入过」，outbox 不新增；
    - sender 处理后该条目转 `dry_run`（只激活微信到对话、不粘贴不回车），`audit/sender.jsonl` 只有元数据。
 4. 确认无误后，是否真发由发送层自身的开关决定（`senderEnabled` + `sendDryRun: false`，见 §12.5），
-   与定时报告完全一致；本开关不提供单独的「真发」选项。
+   与定时报告完全一致；本开关不提供单独的「真发」选项。**真发前先做完 §12.5「首次启用步骤」第 0 步**
+   （快捷键不冲突、微信搜索 `sendTargetChat` 的第一条结果就是目标会话——插件按 Return 直接进入第一条）。
 5. 回退：`webOutboxEnabled: false` 并重启即可。已入队未处理的条目仍在 outbox 中，按发送层开关处理；
    需要撤下的话在发送层关闭期间处理，不要手工删改 outbox.jsonl。
 
