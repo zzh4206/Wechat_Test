@@ -119,13 +119,15 @@ test('泛化消费：weekly/monthly 补生成按 kind 调 generateReport（月�
     audit: () => {},
     now: () => 5000,
   }
-  const { processRegenHead } = await import('../lib/regen-processor.js')
+  // 手动重跑走 processManualRegen（只重新生成、不进 outbox）
+  const { processManualRegen } = await import('../lib/regen-processor.js')
   q.enqueue(CHAT, '2026-06-08', 1, 'weekly', 'manual')
-  const r1 = await processRegenHead(deps)
-  assert.equal(r1.action, 'regenerated')
+  const r1 = await processManualRegen(deps)
+  assert.equal(r1.action, 'manual_regenerated')
   assert.deepEqual(genCalls[0], [CHAT, 'weekly', '2026-06-08'])
   q.enqueue(CHAT, '2026-06-01', 2, 'monthly', 'manual')
-  await processRegenHead(deps)
+  await processManualRegen(deps)
   assert.deepEqual(genCalls[1], [CHAT, 'monthly', '2026-06-01'], '月报补发锚定当月 1 号（backfill 语义）')
+  assert.equal(outbox.listOutbox().length, 0, '手动重跑不进 outbox')
   rmSync(dir, { recursive: true, force: true })
 })
