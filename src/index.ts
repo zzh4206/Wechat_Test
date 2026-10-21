@@ -1133,7 +1133,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
           accountOk: accountGate
             ? async () => {
                 const active = await accountGate.activeAccount()
-                return active === null || accountGate.isAllowed(active)
+                return active !== null && accountGate.isAllowed(active) // fail-closed：不可判定不处理
               }
             : undefined,
         })

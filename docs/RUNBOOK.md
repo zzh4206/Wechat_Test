@@ -498,6 +498,14 @@ Accessibility Inspector 确认元素层级）。**实证结论回填此处：___
   不重试；账号闸配置且错号在线时跳过本轮（防空数据覆盖正常报告）。审计 `regen_manual_done`。
   要推送到手机须另走「排入发件箱」（发送只有一个入口）。错号补发的 satisfied 检查、重试计数与
   outbox 条目均按条目自身周期（日/周/月）处理。
+- **账号闸 fail-closed 强化（2026-10-21 误发事故修复）**：旧实现用 2s 写入流采样判活跃账号，
+  微信空闲时返回 null 而 sender 把 null 当"不挂起"——登录大号期间照发（事件：2026-10-21 两条日报
+  从大号发出，回读判 failed_wrong_target，无法撤回）。现判据三道：①2s 写入流（强信号）→
+  ②回退 **DB WAL/db mtime 对比**（活跃账号的 `message_0.db-wal` 持续更新；差距 <60s 视为歧义；
+  **`-shm` 会被读取层轮询污染，绝不参与**）→ ③发送前 `verify` 级读取预检（keys 失效→延后）。
+  **null 一律 fail-closed**：不可判定 = 不激活微信/不敲键/不耗 attempts，审计
+  `account_unknown_deferred`；缺 `sendTargetChat`/`readbackChatId` 等同缺工具，审计
+  `unverified_missing_config` 拒发。
 - **账号生命周期自动化（白名单制，2026-10-15）**：探针每轮消费周期对
   `xwechat_files/wxid_*` 各目录做**双快照活动对比**（间隔 2s；文件数或最新 mtime 变化 =
   持续写入流 = 活跃；单次快照无判别力）。活跃 ∉ `accountWhitelist` → sender **全面挂起**

@@ -147,6 +147,36 @@ export type RekeyOutcome =
   | 'timeout' // 用户超时未登录临时副本：本轮放弃，保持挂起
   | 'failed' // 取钥或 verify 失败：保持挂起
 
+/** WAL 信号歧义阈值：两账号 DB 活动时间差 < 该值 → 不判定（fail-closed 由调用方兜住） */
+export const DB_ACTIVITY_AMBIGUOUS_MS = 60_000
+
+/**
+ * 账号的 DB 写入活动时间（毫秒）：取 `<accountDir>/db_storage/message/*.db-wal` 与 `message_*.db`
+ * 的最新 mtime；**排除 `-shm`**——shared-memory 会被外部只读轮询触碰（本项目读取层每 10s 读库），
+ * 用它判断活跃账号必然误判。
+ */
+export function dbActivityMtime(accountDir: string, fs: FsLike): number {
+  const dir = join(accountDir, 'db_storage', 'message')
+  let entries
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true })
+  } catch {
+    return 0
+  }
+  let newest = 0
+  for (const e of entries) {
+    if (!e.isFile()) continue
+    if (!(e.name.endsWith('.db-wal') || (e.name.endsWith('.db') && e.name.startsWith('message')))) continue
+    try {
+      const m = fs.statSync(join(dir, e.name)).mtimeMs
+      if (m > newest) newest = m
+    } catch {
+      /* 扫描间隙消失 —— 忽略 */
+    }
+  }
+  return newest
+}
+
 export interface AccountGate {
   /** 白名单成员判定（fail-closed：空白名单 = 全部不允许） */
   isAllowed(wxid: string): boolean
@@ -205,7 +235,17 @@ export function createAccountGate(options: AccountGateOptions): AccountGate | nu
       const after = new Map<string, AccountSample>()
       for (const wxid of accounts) after.set(wxid, sampleAccount(join(root, wxid), fs))
       const active = diffActivity(before, after)
-      if (active.length === 0) return null // 无写入流（微信未开/全退）——不判定，不阻断
+      if (active.length === 0) {
+        // 无 2s 写入流（微信空闲/未开）→ 回退 DB 写入时间对比（活跃账号的 WAL 持续更新，
+        // 不活跃的一直静止）。歧义（差距 < 阈值 / 只有一个账号可判）→ null，由调用方 fail-closed。
+        const stamps = accounts
+          .map((wxid) => ({ wxid, ts: dbActivityMtime(join(root, wxid), fs) }))
+          .filter((x) => x.ts > 0)
+          .sort((a, b) => b.ts - a.ts)
+        if (stamps.length < 2) return null
+        if (stamps[0].ts - stamps[1].ts < DB_ACTIVITY_AMBIGUOUS_MS) return null
+        return stamps[0].wxid
+      }
       if (active.length > 1) {
         // 启动瞬间可能双目录同被触碰——取「持续写入流」更强的那个：文件数仍在增长者优先，
         // 无法区分则按字母序稳定输出（调用方与 expected 比对后挂起，宁可错挂不误发）。

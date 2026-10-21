@@ -129,6 +129,8 @@ function makeSenderEnv({ gate } = {}) {
     sourceToolDir: '/fake/macos-wechat-export',
     sourceDbRoot: '/fake/wechat-db-storage',
     sourcePython: 'python3',
+    sendTargetChat: '目标会话',
+    readbackChatId: 'wxid_target',
     now: () => new Date(2026, 9, 15, 12, 0).getTime(),
     accountGate: gate ?? undefined,
     runCommand: (file, args) => {
@@ -355,4 +357,38 @@ test('默认（未注入 accountGate）零变化：既有链路原样', async ()
   assert.ok(['sent', 'failed'].includes(r.action), '无账号闸 = 行为与旧版一致')
   assert.ok(env.steps.length > 0, '键序已发出（新键序无 activate——Cmd+Shift+W 调出窗口）')
   rmSync(env.dir, { recursive: true, force: true })
+})
+
+// —— 2026-10-21 误发事故修复：无写入流时回退 DB（WAL）活动时间信号 ——
+
+test('无 2s 写入流时回退 WAL 信号：差异 ≥60s 取最新账号；<60s 歧义返回 null；shm 不参与', async () => {
+  const root = '/w'
+  const now = Date.now()
+  const tree = { [root]: { isDir: true, mtimeMs: 1 } }
+  const mk = (wxid, wal, db, shm) => {
+    tree[`${root}/${wxid}`] = { isDir: true, mtimeMs: 1 }
+    tree[`${root}/${wxid}/db_storage`] = { isDir: true, mtimeMs: 1 }
+    tree[`${root}/${wxid}/db_storage/message`] = { isDir: true, mtimeMs: 1 }
+    tree[`${root}/${wxid}/db_storage/message/message_0.db-wal`] = { isDir: false, mtimeMs: wal }
+    tree[`${root}/${wxid}/db_storage/message/message_0.db`] = { isDir: false, mtimeMs: db }
+    tree[`${root}/${wxid}/db_storage/message/message_0.db-shm`] = { isDir: false, mtimeMs: shm }
+  }
+  // 小号 WAL 5 小时前（不活跃）；大号 WAL 10 秒前（活跃）；大号 shm 故意伪造很旧
+  mk(SMALL, now - 5 * 3600e3, now - 5 * 3600e3, now - 50e3)
+  mk(BIG, now - 10e3, now - 10e3, now - 60e3)
+  const fs = memFs(tree)
+  const { gate } = makeGate(tree, root, { overrides: { fs } })
+  assert.equal(await gate.activeAccount(), BIG, '回退判据：WAL 最新者 = 活跃账号（无写入流时）')
+
+  // 歧义：两账号 WAL 差 < 60s → null（由 sender fail-closed）
+  tree[`${root}/${SMALL}/db_storage/message/message_0.db-wal`].mtimeMs = now - 30e3
+  assert.equal(await gate.activeAccount(), null, '差距 <60s = 歧义，绝不猜')
+
+  // shm 不参与：小号 WAL 最新（5s 前），大号 WAL 旧（120s 前）但 shm 很新 —— 仍应判小号
+  tree[`${root}/${SMALL}/db_storage/message/message_0.db-wal`].mtimeMs = now - 5e3
+  tree[`${root}/${SMALL}/db_storage/message/message_0.db`].mtimeMs = now - 5e3
+  tree[`${root}/${BIG}/db_storage/message/message_0.db-wal`].mtimeMs = now - 120e3
+  tree[`${root}/${BIG}/db_storage/message/message_0.db`].mtimeMs = now - 120e3
+  tree[`${root}/${BIG}/db_storage/message/message_0.db-shm`].mtimeMs = now
+  assert.equal(await gate.activeAccount(), SMALL, 'shm 被读取层污染——不作为判据')
 })

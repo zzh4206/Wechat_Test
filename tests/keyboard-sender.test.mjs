@@ -183,6 +183,7 @@ test('键序正确性（真发）：⌘⇧W+⌘F 键序 + DB 回读验证兜底 
   assert.equal(r.action, 'sent')
   const seq = env.steps.map((s) => (s.kind === 'sleep' ? `sleep:${s.ms}` : s.kind === 'spawn' ? 'spawn' : s.step))
   assert.deepEqual(seq, [
+    'spawn', // ⓪' 发送前密钥预检（read --limit 1）
     'clipboard_save',
     `clipboard_set:【lurker】日报 关键判断 ${env.lastFeature}`, // 1. 剪贴板=消息文本
     'key:cmd+shift+w', // 2. Cmd+Shift+W 调出微信窗口
@@ -202,7 +203,7 @@ test('键序正确性（真发）：⌘⇧W+⌘F 键序 + DB 回读验证兜底 
   assert.ok(!seq.some((x) => String(x).startsWith('click')), '不应点击搜索框')
   assert.ok(!seq.includes('clipboard_set:老大'), '默认直接键入形态：搜索词不走剪贴板')
   // 回读参数形态：只读、filehelper、limit 3（合规闸 spawn 是 wechat-ui read，回读 spawn 是 python3）
-  const spawn = env.steps.filter((s) => s.kind === 'spawn').find((s) => s.file === 'python3')
+  const spawn = env.steps.filter((s) => s.kind === 'spawn' && s.args[s.args.indexOf('--limit') + 1] === '30').find((s) => s.file === 'python3')
   assert.equal(spawn.file, 'python3')
   // --db-root/--key-file 是 CLI 全局参数，必须在子命令 read 之前（实测放后面报 unrecognized arguments）
   assert.deepEqual(spawn.args, [
@@ -303,7 +304,7 @@ test('回读未命中（可能发错会话）→ P0：标 failed_wrong_target �
   assert.equal(p0.p0, true, '审计行醒目标 P0')
   assert.ok(env.logger.logs.warn.some((m) => m.includes('P0') && m.includes('failed_wrong_target')), '立即 warn')
   // 重试窗口：4 次尝试（每次前 sleep VERIFY_DELAY_MS），穷尽后才终判
-  assert.equal(env.steps.filter((x) => x.kind === 'spawn').length, VERIFY_RETRIES, '穷尽 verifyRetries 次回读（OCR 闸已移除）')
+  assert.equal(env.steps.filter((x) => x.kind === 'spawn').length, VERIFY_RETRIES + 1, '预检 1 次 + 穷尽 verifyRetries 次回读')
   assert.equal(env.steps.filter((x) => x.kind === 'sleep' && x.ms === VERIFY_DELAY_MS).length, VERIFY_RETRIES, '每次尝试前等 verifyDelaySec')
   // 终态：后续周期不再消费
   const spawns = env.steps.filter((x) => x.kind === 'spawn').length
@@ -316,6 +317,7 @@ test('回读重试窗口（异步写入竞态修复）：首次回读空、第�
   const env = makeEnv({
     // 首次：微信尚未异步写入；第二次：写入提交，命中特征串
     dbReadSeq: [
+      { code: 0, stdout: 'PREFLIGHT_OK', stderr: '' }, // ⓪' 发送前密钥预检
       { code: 0, stdout: '{"messages":[]}', stderr: '' },
       { code: 0, stdout: 'MATCH_FEATURE', stderr: '' },
     ],
@@ -324,7 +326,7 @@ test('回读重试窗口（异步写入竞态修复）：首次回读空、第�
   env.lastFeature = `#l${e.id.replace(/[^0-9a-zA-Z]/g, '').slice(0, 8)}` // 让 MATCH_FEATURE 占位替换命中本条特征串
   const r = await env.sender.processOnce()
   assert.equal(r.action, 'sent', '竞态窗口内第二次回读命中 → sent（不误判 wrong_target）')
-  assert.equal(env.steps.filter((x) => x.kind === 'spawn').length, 2, '只回读 2 次即命中（+1 定位闸 +1 合规闸；无 deliver spawn）')
+  assert.equal(env.steps.filter((x) => x.kind === 'spawn').length, 3, '预检 1 次 + 回读 2 次即命中')
   assert.equal(readOutbox(env.dir).find((x) => x.id === e.id).status, 'sent')
   const audit = readAudit(env.dir)
   assert.deepEqual(audit.map((a) => a.result), ['transmitted', 'sent'])
@@ -335,6 +337,7 @@ test('回读重试窗口（异步写入竞态修复）：首次回读空、第�
 test('回读重试窗口可配：verifyRetries=2 / verifyDelaySec=1（1s × 2 次）', async () => {
   const env = makeEnv({
     dbReadSeq: [
+      { code: 0, stdout: 'PREFLIGHT_OK', stderr: '' }, // ⓪' 发送前密钥预检
       { code: 0, stdout: '{"messages":[]}', stderr: '' },
       { code: 0, stdout: 'MATCH_FEATURE', stderr: '' },
     ],
@@ -344,6 +347,7 @@ test('回读重试窗口可配：verifyRetries=2 / verifyDelaySec=1（1s × 2 �
   const r = await new SenderService({
     outbox: env.outbox, store: env.store, logger: silentLogger, enabled: true, dryRun: false,
     sourceToolDir: '/fake/macos-wechat-export', sourceDbRoot: '/fake/wechat-db-storage', sourcePython: 'python3',
+    sendTargetChat: '目标会话', readbackChatId: 'wxid_target',
     verifyDelaySec: 1, verifyRetries: 2,
     runCommand: (file, args) => {
       if (file === 'osascript') return Promise.resolve({ code: 0, stdout: '«class UTF8»"saved-content"', stderr: '' })
@@ -357,7 +361,7 @@ test('回读重试窗口可配：verifyRetries=2 / verifyDelaySec=1（1s × 2 �
     sleepMs: (ms) => { env.steps.push({ kind: 'sleep', ms }); return Promise.resolve() },
   }).processOnce()
   assert.equal(r.action, 'sent')
-  assert.equal(env.steps.filter((x) => x.kind === 'spawn').length, 2, '回读 2 次（OCR 闸已移除——纯回读 spawn）')
+  assert.equal(env.steps.filter((x) => x.kind === 'spawn').length, 3, '预检 1 次 + 回读 2 次')
   assert.deepEqual(env.steps.filter((x) => x.kind === 'sleep').map((x) => x.ms), [KEY_DELAY_OPEN_MS, KEY_DELAY_PASTE_MS, 1000, 1000])
   assert.equal(readOutbox(env.dir).find((x) => x.id === e.id).status, 'sent')
   rmSync(env.dir, { recursive: true, force: true })
@@ -366,7 +370,11 @@ test('回读重试窗口可配：verifyRetries=2 / verifyDelaySec=1（1s × 2 �
 test('回读本身失败（CLI 报错）→ 保持 sent_pending_verify 只重试验证、绝不重发；verifyAttempts≥5 人工告警', async () => {
   const env = makeEnv({
     logger: recordingLogger(),
-    dbReadResult: { code: 1, stdout: '', stderr: 'db locked' },
+    // 预检（--limit 1）成功一次；此后回读（--limit 30）持续报错
+    dbReadSeq: [
+      { code: 0, stdout: 'PREFLIGHT_OK', stderr: '' },
+      ...Array.from({ length: 12 }, () => ({ code: 1, stdout: '', stderr: 'db locked' })),
+    ],
   })
   const e = env.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
   const r = await env.sender.processOnce()
@@ -451,7 +459,7 @@ test('keyboard 模式缺 sourceDbRoot：fail-closed 不发键序，计数 attemp
   assert.equal(after.status, 'failed')
   assert.equal(after.attempts, MAX_ATTEMPTS)
   const audit = readAudit(env.dir)
-  assert.ok(audit.every((a) => a.result === 'unverified_no_db_tool' && a.missing === 'sourceDbRoot'))
+  assert.ok(audit.every((a) => a.result === 'unverified_missing_config' && a.missing === 'sourceDbRoot'))
   rmSync(env.dir, { recursive: true, force: true })
 })
 

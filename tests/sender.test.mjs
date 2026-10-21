@@ -44,7 +44,9 @@ function makeEnv(overrides = {}) {
     sourceToolDir: overrides.sourceToolDir ?? '/fake/macos-wechat-export',
     sourceDbRoot: overrides.sourceDbRoot ?? '/fake/wechat-db-storage',
     sourcePython: overrides.sourcePython ?? 'python3',
+    sendTargetChat: overrides.sendTargetChat ?? '目标会话',
     readbackChatId: overrides.readbackChatId ?? 'wxid_target',
+    accountGate: overrides.accountGate,
     sleepMs: () => Promise.resolve(), // 键序/验证延迟不真等待
     runCommand: (file, args) => {
       spawnCalls.push({ file, args })
@@ -123,12 +125,14 @@ test('全流程：pending → sent，回读 spawn 参数形态正确（--db-root
   assert.equal(r.action, 'sent')
   // 键序 osascript 多次 + 回读 spawn 一次
   const readCalls = env.spawnCalls.filter((c) => c.file === 'python3')
-  assert.equal(readCalls.length, 1)
-  assert.equal(readCalls[0].args[0], join('/fake/macos-wechat-export', 'wechat_db.py'))
-  assert.ok(readCalls[0].args.includes('--db-root'))
-  assert.ok(readCalls[0].args.includes('--key-file'))
-  const ci = readCalls[0].args.indexOf('--chat-id')
-  assert.equal(readCalls[0].args[ci + 1], 'wxid_target')
+  assert.equal(readCalls.length, 2, '预检 1 次 + 回读 1 次')
+  const rb = readCalls.find((c) => c.args[c.args.indexOf('--limit') + 1] === '30')
+  assert.ok(rb, '回读 spawn（--limit 30）')
+  assert.equal(rb.args[0], join('/fake/macos-wechat-export', 'wechat_db.py'))
+  assert.ok(rb.args.includes('--db-root'))
+  assert.ok(rb.args.includes('--key-file'))
+  const ci = rb.args.indexOf('--chat-id')
+  assert.equal(rb.args[ci + 1], 'wxid_target')
   assert.ok(env.spawnCalls.some((c) => c.file === 'osascript' && c.args.some((a) => String(a).includes('shift down'))), 'Cmd+Shift+W 在键序中')
   const after = readOutbox(env.dir).find((x) => x.id === e.id)
   assert.equal(after.status, 'sent')
@@ -195,7 +199,7 @@ test('频控：maxSendsPerDay 超限的当日 pending 标 skipped_quota', async 
     ids.push(env.outbox.appendOutbox({ kind: 'remind', title: `t${i}`, body: 'b', evidence_ref: 'x' }).id)
   }
   const r = await env.sender.processOnce()
-  assert.equal(env.spawnCalls.filter((c) => c.file === 'python3').length, 2, '回读 2 次')
+  assert.equal(env.spawnCalls.filter((c) => c.file === 'python3').length, 3, '预检 1 次 + 回读 2 次')
   assert.ok(env.spawnCalls.filter((c) => c.file === 'osascript').length >= 18, `两条日报键序完整（实际 ${env.spawnCalls.filter((c) => c.file === 'osascript').length}）`)
   const states = Object.fromEntries(readOutbox(env.dir).map((x) => [x.id, x.status]))
   assert.equal(states[ids[0]], 'sent')
@@ -337,6 +341,7 @@ function makeTakeFocusEnv({ allowTakeFocus, idleSec, frontmost, logger = silentL
     allowTakeFocus,
     sourceToolDir: '/fake/macos-wechat-export',
     sourceDbRoot: '/fake/wechat-db-storage',
+    sendTargetChat: '目标会话',
     readbackChatId: 'wxid_target',
     sleepMs: () => Promise.resolve(),
     runCommand: (file, args) => {
@@ -425,5 +430,55 @@ test('allowTakeFocus 默认 false：行为零变化（非前台仍跳过 not_fro
   assert.equal(readOutbox(env.dir).find((x) => x.id === e.id).status, 'pending')
   assert.ok(readAudit(env.dir).some((a) => a.result === 'not_frontmost'))
   assert.ok(!readAudit(env.dir).some((a) => String(a.result).startsWith('take_focus')))
+  rmSync(env.dir, { recursive: true, force: true })
+})
+
+// —— 2026-10-21 误发事故修复：账号闸 fail-closed / 密钥预检 / 配置缺失 ——
+
+test('账号不可判定（gate.activeAccount=null）→ fail-closed 挂起：零微信交互、pending 不耗 attempts、审计 account_unknown_deferred', async () => {
+  const gate = {
+    activeAccount: async () => null,
+    isAllowed: () => false,
+    wasSuspended: () => false,
+    setSuspended: () => {},
+    rekeyAndVerify: async () => 'healthy',
+    whitelistSummary: () => 'wxid_x…',
+  }
+  const env = makeEnv({ accountGate: gate })
+  env.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
+  const r = await env.sender.processOnce()
+  assert.equal(r.action, 'wrong_account_suspended', 'null（不可判定）= 挂起，绝不发送')
+  assert.equal(env.spawnCalls.length, 0, '零微信交互（不 activate 不 spawn）')
+  const audit = readAudit(env.dir)
+  assert.ok(audit.some((a) => a.result === 'account_unknown_deferred'), '审计可区分"不可判定"与"白名单外"')
+  const entry = readOutbox(env.dir)[0]
+  assert.equal(entry.status, 'pending')
+  assert.equal(entry.attempts ?? 0, 0)
+  rmSync(env.dir, { recursive: true, force: true })
+})
+
+test('发送前密钥预检失败 → 本轮延后：零键序、pending 不耗 attempts、审计 account_key_check_deferred', async () => {
+  const env = makeEnv({ dbReadResult: { code: 15, stdout: '', stderr: 'sqlcipher: file is not a database' } })
+  const e = env.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
+  const r = await env.sender.processOnce()
+  assert.equal(r.action, 'deferred')
+  assert.equal(env.spawnCalls.filter((c) => c.file === 'osascript').length, 0, '预检失败绝不进键序')
+  const audit = readAudit(env.dir)
+  assert.ok(audit.some((a) => a.result === 'account_key_check_deferred'))
+  const entry = readOutbox(env.dir).find((x) => x.id === e.id)
+  assert.equal(entry.status, 'pending')
+  assert.equal(entry.attempts ?? 0, 0)
+  rmSync(env.dir, { recursive: true, force: true })
+})
+
+test('缺 sendTargetChat → fail-closed（unverified_missing_config），零键序（空目标会发进当前会话）', async () => {
+  const env = makeEnv({ sendTargetChat: '' })
+  env.outbox.appendOutbox({ kind: 'daily', title: 't', body: 'b', evidence_ref: 'x' })
+  const r = await env.sender.processOnce()
+  assert.equal(r.action, 'failed')
+  assert.equal(env.spawnCalls.filter((c) => c.file === 'osascript').length, 0, '零键序')
+  const audit = readAudit(env.dir)
+  const miss = audit.find((a) => a.result === 'unverified_missing_config')
+  assert.ok(miss && String(miss.missing).includes('sendTargetChat'))
   rmSync(env.dir, { recursive: true, force: true })
 })

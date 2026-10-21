@@ -42,7 +42,7 @@ export const ALLOWED_CHANNELS: readonly string[] = ['filehelper']
 /** 唯一白名单目标聊天（文件传输助手） */
 export const FILEHELPER_CHAT = '文件传输助手'
 /** 发送目标会话名（用户指定 2026-10-19：大号在小号通讯录中的备注；搜索词） */
-export const SEND_TARGET_CHAT_DEFAULT = '老大'
+export const SEND_TARGET_CHAT_DEFAULT = ''
 /** 单行文本上限 */
 export const MAX_TEXT_CHARS = 200
 /** 摘要上限（正文截断） */
@@ -498,14 +498,22 @@ export class SenderService {
       return { action: 'dry_run' }
     }
 
-    // keyboard 模式 fail-closed：没有 wechat_db.py 就无法做 DB 回读验证，宁可不发
-    if (this.method === 'keyboard' && (this.sourceToolDir === '' || this.sourceDbRoot === '')) {
-      const status: OutboxEntry['status'] = attempts >= MAX_ATTEMPTS ? 'failed' : 'pending'
-      this.options.outbox.updateSendState(id, { status, attempts })
-      const missing = this.sourceToolDir === '' ? 'sourceToolDir' : 'sourceDbRoot'
-      this.audit({ id, kind: entry.kind, result: 'unverified_no_db_tool', attempts, missing })
-      this.options.logger.error(`sender: keyboard 模式缺 ${missing}（无法 DB 回读验证）— fail-closed 不发送 id=${id} attempts=${attempts}`)
-      return { action: 'failed' }
+    // keyboard 模式 fail-closed：缺工具/库/回读目标/发送目标 → 宁可不发
+    // （空发送目标时键序会 ⌘V+⏎ 把消息发进当前打开的会话；空回读目标会让 P0 兜底失效）
+    if (this.method === 'keyboard') {
+      const missing = [
+        this.sourceToolDir === '' ? 'sourceToolDir' : '',
+        this.sourceDbRoot === '' ? 'sourceDbRoot' : '',
+        this.readbackChatId === '' ? 'readbackChatId' : '',
+        this.sendTargetChat === '' ? 'sendTargetChat' : '',
+      ].filter(Boolean)
+      if (missing.length > 0) {
+        const status: OutboxEntry['status'] = attempts >= MAX_ATTEMPTS ? 'failed' : 'pending'
+        this.options.outbox.updateSendState(id, { status, attempts })
+        this.audit({ id, kind: entry.kind, result: 'unverified_missing_config', attempts, missing: missing.join(',') })
+        this.options.logger.error(`sender: keyboard 模式缺 ${missing.join('/')}（无法回读验证或目标未配置）— fail-closed 不发送 id=${id} attempts=${attempts}`)
+        return { action: 'failed' }
+      }
     }
 
     const r = await this.primitive.transmit({ id, text, feature, dryRun: false })
@@ -542,6 +550,21 @@ export class SenderService {
    * 回读窗口。命中 → sent；穷尽未命中 → failed_wrong_target（P0 终态）；CLI 报错 → 保持
    * sent_pending_verify + verifyAttempts++（≥5 转人工告警），下轮只重试验证。
    */
+  /** 发送前密钥可用性预检：读一行验证 keys 可用（附加防线；失败 = 延后不发送、不耗 attempts） */
+  private async preflightKeyCheck(): Promise<boolean> {
+    try {
+      const r = await this.runCommandFn(this.sourcePython, [
+        join(this.sourceToolDir, 'wechat_db.py'),
+        '--db-root', this.sourceDbRoot,
+        '--key-file', join(this.sourceToolDir, '.wechat-local/keys.json'),
+        'read', '--chat-id', this.readbackChatId, '--limit', '1',
+      ])
+      return r.code === 0
+    } catch {
+      return false
+    }
+  }
+
   private async verifyTransmitted(
     entry: OutboxEntry,
     id: string,
@@ -709,7 +732,18 @@ export class SenderService {
     const acctGate = this.options.accountGate
     if (acctGate) {
       const active = await acctGate.activeAccount()
-      if (active !== null && !acctGate.isAllowed(active)) {
+      if (active === null) {
+        // 不确定 = 不动（fail-closed）：无法判定活跃账号时绝不发送——2026-10-21 误发事故的根因
+        // 正是旧实现把 null（微信空闲、2s 无写入流）当"不挂起"而放行，导致登录大号期间照发。
+        acctGate.setSuspended(true)
+        this.wrongAccountRounds += 1
+        if (this.wrongAccountRounds === 1 || this.wrongAccountRounds % 10 === 0) {
+          this.audit({ result: 'account_unknown_deferred', rounds: this.wrongAccountRounds })
+          this.options.logger.warn(`sender: 活跃账号不可判定（无写入流且 DB 活动时间歧义）——sender 挂起防误发（第 ${this.wrongAccountRounds} 轮）`)
+        }
+        return { action: 'wrong_account_suspended', processed: 0 }
+      }
+      if (!acctGate.isAllowed(active)) {
         // 白名单外账号活跃 → sender 全面挂起（零微信交互，pending 不耗 attempts）；
         // 读取层不挂起（对配置 db 只读无害），但提醒缓存语义。
         acctGate.setSuspended(true)
@@ -778,6 +812,14 @@ export class SenderService {
     // ③ 交互闸：微信前台 + 用户空闲
     const gate = await this.interactionGate(`${batch.length} 条`)
     if (gate.blocked !== null) return { action: gate.blocked, processed: 0 }
+
+    // ⓪' 发送前密钥可用性预检（附加防线，仅在真正要发时跑一次；配置不全时跳过——由 sendEntry 的 missing 报错）
+    const cfgComplete = this.sourceToolDir !== '' && this.sourceDbRoot !== '' && this.readbackChatId !== '' && this.sendTargetChat !== ''
+    if (this.method === 'keyboard' && !this.dryRun && cfgComplete && !(await this.preflightKeyCheck())) {
+      this.audit({ result: 'account_key_check_deferred' })
+      this.options.logger.warn('sender: 发送前密钥预检失败（keys 失效或微信库不可读）——本轮延后不发送（不计 attempts）')
+      return { action: 'deferred', processed: 0 }
+    }
 
     let sent = 0
     let failed = 0
