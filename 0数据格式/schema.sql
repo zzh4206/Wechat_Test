@@ -6,7 +6,7 @@
 
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
-PRAGMA user_version = 4;   -- schema 版本 v0.4
+PRAGMA user_version = 6;   -- schema 版本 6（5→6：entry 增 chat_id 群归属 + v_marking_latest 分组加 chat_id；report_revision/marking 表不动）
 
 -- ------------------------------------------------------------
 -- 2.1 资料：一切沉淀的知识单元
@@ -122,11 +122,16 @@ CREATE TABLE entry (
   content_md  TEXT NOT NULL,
   report_id   INTEGER REFERENCES report(id) ON DELETE SET NULL,  -- 空=未归档
   doc_id      INTEGER REFERENCES doc(id)    ON DELETE SET NULL,
-  created_at  INTEGER NOT NULL
+  created_at  INTEGER NOT NULL,
+  -- 修订11：群归属（chat_id 列加在表尾，与 5→6 迁移 ALTER TABLE ADD COLUMN 后的列序一致；
+  -- 既有行经迁移回填 'aggregate'）
+  chat_id     TEXT NOT NULL DEFAULT 'aggregate'
+              CHECK (length(chat_id) BETWEEN 1 AND 128)
 );
 CREATE INDEX idx_entry_ts      ON entry(ts);
 CREATE INDEX idx_entry_pending ON entry(report_id) WHERE report_id IS NULL; -- 修订5
 CREATE INDEX idx_entry_doc     ON entry(doc_id)     WHERE doc_id IS NOT NULL; -- 修订5
+CREATE INDEX idx_entry_chat    ON entry(chat_id, ts);                          -- 修订11
 
 -- ------------------------------------------------------------
 -- 2.5 会话摘要（二期由「2水群」项目自动写入）：只存要点，绝不存原文。
@@ -149,6 +154,61 @@ CREATE TABLE chat_digest (
   created_at  INTEGER NOT NULL
 );
 CREATE INDEX idx_digest_day ON chat_digest(happened_on);
+
+-- ------------------------------------------------------------
+-- 2.3.2 report_revision 报告修订历史（v0.6 修订9，TECH-v0.6 §1.1）
+-- 修订事件是不可变事实：source_key 幂等键，重放不产生重复行、不做 UPDATE。
+-- 不建指向 report 的 FK——修订事件可先于报告行存在（补发场景），查询按
+-- (chat_id, period_type, period_start) 关联。
+-- ------------------------------------------------------------
+CREATE TABLE report_revision (
+  id           INTEGER PRIMARY KEY,
+  chat_id      TEXT NOT NULL CHECK (length(chat_id) BETWEEN 1 AND 128),
+  period_type  TEXT NOT NULL CHECK (period_type IN ('daily','weekly','monthly')),
+  period_start TEXT NOT NULL,
+  ts           INTEGER NOT NULL,              -- 修订发生时刻
+  type         TEXT NOT NULL,                 -- 修订类型（自由短词：section/correction/status…）
+  target_ref   TEXT,                          -- 段落/条目引用（可空）
+  summary      TEXT,                          -- 元数据摘要（红线：不含消息/语句原文）
+  source       TEXT NOT NULL CHECK (source IN ('chat','web')),
+  source_key   TEXT NOT NULL UNIQUE,          -- 幂等键，插件生成（如 rev:<chatId>:<period>:<ts>:<n>）
+  created_at   INTEGER NOT NULL
+);
+CREATE INDEX idx_revision_report ON report_revision(chat_id, period_type, period_start, ts);
+CREATE INDEX idx_revision_ts ON report_revision(ts);
+
+-- ------------------------------------------------------------
+-- 2.3.3 marking 完成情况标记（v0.6 修订10，TECH-v0.6 §1.2）
+-- kind 三态 done/undone/deleted；同一 target_ref 的状态演变 = 追加行（不可变事实）。
+-- ------------------------------------------------------------
+CREATE TABLE marking (
+  id           INTEGER PRIMARY KEY,
+  chat_id      TEXT NOT NULL CHECK (length(chat_id) BETWEEN 1 AND 128),
+  kind         TEXT NOT NULL CHECK (kind IN ('done','undone','deleted')),
+  target_ref   TEXT NOT NULL,                 -- 任务/事项标识
+  ts           INTEGER NOT NULL,              -- 标记时刻
+  source       TEXT NOT NULL CHECK (source IN ('chat','web')),
+  source_key   TEXT NOT NULL UNIQUE,
+  created_at   INTEGER NOT NULL
+);
+CREATE INDEX idx_marking_chat ON marking(chat_id, kind, ts);
+CREATE INDEX idx_marking_target ON marking(target_ref);
+
+-- 「未完成事项」聚合 = 每 (chat_id, target_ref) 取最新一条；同 ts 并列时取 id 大者（MAX(id) 兜底）。
+-- 修订11：分组加 chat_id——不同群可各自维护同一 target_ref（如同名任务）而互不串态。
+CREATE VIEW v_marking_latest AS
+SELECT m.* FROM marking m
+JOIN (SELECT chat_id, target_ref, MAX(ts) AS mx, MAX(id) AS mi
+      FROM marking GROUP BY chat_id, target_ref) t
+  ON m.chat_id = t.chat_id AND m.target_ref = t.target_ref
+ AND m.ts = t.mx AND m.id = t.mi;
+
+-- ------------------------------------------------------------
+-- 2.3.4 v_report_revised 修订视图（v0.6，T1 方案 b：不加 report 列，视图推导）
+-- ------------------------------------------------------------
+CREATE VIEW v_report_revised AS
+SELECT chat_id, period_type, period_start, COUNT(*) AS revision_count, MAX(ts) AS revised_at
+FROM report_revision GROUP BY chat_id, period_type, period_start;
 
 -- ------------------------------------------------------------
 -- 2.6 视图：周期日志全文 + 条目数（r.* 通配，自动带出 chat_id）
@@ -176,5 +236,17 @@ ORDER BY r.period_type, r.period_start DESC;
 -- 8. 新增 media 表（媒体元数据，本体永不入库）：path_kind ∈ local/archive、
 --    status ∈ available/pending/missing、source_key 幂等键、
 --    CHECK(status<>'available' OR path IS NOT NULL)；补索引 idx_media_chat/created/status。
+-- （v0.6，审批双通道与报告修订流，TECH-v0.6.md 定稿 + REPLY-v0.6 裁定）
+-- 9. 新增 report_revision 表（修订历史，不可变事实）：source_key 幂等、不建 report FK、
+--    summary 仅元数据摘要；视图 v_report_revised（COUNT/MAX(ts) 推导，替代 report 轻量列）。
+-- 10. 新增 marking 表（完成情况标记，kind 三态 done/undone/deleted）：source_key 幂等、
+--    同 target_ref 追加行表达状态演变；视图 v_marking_latest（每 target_ref 最新一条，
+--    同 ts 并列取 MAX(id) 兜底）。
+-- （v6，会话级 entry 群归属，工单 D-3/D-4，2026-10-20）
+-- 11. entry 增列 chat_id TEXT NOT NULL DEFAULT 'aggregate'（列序在表尾，与迁移
+--     ALTER TABLE ADD COLUMN 后一致；既有行回填 'aggregate'）；补索引 idx_entry_chat；
+--     视图 v_marking_latest 分组改 (chat_id, target_ref)——不同群同名任务各留最新态。
+--     迁移（user_version 5→6）：ALTER ADD + 回填 + DROP/重建 v_marking_latest，
+--     report_revision/marking 表零改动，单事务幂等。
 -- 二期规划（本期不做）：FTS5 全文索引、report_doc 关联表、uuid 业务键、category 表。
 -- ============================================================

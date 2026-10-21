@@ -107,6 +107,33 @@ python3 export_md.py --db sample.db --out ./exports
   `export_md.py` 非 aggregate 行导出至 `reports/<chatId>/` 子目录。
 - sample.db 合成假数据升级：同日双群两份 daily + 1 份聚合 daily + 1 份聚合 weekly + media 三态合成行。
 
+## 前端只读接入约定（v6，数据负责人裁定）
+
+前端/第三方只读接入 knowledge.db 时遵守以下 6 条（工单 2026-10-20 §三全文）：
+
+1. **业务键**：report = `(period_type, period_start, chat_id)`；`id` 本地自增跨库不稳定；
+   插件侧自增 id 跨群不唯一，前端 key 用 `chatId:id` 复合。
+2. **时间戳与时区裁定（D-9）**：
+   - knowledge.db 全部 `*_ts/created_at/updated_at` = **Unix 秒（UTC epoch）**，与 tz 无关；
+   - `report.period_start/period_end`、`doc.happened_on` 等 = **本地业务日 ISO 字符串**（YYYY-MM-DD）；
+   - 插件侧 store.db 的毫秒时间戳**在镜像边界转换为秒**入库；新文件（jsonl/json）统一毫秒 epoch UTC；
+   - 前端展示层自行转本地时区，库层不做本地化。
+3. `doc_ids_hint` 可失效 JSON 文本、无 FK，解析需容错。
+4. `report_revision` 无 FK：按三元组 LEFT JOIN，容忍孤儿行。
+5. `doc.file_path` 指向 `1数据/docs/` 相对路径，前端只展示不提供下载。
+6. marking/revision 以 knowledge.db 为准、容忍镜像延迟（动作 ok ≠ 立即可见）。
+
+## v6 增补（entry 群归属 + marking 分组）
+
+- `entry` 增列 `chat_id`（默认/回填 `'aggregate'`），`report gen --chat-id X` 只归档本群 entry，
+  聚合不再串吃各群条目；补索引 `idx_entry_chat(chat_id, ts)`；
+- `v_marking_latest` 分组改 `(chat_id, target_ref)`——不同群同名任务各留最新态；
+- schema 版本 `user_version` 5→6：Python/TS 双实现自动链式迁移（单事务、幂等、
+  既有行零变化仅回填 chat_id），全新库直接建 v6，>6 拒开；
+- CLI 全部连接 `busy_timeout=5000`、写路径 `BEGIN IMMEDIATE` 短事务（D-5）；
+  regenerate 遇 final 报告需 `--force`（D-13）；export_md 文件名带 doc id 前缀（D-6）、
+  「完成情况」按报告周期过滤（D-4）、frontmatter tags 数组化（D-15）。
+
 ## 路线图
 
 - [x] v0.2.1 schema 冻结（含评审修订 6 条）+ Python CLI + Markdown 导出
