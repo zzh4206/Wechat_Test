@@ -286,6 +286,24 @@ jq -s '[.[] | select((.ts/1000|floor|strftime("%Y-%m"))=="2026-10") | .costCny] 
 
 （`ts` 为毫秒时间戳；`costCny` 逐行累加即总费用，与报告尾 ≈¥ 同口径。）
 
+## 7.12 分支策略与 main 保护（2026-10-21 起）
+
+**规则：main 只接受经审查的合并，禁止直接推送。** 未经真实验证的功能改动一律先落分支。
+
+```sh
+# 一次性安装本地闸门（每个克隆各装一次；钩子不进版本库）
+cp scripts/git-hooks/pre-push .git/hooks/pre-push && chmod +x .git/hooks/pre-push
+
+# 日常流程
+git checkout -b <topic>                # 如 llm/<topic>、fix/<topic>、feat/<topic>
+# …改动 + ./scripts/check-sensitive.sh + npm run build && npm test…
+git push -u origin <topic>             # 钩子只拦 main，分支正常推
+# 审查后由维护者合并进 main（--no-ff），或开 PR
+```
+
+- 确需紧急直推（线上故障恢复）：`git push --no-verify`，并在 CHANGELOG 记录原因与时间。
+- 闸门只是本地防线；服务端保护（GitHub branch protection / 仅 PR 合并）需在仓库设置里开，二者互补。
+
 ## 8. 排障
 
 **第一诊断工具：读取层探针 `spikes/db-probe.mjs`**（插件仓库内，只读）——任何"读不到消息/昵称解析失败/库打不开"问题先跑它再查插件：
