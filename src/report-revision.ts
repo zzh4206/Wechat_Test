@@ -11,6 +11,10 @@
  * 修订流：镜像成功后，报告 .md 尾部「修订记录」段照常追加（即使镜像暂时失败也追加——
  * 修订段可能暂时缺行，可接受；revised 事件重放后由报告 upsert 补齐时间线）。
  *
+ * 归属日（2026-10-21 纠正：标记与审批语义不同，不再同口径）：
+ * - 标记（markTarget）= 工作流的演化 → 落**标记发生当天**的日报，级联当天所在周/月；
+ * - 审批（onApproval）= 对条目本身的认定 → 落条目**出身日报**（created_at 本地日），级联出身周/月。
+ *
  * 红线：source 只含通道名（'chat' | 'web'）无正文；不触发 LLM；不重发 filehelper。
  */
 import type { Store } from './store.js'
@@ -39,7 +43,7 @@ interface MirrorEvent {
 export interface ReportRevisionDeps {
   store: Store
   logger: StoreLogger
-  /** 存在性校验 + origin 解析（tasks/promises 行：created_at = 条目出身时刻）。返回 null = 不存在 */
+  /** 存在性校验 + 出身时刻解析（tasks/promises 行：created_at；审批据此归属出身日报）。返回 null = 不存在 */
   resolveTarget: (chatId: string, targetKind: 'task' | 'event' | 'promise', targetId: number) => { createdAt: number } | null
   mirror?: {
     mirrorMarking: (chatId: string, kind: 'done' | 'undone' | 'deleted', targetRef: string, ts: number, opts?: { source?: 'chat' | 'web'; sourceKey?: string }) => boolean
@@ -106,11 +110,10 @@ export class ReportRevisionService {
       this.deps.logger.warn(`report-revision: 标记目标不存在 ${chatId}/${targetKind}#${targetId}——整链零副作用`)
       return false
     }
-    // origin 归属（2026-10-21 用户裁定）：修订归属条目最初出现的日报（created_at 本地日），
-    // 级联周报=origin 所在周周一、月报=origin 当月 1 号——出身日报永远反映最新状态。
-    const originDateKey = this.dayKey(target.createdAt)
     this.drainPending()
     const ts = this.now()
+    // 归属日 = 标记发生当天（工作流演化落当天；审批才归出身日报，见文件头）
+    const markDateKey = this.dayKey(ts)
     const targetRef = `${chatId}:${targetKind}:${targetId}` // 全局唯一（防 v_marking_latest 跨群串号）
     const kKind = markingStatusToKnowledgeKind(status)
     const sourceKey = `mark:${targetRef}:${ts}`
@@ -129,12 +132,10 @@ export class ReportRevisionService {
     }
     const label = STATUS_LABEL[status]
     const mdLine = `- ${this.dayKey(ts)} ${this.hhmm(ts)} 标记：${targetKind}「#${targetId}」→ ${label}（来源：${source === 'web' ? '前端' : '对话框'}）`
-    // 特例：origin 日报告文件不存在 → 跳过 .md 追加，修订行（revisions+镜像）照记、级联照常
-    const originFileExists = this.deps.store.readText(reportRelPath(chatId, originDateKey)) !== null
-    if (originFileExists) this.appendRevisionLineToMd(chatId, originDateKey, mdLine)
-    else this.deps.logger.warn(`report-revision: origin 日（${originDateKey}）无报告文件——修订行照记、跳过 .md 追加 ${chatId}/${targetKind}#${targetId}`)
-    this.appendRevisionRow(chatId, originDateKey, { revType: 'marking', targetKind, targetRef: ev.targetRef, summary: `标记：${targetKind} #${targetId} → ${label}`, source: ev.source })
-    this.cascadeAggregates(chatId, originDateKey, { revType: 'marking', targetRef: ev.targetRef, summary: `标记：${targetKind} #${targetId} → ${label}`, source: ev.source, mdLine })
+    // 当天日报还没生成（白天标记、20:30 才出日报）→ 跳过 .md 追加；修订行照记，生成当天日报时由 revisionLines 渲染进去
+    if (this.deps.store.readText(reportRelPath(chatId, markDateKey)) !== null) this.appendRevisionLineToMd(chatId, markDateKey, mdLine)
+    this.appendRevisionRow(chatId, markDateKey, { revType: 'marking', targetKind, targetRef: ev.targetRef, summary: `标记：${targetKind} #${targetId} → ${label}`, source: ev.source })
+    this.cascadeAggregates(chatId, markDateKey, { revType: 'marking', targetRef: ev.targetRef, summary: `标记：${targetKind} #${targetId} → ${label}`, source: ev.source, mdLine })
     return true
   }
 

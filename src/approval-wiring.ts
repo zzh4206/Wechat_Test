@@ -68,7 +68,7 @@ export function createApprovalWiring(deps: ApprovalWiringDeps): ApprovalWiring {
         enqueueReportRegen: deps.enqueueReportRegen,
         now: deps.now,
         revision: reportRevision,
-        // 完成语义走完整标记链（存在性校验 → 镜像 → 出身日报修订段 → 周/月级联），
+        // 完成语义走完整标记链（存在性校验 → 镜像 → 标记当天日报修订段 → 周/月级联），
         // 与 ActionInbox task.mark 同源；直连 store.mirrorMarking 会跳过校验与修订段
         marks: reportRevision,
         reports: {
