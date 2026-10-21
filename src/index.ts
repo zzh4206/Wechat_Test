@@ -828,6 +828,11 @@ export function apply(ctx: Context, config: PluginConfig): void {
     distillEveryMessages: config.distillEveryMessages,
     distillIntervalMin: config.distillIntervalMin,
     llmCallRecorder, // T3：提炼调用也落 llm_call（phase='distill'）
+    // C1+C2：失败退避/熔断与增量水位状态落 groups/<chatId>/distill-state.json
+    // （必须注入 store，否则重启后退避与水位都归零——那正是重试风暴的一半成因）
+    store,
+    // C1 熔断告警：同群连续 5 次失败 → 弹一次系统通知（dry_run 语义在 SystemNotifier 内保持）
+    notifier,
     // T8：distiller 批上限读该群 safe-batch 状态（只读不写——不污染报告管线反馈环；
     // 取 daily 条目——日报是报告主路径，其收缩信号对 distiller 同样成立）；
     // 无状态回退 min(distillEveryMessages, batchThreshold) 静态上限

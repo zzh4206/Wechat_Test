@@ -16,16 +16,60 @@
  * 不引入新依赖；durMs 恒为正数（单调时钟 + 下限 1ms）。
  */
 import type { Store } from './store.js'
+import { redactSecretLike } from './guard.js'
 
 /**
- * 错误分类（T1，技术文档 §3.3）：timeout 类故障对半切分重试（改变参数重试），
- * 非 timeout（断言/解析失败、其他异常）保持"重试一次"。
- * 匹配 distiller 抛出的 `llm stream finished with error: Request timed out.`
- * 用 `/timed?\s?out|timeout/i` 容错匹配（覆盖 timeout / timed out / timedout 等变体）。
+ * 失败分类（C1：由 timeout|other 二值细分为六类）。
+ *
+ * 动机：成本分析（docs/COST-ANALYSIS-2026-10-21.md §3.3）显示 5 天内 1807 次失败
+ * 全被记成 `other`，"other" 的真身（限流？5xx？鉴权？）至今不可见 → 5 天后才从
+ * 账单发现。这里先把失败分类做细，让下一次真实失败立刻可归因。
+ *
+ * 判定优先级（自上而下，先匹配先返回）：
+ * 1. timeout —— `/timed?\s?out|timeout/i`（覆盖 timeout / timed out / timedout 等变体。
+ *    **必须最先判**：report.ts / distiller.ts 的"对半切分重试"只认 timeout，
+ *    语义与 T1 完全向后兼容）；
+ * 2. rate_limit —— 429 / rate limit / too many requests；
+ * 3. auth —— 401 / 403 / unauthorized / forbidden / invalid api key（须在 bad_request 之前，
+ *    否则 "invalid api key" 会被 /invalid/ 抢走）；
+ * 4. server —— 5xx / 500 / 502 / 503 / internal server error / bad gateway；
+ * 5. bad_request —— 400 / 422 / invalid / bad request / validation；
+ * 6. other —— 其余（解析失败、未知异常）。
  */
-export function errKindOf(error: unknown): 'timeout' | 'other' {
+export type LlmErrKind = 'timeout' | 'rate_limit' | 'auth' | 'server' | 'bad_request' | 'other'
+
+/** 失败分类（函数名保持 `errKindOf` 不变：report.ts 再导出与既有测试零改动） */
+export function errKindOf(error: unknown): LlmErrKind {
   const msg = error instanceof Error ? error.message : String(error ?? '')
-  return /timed?\s?out|timeout/i.test(msg) ? 'timeout' : 'other'
+  // ① timeout 优先：对半切分重试的判据只看这一类，语义不得变
+  if (/timed?\s?out|timeout/i.test(msg)) return 'timeout'
+  // ② 限流
+  if (/429|rate[\s_-]?limit|too many requests/i.test(msg)) return 'rate_limit'
+  // ③ 鉴权（先于 bad_request：避免 "invalid api key" 被 /invalid/ 归到 400）
+  if (/\b40[13]\b|unauthori[sz]ed|forbidden|invalid api key|authentication|permission denied/i.test(msg)) return 'auth'
+  // ④ 服务端（5xx）
+  if (/\b5\d{2}\b|internal server error|bad gateway|service unavailable|server error/i.test(msg)) return 'server'
+  // ⑤ 请求非法（400/422）
+  if (/\b4(?:00|22)\b|bad request|invalid|validation|unprocessable|malformed/i.test(msg)) return 'bad_request'
+  return 'other'
+}
+
+/** 失败调用错误摘要的字符上限（errMsg 落盘前截断——只留定位线索，不留全文） */
+export const ERR_MSG_MAX_CHARS = 160
+
+/**
+ * 失败调用错误摘要（C1）：message 先过 redactSecretLike（≥32 位密钥形态串替换为
+ * `[redacted-token:N]`）再截断到 ERR_MSG_MAX_CHARS 字符。
+ * 只用于失败行（成功行不写 errMsg），保证 API key 绝不进 JSONL。
+ */
+export function summarizeErrMsg(error: unknown): string {
+  const raw =
+    error instanceof Error
+      ? error.message !== ''
+        ? error.message
+        : error.name
+      : String(error ?? '')
+  return redactSecretLike(raw).slice(0, ERR_MSG_MAX_CHARS)
 }
 
 /**
@@ -95,7 +139,12 @@ export interface LlmCallEntry {
   durMs: number
   ok: boolean
   /** 失败分类（复用 errKindOf；成功为空串） */
-  errKind: 'timeout' | 'other' | ''
+  errKind: LlmErrKind | ''
+  /**
+   * C1：失败调用的错误摘要（redactSecretLike 脱敏 + 截断 160 字符）。
+   * 可选字段——**只对失败调用记录**，成功行不写（向后兼容：旧读取方忽略即可）。
+   */
+  errMsg?: string
   ts: number
   /** T9：模型名（来源 LlmClient.modelId()；缺省 'unknown'） */
   model: string
@@ -241,7 +290,7 @@ export class LlmCallRecorder {
       this.record(chatId, kind, phase, batch, msgs, prompt.length, sinceMs(t0), true, '', text.length, usage)
       return text
     } catch (error) {
-      this.record(chatId, kind, phase, batch, msgs, prompt.length, sinceMs(t0), false, errKindOf(error), 0, null)
+      this.record(chatId, kind, phase, batch, msgs, prompt.length, sinceMs(t0), false, errKindOf(error), 0, null, summarizeErrMsg(error))
       throw error
     }
   }
@@ -256,11 +305,13 @@ export class LlmCallRecorder {
     promptChars: number,
     durMs: number,
     ok: boolean,
-    errKind: 'timeout' | 'other' | '',
+    errKind: LlmErrKind | '',
     /** T9：输出字符数（估算 outTokens 用；失败调用传 0） */
     outChars: number,
     /** T9：宿主回传的真实 usage（无则 null → 走估算） */
     usage: { inTok: number; outTok: number } | null,
+    /** C1：失败调用的错误摘要（已脱敏截断；成功调用不传 → 字段不出现） */
+    errMsg?: string,
   ): void {
     this.stats.calls++
     if (ok) this.stats.okCalls++
@@ -281,6 +332,8 @@ export class LlmCallRecorder {
     this.stats.costCny = Math.round((this.stats.costCny + costCny) * 1_000_000) / 1_000_000
     if (tokensEst) this.stats.tokensEst = true
     const entry: LlmCallEntry = { ev: 'llm_call', chat: chatId, kind, phase, batch, msgs, promptChars, durMs, ok, errKind, ts: this.now(), model: this.model, inTokens, outTokens, costCny, tokensEst }
+    // C1：错误摘要只进失败行（空串不写，保持成功行字段集与旧版完全一致）
+    if (!ok && errMsg !== undefined && errMsg !== '') entry.errMsg = errMsg
     this.store.ensureDir(['groups', chatId].join('/'))
     this.store.appendJsonl(llmCallRelPath(chatId), entry)
   }

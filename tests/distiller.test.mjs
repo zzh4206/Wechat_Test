@@ -75,8 +75,11 @@ test('非法 JSON：整批丢弃并 warn', async () => {
   const { distiller, produced, logger } = setup({ llmText: '这不是JSON', messages: [['g1', 'a', 'hi']] })
   assert.equal(await distiller.tryDistill('g1', 'manual'), false)
   assert.deepEqual(produced, [])
-  assert.equal(logger.warnings.length, 1)
-  assert.match(logger.warnings[0], /invalid LLM output/)
+  // C1 起失败必定追加一行退避 warn（「连续失败 1 次，退避至 …」），故按"丢弃 warn 恰好
+  // 一次"断言——原语义（解析失败只 warn 一次、不重试）不变。
+  const droppedWarns = logger.warnings.filter((w) => /invalid LLM output/.test(w))
+  assert.equal(droppedWarns.length, 1)
+  assert.match(droppedWarns[0], /invalid LLM output/)
 })
 
 test('未知 type：整批丢弃并 warn', async () => {
@@ -84,7 +87,8 @@ test('未知 type：整批丢弃并 warn', async () => {
   const { distiller, produced, logger } = setup({ llmText: bad, messages: [['g1', 'a', 'hi']] })
   assert.equal(await distiller.tryDistill('g1', 'manual'), false)
   assert.deepEqual(produced, [])
-  assert.equal(logger.warnings.length, 1)
+  // 同上：只断言"丢弃 warn 一次"（C1 的退避 warn 是另外一行）
+  assert.equal(logger.warnings.filter((w) => /invalid LLM output/.test(w)).length, 1)
 })
 
 test('prompt：指令区与数据区分离；数据字段中注入文本被 JSON 封装，指令区无原文', async () => {
