@@ -92,7 +92,7 @@ test('writeWebManifest：写入 web/allowed-chats.json（白名单 + 库路径�
   const dir = resolve(mkdtempSync(join(tmpdir(), 'web-manifest-')))
   const store = new Store(dir, { warn() {}, error() {} })
   assert.equal(writeWebManifest(store, { groups: [CHAT], knowledgeDb: '/path/to/knowledge.db', now: () => 7 }), true)
-  assert.deepEqual(JSON.parse(readFileSync(join(dir, WEB_MANIFEST_REL), 'utf8')), { version: 1, groups: [CHAT], knowledgeDb: '/path/to/knowledge.db', updatedAt: 7 })
+  assert.deepEqual(JSON.parse(readFileSync(join(dir, WEB_MANIFEST_REL), 'utf8')), { version: 1, groups: [CHAT], knowledgeDb: '/path/to/knowledge.db', actionsEnabled: false, operator: null, updatedAt: 7 })
   writeWebManifest(store, { groups: [], knowledgeDb: null })
   assert.deepEqual(JSON.parse(readFileSync(join(dir, WEB_MANIFEST_REL), 'utf8')).groups, [])
   rmSync(dir, { recursive: true, force: true })
@@ -226,13 +226,15 @@ test('错 Host（DNS rebinding）→ 403，静态资源也拦', async () => {
   } finally { await env.stop() }
 })
 
-test('错 Origin → 403；非 GET → 405', async () => {
+test('错 Origin → 403；只读接口与静态资源不接受 POST/PUT（写入只有 /api/actions，见 web-inbox.test）', async () => {
   const env = await startEnv()
   try {
     assert.equal((await env.get('/api/chats', { origin: 'https://evil.example' })).status, 403)
     assert.equal((await env.get('/api/chats', { origin: `http://127.0.0.1:${env.port}` })).status, 200)
-    const post = await env.raw('POST', '/api/actions', { host: `127.0.0.1:${env.port}`, authorization: `Bearer ${TOKEN}`, origin: `http://127.0.0.1:${env.port}` })
-    assert.equal(post.status, 405, 'FE-1 无写接口')
+    const self = { host: `127.0.0.1:${env.port}`, authorization: `Bearer ${TOKEN}`, origin: `http://127.0.0.1:${env.port}` }
+    assert.equal((await env.raw('POST', '/api/reports', self)).status, 405)
+    assert.equal((await env.raw('POST', '/', self)).status, 405)
+    assert.equal((await env.raw('PUT', '/api/actions', self)).status, 405)
   } finally { await env.stop() }
 })
 

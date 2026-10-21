@@ -17,6 +17,11 @@ export function h(tag, attrs = {}, ...children) {
   return el
 }
 
+/** 替换子节点；与 h() 同样跳过 null/undefined/false（原生 replaceChildren 会把 null 渲染成文字「null」） */
+export function fill(el, ...children) {
+  el.replaceChildren(...children.flat().filter(c => c !== undefined && c !== null && c !== false))
+}
+
 const SAFE_HREF_RE = /^(https?:\/\/|mailto:)/i
 
 function inline(spans) {

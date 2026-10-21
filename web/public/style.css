@@ -81,3 +81,20 @@ main { padding: 16px; max-width: 1400px; margin: 0 auto; }
 table { border-collapse: collapse; width: 100%; font-size: 14px; }
 th, td { border-bottom: 1px solid var(--line); padding: 4px 8px; text-align: left; vertical-align: top; }
 .revisions { margin-top: 16px; border-top: 1px dashed var(--line); font-size: 14px; }
+
+/* —— FE-2 审批收件箱 —— */
+.banner { background: var(--panel); border: 1px solid var(--monthly); border-radius: 6px; padding: 8px 12px; }
+.section-title { font-size: 16px; margin: 18px 0 8px; }
+.inbox-card.no-deadline { border-left: 3px solid var(--monthly); }
+.inbox-head { display: flex; gap: 8px; align-items: baseline; }
+.pill.warn { color: var(--monthly); border-color: var(--monthly); }
+.evidence-line { font-size: 14px; overflow-wrap: anywhere; }
+button.link { border: none; background: none; color: var(--accent); padding: 0 4px; }
+.context { font-size: 14px; margin: 6px 0; padding-left: 1.4em; overflow-wrap: anywhere; }
+.context .is-evidence { background: var(--bg); font-weight: 600; }
+.actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 8px; }
+.deadline-set { display: inline-flex; gap: 4px; }
+button.primary { border-color: var(--accent); color: var(--accent); }
+.status { font-size: 13px; color: var(--muted); }
+.status.ok { color: var(--weekly); }
+.status.error { color: var(--error); }

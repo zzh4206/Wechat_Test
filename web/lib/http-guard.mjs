@@ -29,6 +29,14 @@ export function originAllowed(origin, port) {
 
 const digest = (s) => createHash('sha256').update(String(s), 'utf8').digest()
 
+/**
+ * token 指纹 = sha256 十六进制前 8 位，与插件审计 operator 同算法（RUNBOOK §13.3）。
+ * 用于和插件清单里的指纹比对、写进动作行；绝不落原 token。
+ */
+export function operatorOf(token) {
+  return digest(token).toString('hex').slice(0, 8)
+}
+
 /** Authorization 头是否携带正确 token（先 sha256 再比，长度恒定，避免长度泄露） */
 export function tokenAllowed(authorization, token) {
   if (typeof authorization !== 'string' || !authorization.startsWith('Bearer ')) return false

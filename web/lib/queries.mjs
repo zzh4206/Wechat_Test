@@ -231,3 +231,107 @@ export function getPersonDigest(stateDir, allowed, chatId, pid, day) {
     return null
   }
 }
+
+// —— FE-2：审批收件箱（每群库只读；审批写入只走 actions.jsonl） ——
+
+const EVIDENCE_PREVIEW = 120
+
+/** 打开某群的每群库（不存在返回 null） */
+function openGroupDb(stateDir, chatId) {
+  return openReadOnly(join(stateDir, 'groups', chatId, 'store.db'))
+}
+
+/** 表是否有某列（旧库可能缺 created_at 等迁移列） */
+function hasColumn(db, table, col) {
+  return db.prepare(`SELECT 1 FROM pragma_table_info(?) WHERE name = ?`).get(table, col) !== undefined
+}
+
+/**
+ * 某群待处理项：
+ * - pending：待确认的任务 / 承诺 / 事件；
+ * - active：进行中的任务与承诺（可完成/兑现/关闭；无时限的任务标「待定时间」）。
+ * 证据只带发送者与前 120 字预览，完整上下文走 /api/evidence。
+ */
+function inboxOfChat(db, chatId) {
+  const nick = new Map(db.prepare('SELECT pid, group_nick, remark FROM identities').all().map(r => [r.pid, r.remark || r.group_nick]))
+  const msgStmt = db.prepare('SELECT ts, sender_pid, sender_name, text FROM messages WHERE msg_id = ?')
+  const evidenceOf = (msgId) => {
+    if (!msgId) return null
+    const m = msgStmt.get(msgId)
+    if (!m) return { msgId, ts: null, sender: '', preview: '' }
+    return { msgId, ts: m.ts, sender: m.sender_name || nick.get(m.sender_pid) || '', preview: m.text.slice(0, EVIDENCE_PREVIEW) }
+  }
+  const items = []
+  const taskCreated = hasColumn(db, 'tasks', 'created_at') ? 'created_at' : '0'
+  for (const r of db.prepare(`SELECT task_id, statement, assigner_pid, evidence_msg_id, deadline, deadline_confidence, status, ${taskCreated} AS created_at
+      FROM tasks WHERE status IN ('pending_confirm', 'active') ORDER BY task_id DESC LIMIT ${LIST_LIMIT}`).all()) {
+    items.push({
+      kind: 'task', id: r.task_id, chatId, statement: r.statement, status: r.status,
+      assigner: r.assigner_pid ? nick.get(r.assigner_pid) ?? '' : '',
+      deadline: r.deadline, deadlineConfidence: r.deadline_confidence, createdAt: r.created_at || null,
+      evidence: evidenceOf(r.evidence_msg_id),
+    })
+  }
+  for (const r of db.prepare(`SELECT promise_id, statement, assigner_pid, evidence_msg_id, deadline, deadline_confidence, status
+      FROM promises WHERE status IN ('pending_confirm', 'active') ORDER BY promise_id DESC LIMIT ${LIST_LIMIT}`).all()) {
+    items.push({
+      kind: 'promise', id: r.promise_id, chatId, statement: r.statement, status: r.status,
+      assigner: r.assigner_pid ? nick.get(r.assigner_pid) ?? '' : '',
+      deadline: r.deadline, deadlineConfidence: r.deadline_confidence,
+      evidence: evidenceOf(r.evidence_msg_id),
+    })
+  }
+  for (const r of db.prepare(`SELECT event_id, category, statement, evidence_msg_id, confidence, status
+      FROM events WHERE status = 'pending_confirm' ORDER BY event_id DESC LIMIT ${LIST_LIMIT}`).all()) {
+    items.push({
+      kind: 'event', id: r.event_id, chatId, statement: r.statement, status: r.status,
+      category: r.category, confidence: r.confidence,
+      evidence: evidenceOf(r.evidence_msg_id),
+    })
+  }
+  return items
+}
+
+/** 收件箱：chat 缺省 = 全部白名单群 */
+export function listInbox(stateDir, allowed, chat) {
+  const chats = scopeChats(chat, allowed)
+  if (!chats) return null
+  const items = []
+  for (const chatId of chats) {
+    let db = null
+    try {
+      db = openGroupDb(stateDir, chatId)
+      if (db) items.push(...inboxOfChat(db, chatId))
+    } catch {
+      // 单群库不可读（未建库/被锁/旧 schema）不拖累其它群
+    } finally {
+      db?.close()
+    }
+  }
+  return items
+}
+
+/** 证据上下文：证据消息前后各 around 条（≤10） */
+export function evidenceContext(stateDir, allowed, q) {
+  if (q.chat === undefined || !allowed.has(q.chat)) return null
+  if (typeof q.msg !== 'string' || q.msg === '' || q.msg.length > 128) throw new BadRequest('msg 非法')
+  const around = Math.min(Math.max(Number.parseInt(q.around ?? '5', 10) || 5, 1), 10)
+  const db = openGroupDb(stateDir, q.chat)
+  if (!db) return { msgId: q.msg, messages: [] }
+  try {
+    const center = db.prepare('SELECT ts FROM messages WHERE msg_id = ?').get(q.msg)
+    if (!center) return { msgId: q.msg, messages: [] }
+    const cols = 'msg_id, ts, sender_pid, sender_name, kind, text'
+    const before = db.prepare(`SELECT ${cols} FROM messages WHERE (ts < ? OR (ts = ? AND msg_id < ?)) ORDER BY ts DESC, msg_id DESC LIMIT ?`).all(center.ts, center.ts, q.msg, around).reverse()
+    const self = db.prepare(`SELECT ${cols} FROM messages WHERE msg_id = ?`).all(q.msg)
+    const after = db.prepare(`SELECT ${cols} FROM messages WHERE (ts > ? OR (ts = ? AND msg_id > ?)) ORDER BY ts, msg_id LIMIT ?`).all(center.ts, center.ts, q.msg, around)
+    return {
+      msgId: q.msg,
+      messages: [...before, ...self, ...after].map(m => ({
+        msgId: m.msg_id, ts: m.ts, sender: m.sender_name, kind: m.kind, text: m.text, isEvidence: m.msg_id === q.msg,
+      })),
+    }
+  } finally {
+    db.close()
+  }
+}
