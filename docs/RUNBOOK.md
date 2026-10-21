@@ -635,8 +635,8 @@ LURKER_WEB_TOKEN='<与插件 webActionsToken 相同的值>' \
 | 60 秒内插件未处理 | — | 插件没在跑或收件箱没开；动作已入队，插件恢复后仍会执行 |
 
 前端只开放这些动作：`task.confirm/cancel/complete/set_deadline`、`event.confirm`、
-`promise.confirm/cancel/fulfilled/close`、`person.follow/unfollow`、`report.finalize`、`report.regen`
-（插件侧白名单的子集）。
+`promise.confirm/cancel/fulfilled/close`、`person.follow/unfollow`、`report.finalize`、`report.regen`、
+`report.toOutbox`（插件侧白名单的子集；`report.toOutbox` 另受 §14.5 开关约束）。
 
 **报告操作（FE-3，报告详情页）**——两者都**不发送**：
 
@@ -665,6 +665,32 @@ LURKER_WEB_TOKEN='<与插件 webActionsToken 相同的值>' \
 
 `Ctrl-C`（或 SIGTERM）即可。web 进程没有后台任务，停掉不影响插件；已提交未执行的动作留在 actions.jsonl，
 插件照常消费。要彻底关闭审批通道，把插件 `webActionsEnabled` 设回 `false`。
+
+
+### 14.5 排入发件箱（默认关闭）
+
+报告详情页的「排入发件箱」是工作台里**唯一会走向发送**的操作：往 outbox 追加一条与定时报告同形的条目，
+之后由既有 sender worker 处理——四道闸（`senderEnabled` / `sendDryRun` / 通道闸 / 交互闸）、每日配额
+`maxSendsPerDay`、DB 回读验证一概照旧，没有新的发送路径。发出去的只是一行提醒
+（`【lurker】日报 2026-10-14（群）（前端补推） 修订 N 处，全文见工作台`），**不含报告正文**。
+
+开关：插件配置 `webOutboxEnabled`，默认 `false`。关闭时插件收件箱不注入入队函数，
+`report.toOutbox` 一律回执 `unsupported`（手写 actions.jsonl 也绕不过）；web 侧按钮置灰、提交回 409。
+
+**启用步骤（按顺序，前一步确认无误再进行下一步）**：
+
+1. 前置：§14.2 的审批通道已能正常使用（确认/定稿等回执正常）。
+2. 保持发送层**干跑**：`sendDryRun: true`（默认）。设 `webOutboxEnabled: true`，重启插件；
+   工作台报告详情页的「排入发件箱」按钮应变为可用。
+3. 点一次「排入发件箱」，核对：
+   - 回执「已排入发件箱」；`outbox.jsonl` 末尾多一条 `kind` 为报告周期、标题以「（前端补推）」结尾、
+     `evidence_ref` 为报告 md 路径、`status: pending` 的条目，正文无报告内容；
+   - 10 分钟内再点一次 → 回执「10 分钟内已排入过」，outbox 不新增；
+   - sender 处理后该条目转 `dry_run`（只激活微信到对话、不粘贴不回车），`audit/sender.jsonl` 只有元数据。
+4. 确认无误后，是否真发由发送层自身的开关决定（`senderEnabled` + `sendDryRun: false`，见 §12.5），
+   与定时报告完全一致；本开关不提供单独的「真发」选项。
+5. 回退：`webOutboxEnabled: false` 并重启即可。已入队未处理的条目仍在 outbox 中，按发送层开关处理；
+   需要撤下的话在发送层关闭期间处理，不要手工删改 outbox.jsonl。
 
 ## 排障：重新登录/切换微信账号后读取失效（code 15）
 

@@ -55,6 +55,7 @@ import { processRegenHead, startManualRegen } from './regen-processor.js'
 import { ActionInbox } from './action-inbox.js'
 import { createApprovalWiring } from './approval-wiring.js'
 import { writeWebManifest } from './web-manifest.js'
+import { createReportOutbox } from './report-outbox.js'
 import { homedir } from 'node:os'
 // M6：保留期清理（T1.1 遗留）+ A/B 脚手架类型（新增行，不动他人行）
 import { RetentionService } from './retention.js'
@@ -184,6 +185,8 @@ export interface PluginConfig {
   readbackChatId: string
   sendSearchViaClipboard: boolean
   webActionsEnabled: boolean
+  /** FE-3「排入发件箱」总开关（默认 false：前端 report.toOutbox 一律拒绝、零入队） */
+  webOutboxEnabled: boolean
   webActionsPollSec: number
   /** W-1：前端动作通道共享 token（真实值放 cordis.patch.yml；审计只记 sha256 前 8 位） */
   webActionsToken: string
@@ -277,6 +280,7 @@ export const Config: Schema<PluginConfig> = Schema.object({
   allowAutoRekey: Schema.boolean().default(false).description('小号回归自动取钥（默认 false：只通知人工执行 bootstrap_keys.py）。true = 自动执行取钥+验证。开启前必须人工成功手跑一次取钥（两段式安全条件，见 RUNBOOK）'),
     sendTargetChat: Schema.string().default('').description('发送目标会话名（搜索词；真实值放运行配置。默认空 = fail-closed 不发送；搜索结果多条时 Enter 选第一个，异常由 DB 回读兜底报警）'),
   webActionsEnabled: Schema.boolean().default(false).description('前端动作收件箱（审批双通道 web 侧）：消费 web/actions.jsonl 调 ApprovalActions，写结果/审计文件。默认关'),
+  webOutboxEnabled: Schema.boolean().default(false).description('前端「排入发件箱」开关（默认关）：开启后前端可把一份报告排入 outbox，之后走既有发送链路（senderEnabled / sendDryRun 等四道闸照旧生效）。关闭时 report.toOutbox 回执 unsupported、零入队。启用步骤见 RUNBOOK §14.5'),
   webActionsPollSec: Schema.number().default(5).description('动作收件箱轮询周期秒（默认 5）'),
     webActionsToken: Schema.string().default('').description('前端动作通道共享 token（与前端 web 进程一致；真实值放 cordis.patch.yml，绝不入日志/审计原文）。审计只记 sha256 前 8 位操作者标识（W-1）；配置后动作行的 operator 必须与之一致才执行（不一致回执 operator_mismatch），web 进程也会比对指纹、不一致即只读；空 = 不校验、审计记 unknown，且前端写动作禁用'),
     readbackChatId: Schema.string().default('').description('DB 回读验证目标会话 wxid（P0 兜底闸目标；必填——缺失 fail-closed 不发送。真实值放 cordis.patch.yml）'),
@@ -742,6 +746,8 @@ export function apply(ctx: Context, config: PluginConfig): void {
         marks: { markTarget: (chatId2, kind2, targetId2, status2, source2) => reportRevision.markTarget(chatId2, kind2, targetId2, status2, source2) },
         groups: config.groups,
         resolveTarget: resolveInboxTarget,
+        // 「排入发件箱」：仅 webOutboxEnabled=true 时注入（未注入 = 开关关，收件箱一律拒绝）
+        reportOutbox: config.webOutboxEnabled ? createReportOutbox({ store, outbox }) : undefined,
         operator: webActionsOperator,
         logger: logger as unknown as StoreLogger,
         pollSec: config.webActionsPollSec,
@@ -753,6 +759,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
     knowledgeDb: mirrorPath ? resolve(mirrorPath) : null,
     actionsEnabled: actionInbox !== null,
     operator: webActionsOperator ?? null,
+    outboxEnabled: actionInbox !== null && config.webOutboxEnabled === true,
   })
 
   // —— M5-T5.3：文件索引（默认关 = 零活动）。 ——

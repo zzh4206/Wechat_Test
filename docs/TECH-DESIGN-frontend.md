@@ -1,7 +1,7 @@
 # 技术设计：本地前端工作台（报告回溯 + 待审批收件箱）
 
 - 版本：v0.1（草案，2026-10-21 入库；正文保持 v0.1 原貌，仅分期编号按 [REF-prefixes.md](REF-prefixes.md) 改为 FE-N）
-- 状态：§3 方案 B 已采纳；插件侧服务面（FE-2 的 ActionInbox / ApprovalActions）已落地；**FE-1 / FE-2 已落地**（`web/`，启动与开启审批见 RUNBOOK §14）；FE-3 已落地定稿与重新生成，「排入发件箱」待实施（单独 PR，带默认关闭的插件侧开关）
+- 状态：§3 方案 B 已采纳；插件侧服务面（FE-2 的 ActionInbox / ApprovalActions）已落地；**FE-1 / FE-2 已落地**（`web/`，启动与开启审批见 RUNBOOK §14）；FE-3 已落地（定稿、重新生成、排入发件箱；排入发件箱受插件 `webOutboxEnabled` 控制，默认关，启用步骤见 RUNBOOK §14.5）
 - 数据层依据：[`0数据格式/`](../0数据格式/README.md)（本稿写于 schema v0.4，现行为 v6）、`src/group-store.ts`（每群库）
 - 安全依据：[SECURITY-TEST-PLAN.md](SECURITY-TEST-PLAN.md) §0 五条红线
 
@@ -34,6 +34,12 @@
 > - 定稿走插件收件箱新动作 `report.finalize`（不是 §5 设想的 web 侧直调 `setReportStatus`）：参数为 `{kind, dateKey}`（周期起点），与 `report.regen` 同一校验，不依赖 knowledge.db 行号；定稿记一条 `status` 修订
 > - 重新生成只入手动重跑队列、**不进发件箱**（补发队列修正后的语义）；推送到手机只能走「排入发件箱」一个入口
 > - 跨群聚合报告暂不提供这两个操作
+>
+> **FE-3（排入发件箱）实施与本稿的差异**：
+>
+> - 增加插件侧总开关 `webOutboxEnabled`（默认关）：关时收件箱不注入入队函数、一律 `unsupported`，web 侧按钮置灰并先回 409——真正的闸在插件侧
+> - 入队条目与定时报告同形，之后完全复用既有 sender 链路；条目正文只含元数据（修订数），报告内容不经此通道外发
+> - 同一份报告 10 分钟内重复排入回执 `duplicate`；报告 md 须存在，路径由插件推导
 
 ---
 

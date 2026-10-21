@@ -26,7 +26,7 @@ export const ACTION_TYPES = [
   'event.confirm',
   'promise.confirm', 'promise.cancel', 'promise.fulfilled', 'promise.close',
   'person.follow', 'person.unfollow',
-  'report.regen', 'report.finalize',
+  'report.regen', 'report.finalize', 'report.toOutbox',
   'task.mark', 'promise.mark',
 ] as const
 export type ActionType = (typeof ACTION_TYPES)[number]
@@ -52,6 +52,12 @@ export interface ActionInboxDeps {
   groups: readonly string[]
   /** W-8 stale 细分用：目标存在性解析（缺省 = 一律 status_conflict） */
   resolveTarget?: (chatId: string, targetKind: 'task' | 'promise' | 'event', targetId: number) => { createdAt: number } | null
+  /**
+   * 「排入发件箱」入队（FE-3 report.toOutbox）。**仅当插件配置 webOutboxEnabled=true 时由接线层注入**——
+   * 未注入 = 开关关闭，report.toOutbox 一律回执 unsupported（outbox_disabled），零入队。
+   * 入队后走既有 sender 链路（四道闸 + 配额 + 回读验证），本模块不碰发送。
+   */
+  reportOutbox?: (chatId: string, kind: ReportKind, dateKey: string) => 'ok' | 'not_found' | 'duplicate'
   /** W-1：操作者标识（web token 哈希前缀；审计元数据） */
   operator?: string
   logger: StoreLogger
@@ -151,7 +157,7 @@ export const RESULT_TOMBSTONE_MAX = 100
  * 带 source 的门面方法一律显式传 'web'——缺省值是 'chat'，漏传会把前端审批记成「来源：对话框」。
  */
 export async function dispatchAction(
-  deps: Pick<ActionInboxDeps, 'actions' | 'marks' | 'resolveTarget'>,
+  deps: Pick<ActionInboxDeps, 'actions' | 'marks' | 'resolveTarget' | 'reportOutbox'>,
   a: ActionLine,
 ): Promise<{ code: ActionOutcome['code']; reason?: string }> {
   const A = deps.actions
@@ -205,6 +211,13 @@ export async function dispatchAction(
       if (r === 'not_found') return { code: 'not_found' }
       if (r === 'unavailable') return { code: 'unsupported', reason: 'knowledge_db_off' }
       return { code: 'error' }
+    }
+    case 'report.toOutbox': {
+      if (!deps.reportOutbox) return { code: 'unsupported', reason: 'outbox_disabled' }
+      const r = deps.reportOutbox(a.chatId, a.params?.kind as ReportKind, String(a.params?.dateKey))
+      if (r === 'ok') return { code: 'ok' }
+      if (r === 'duplicate') return { code: 'duplicate', reason: 'recently_queued' }
+      return { code: 'not_found' }
     }
     case 'task.mark':
     case 'promise.mark': {
@@ -374,13 +387,13 @@ export class ActionInbox {
     if (!this.deps.groups.includes(a.chatId)) {
       return { actionId: a.actionId, ok: false, code: 'chat_not_allowed' }
     }
-    if (a.type !== 'person.follow' && a.type !== 'person.unfollow' && a.type !== 'report.regen' && a.type !== 'report.finalize') {
+    if (a.type !== 'person.follow' && a.type !== 'person.unfollow' && !a.type.startsWith('report.')) {
       if (!Number.isInteger(a.targetId) || a.targetId <= 0) {
         return { actionId: a.actionId, ok: false, code: 'bad_request', reason: 'targetId_required' }
       }
     }
-    // W-7：report.regen / report.finalize 执行前校验（kind/dateKey 按-kind 有效性）——队列零污染
-    if (a.type === 'report.regen' || a.type === 'report.finalize') {
+    // W-7：report.regen / report.finalize / report.toOutbox 执行前校验（kind/dateKey 按-kind 有效性）——队列零污染
+    if (a.type.startsWith('report.')) {
       const bad = validateRegenParams(a.params)
       if (bad) return { actionId: a.actionId, ok: false, code: 'bad_request', reason: bad }
     }

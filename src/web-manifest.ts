@@ -26,13 +26,15 @@ export interface WebManifest {
    * 对应浏览器实际使用的 token。只是哈希前缀（审计日志里本就有），不含 token 本身。
    */
   operator: string | null
+  /** 「排入发件箱」开关（插件 webOutboxEnabled）；false 时前端置灰该按钮。真正的闸在插件收件箱 */
+  outboxEnabled: boolean
   updatedAt: number
 }
 
 /** 写入清单；返回是否成功 */
 export function writeWebManifest(
   store: Pick<Store, 'ensureDir' | 'writeText'>,
-  opts: { groups: readonly string[]; knowledgeDb: string | null; actionsEnabled?: boolean; operator?: string | null; now?: () => number },
+  opts: { groups: readonly string[]; knowledgeDb: string | null; actionsEnabled?: boolean; operator?: string | null; outboxEnabled?: boolean; now?: () => number },
 ): boolean {
   const manifest: WebManifest = {
     version: 1,
@@ -40,6 +42,7 @@ export function writeWebManifest(
     knowledgeDb: opts.knowledgeDb,
     actionsEnabled: opts.actionsEnabled ?? false,
     operator: opts.operator ?? null,
+    outboxEnabled: opts.outboxEnabled ?? false,
     updatedAt: (opts.now ?? Date.now)(),
   }
   if (!store.ensureDir('web')) return false

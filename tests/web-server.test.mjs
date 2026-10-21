@@ -92,7 +92,7 @@ test('writeWebManifest：写入 web/allowed-chats.json（白名单 + 库路径�
   const dir = resolve(mkdtempSync(join(tmpdir(), 'web-manifest-')))
   const store = new Store(dir, { warn() {}, error() {} })
   assert.equal(writeWebManifest(store, { groups: [CHAT], knowledgeDb: '/path/to/knowledge.db', now: () => 7 }), true)
-  assert.deepEqual(JSON.parse(readFileSync(join(dir, WEB_MANIFEST_REL), 'utf8')), { version: 1, groups: [CHAT], knowledgeDb: '/path/to/knowledge.db', actionsEnabled: false, operator: null, updatedAt: 7 })
+  assert.deepEqual(JSON.parse(readFileSync(join(dir, WEB_MANIFEST_REL), 'utf8')), { version: 1, groups: [CHAT], knowledgeDb: '/path/to/knowledge.db', actionsEnabled: false, operator: null, outboxEnabled: false, updatedAt: 7 })
   writeWebManifest(store, { groups: [], knowledgeDb: null })
   assert.deepEqual(JSON.parse(readFileSync(join(dir, WEB_MANIFEST_REL), 'utf8')).groups, [])
   rmSync(dir, { recursive: true, force: true })

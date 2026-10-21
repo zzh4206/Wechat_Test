@@ -32,5 +32,7 @@ export function loadManifest(stateDir) {
   const actionsEnabled = raw.actionsEnabled === true
   // 插件 webActionsToken 的指纹（审计 operator）；null = 插件未配置 token
   const operator = typeof raw.operator === 'string' && /^[0-9a-f]{8}$/.test(raw.operator) ? raw.operator : null
-  return { groups, knowledgeDb, actionsEnabled, operator }
+  // 「排入发件箱」开关（插件 webOutboxEnabled）；旧清单无此字段 = 关
+  const outboxEnabled = raw.outboxEnabled === true
+  return { groups, knowledgeDb, actionsEnabled, operator, outboxEnabled }
 }
