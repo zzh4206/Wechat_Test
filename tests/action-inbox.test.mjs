@@ -17,7 +17,7 @@ function fakeActions() {
   return {
     calls,
     task: {
-      confirmTask: async (c, id) => { calls.push(['task.confirm', c, id]); return id !== 404 },
+      confirmTask: async (c, id) => { calls.push(['task.confirm', c, id]); return id !== 404 && id !== 13 },
       cancelTask: async () => { calls.push(['task.cancel']); return true },
       completeTask: async () => { calls.push(['task.complete']); return true },
       confirmEvent: async () => { calls.push(['event.confirm']); return true },
@@ -31,7 +31,8 @@ function fakeActions() {
   }
 }
 
-function makeEnv() {
+const defaultResolve = (c, k, id) => (id === 404 ? null : { createdAt: 1 })
+function makeEnv({ resolveTarget } = {}) {
   const dir = resolve(mkdtempSync(join(tmpdir(), 'inbox-')))
   const store = new Store(dir, { warn() {}, error() {} })
   store.ensureDir('web')
@@ -48,6 +49,7 @@ function makeEnv() {
   const env = { dir, store, svc, calls, notified }
   env.inbox = new ActionInbox({
     store, actions, groups: [CHAT],
+    resolveTarget: resolveTarget ?? defaultResolve,
     logger: { warn() {}, error() {} },
     pollSec: 1, now: () => 1000,
     marks: { markTarget: async (c, kind, tid, status) => { calls.push(['mark', c, kind, tid, status]); return tid !== 666 } },
@@ -81,17 +83,21 @@ test('白名单外 type 拒绝（unsupported）；越权 chatId 拒绝（forbidd
   ].join('\n') + '\n')
   await env.inbox.poll()
   const results = readFileSync(join(env.dir, ACTION_RESULTS_REL), 'utf8').trim().split('\n').map(JSON.parse)
-  assert.deepEqual(results.map((r) => r.code), ['unsupported', 'forbidden'])
+  assert.deepEqual(results.map((r) => r.code), ['type_not_allowed', 'chat_not_allowed'])
   assert.equal(env.calls.length, 0, '均未执行')
   rmSync(env.dir, { recursive: true, force: true })
 })
 
-test('stale：服务返回 false（状态已变化）→ ok=false code=stale，不强改', async () => {
-  const env = makeEnv()
-  env.store.writeText(ACTIONS_REL, line({ actionId: 's1', targetId: 404 }) + '\n')
+test('stale 细分（W-8）：目标不存在 → not_found；存在但状态不符 → status_conflict', async () => {
+  const env = makeEnv({ resolveTarget: (c, k, id) => (id === 404 ? null : { createdAt: 1 }) })
+  env.store.writeText(ACTIONS_REL, [
+    line({ actionId: 's1', targetId: 404 }),
+    line({ actionId: 's2', targetId: 13 }),
+  ].join('\n') + '\n')
   await env.inbox.poll()
   const results = readFileSync(join(env.dir, ACTION_RESULTS_REL), 'utf8').trim().split('\n').map(JSON.parse)
-  assert.deepEqual(results[0], { actionId: 's1', ok: false, code: 'stale', ts: 1000 })
+  assert.deepEqual(results[0], { actionId: 's1', ok: false, code: 'not_found', ts: 1000 })
+  assert.equal(results[1].code, 'status_conflict', '存在但状态不符 → status_conflict')
   rmSync(env.dir, { recursive: true, force: true })
 })
 

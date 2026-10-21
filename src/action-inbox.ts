@@ -47,15 +47,27 @@ export interface ActionInboxDeps {
   marks?: { markTarget: (chatId: string, kind: 'task' | 'promise', targetId: number, status: 'completed' | 'incomplete' | 'deleted', source: 'chat' | 'web') => Promise<boolean> }
   /** 白名单群（R2：chatId ∈ groups，白名单外拒绝） */
   groups: readonly string[]
+  /** W-8 stale 细分用：目标存在性解析（缺省 = 一律 status_conflict） */
+  resolveTarget?: (chatId: string, targetKind: 'task' | 'promise', targetId: number) => { createdAt: number } | null
+  /** W-1：操作者标识（web token 哈希前缀；审计元数据） */
+  operator?: string
   logger: StoreLogger
   pollSec?: number
   now?: () => number
 }
 
+export type ActionCode =
+  | 'ok' | 'duplicate'
+  | 'not_found' | 'status_conflict' // W-8：stale 细分
+  | 'chat_not_allowed' | 'type_not_allowed' // W-8：forbidden 细分
+  | 'unsupported' | 'bad_request' | 'error'
+
 export interface ActionOutcome {
   actionId: string
   ok: boolean
-  code: 'ok' | 'stale' | 'unsupported' | 'bad_request' | 'forbidden' | 'duplicate' | 'error'
+  code: ActionCode
+  /** 失败原因（bad_request 时细化：kind_not_allowed/date_format/not_monday/not_month_start/…） */
+  reason?: string
 }
 
 /** 解析一行（坏行返回 null——跳过并计数，不中断水位） */
@@ -78,60 +90,86 @@ export function parseActionLine(line: string): ActionLine | null {
   }
 }
 
+/** W-7：report.regen params 校验（kind 枚举 + dateKey GLOB + 按-kind 有效性）。非法返回原因 */
+export function validateRegenParams(params: Record<string, unknown> | undefined): string | null {
+  const kind = params?.kind
+  const dateKey = params?.dateKey
+  if (kind !== 'daily' && kind !== 'weekly' && kind !== 'monthly') return 'kind_not_allowed'
+  if (typeof dateKey !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) return 'date_format'
+  const d = new Date(Number(dateKey.slice(0, 4)), Number(dateKey.slice(5, 7)) - 1, Number(dateKey.slice(8, 10)))
+  if (Number.isNaN(d.getTime()) || p(d) !== dateKey) return 'date_format'
+  if (kind === 'weekly' && (d.getDay() + 6) % 7 !== 0) return 'not_monday'
+  if (kind === 'monthly' && d.getDate() !== 1) return 'not_month_start'
+  return null
+  function p(x: Date): string {
+    return `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, '0')}-${String(x.getDate()).padStart(2, '0')}`
+  }
+}
+
+/** W-8：stale 细分——目标不存在 → not_found；存在但状态不符 → status_conflict */
+function staleOf(deps: Pick<ActionInboxDeps, 'resolveTarget'>, a: ActionLine): { code: ActionOutcome['code']; reason?: string } {
+  const t = deps.resolveTarget?.(a.chatId, a.type === 'promise.mark' || a.type.startsWith('promise.') ? 'promise' : 'task', a.targetId)
+  if (!t) return { code: 'not_found' }
+  return { code: 'status_conflict' }
+}
+
 /** 前端动作 → ApprovalActions / MarkActions 单入口分发。返回 code（stale = 服务返回 false） */
-export async function dispatchAction(deps: Pick<ActionInboxDeps, 'actions' | 'marks'>, a: ActionLine): Promise<ActionOutcome['code']> {
+export async function dispatchAction(
+  deps: Pick<ActionInboxDeps, 'actions' | 'marks' | 'resolveTarget'>,
+  a: ActionLine,
+): Promise<{ code: ActionOutcome['code']; reason?: string }> {
   const A = deps.actions
   const id = a.targetId
   switch (a.type) {
-    case 'task.confirm': return (await A.taskConfirm(a.chatId, id)) ? 'ok' : 'stale'
-    case 'task.cancel': return (await A.taskCancel(a.chatId, id)) ? 'ok' : 'stale'
-    case 'task.complete': return (await A.taskComplete(a.chatId, id)) ? 'ok' : 'stale'
+    case 'task.confirm': return (await A.taskConfirm(a.chatId, id)) ? { code: 'ok' } : staleOf(deps, a)
+    case 'task.cancel': return (await A.taskCancel(a.chatId, id)) ? { code: 'ok' } : staleOf(deps, a)
+    case 'task.complete': return (await A.taskComplete(a.chatId, id)) ? { code: 'ok' } : staleOf(deps, a)
     case 'task.set_deadline': {
       const dl = a.params?.deadline
-      if (typeof dl !== 'number' || !Number.isFinite(dl)) return 'bad_request'
-      return (await A.taskSetDeadline(a.chatId, id, dl)) ? 'ok' : 'stale'
+      if (typeof dl !== 'number' || !Number.isFinite(dl)) return { code: 'bad_request', reason: 'deadline_required' }
+      return (await A.taskSetDeadline(a.chatId, id, dl)) ? { code: 'ok' } : staleOf(deps, a)
     }
     case 'task.postpone': {
       const dl = a.params?.deadline
-      if (typeof dl !== 'number' || !Number.isFinite(dl)) return 'bad_request'
-      return (await A.taskPostpone(a.chatId, id, dl)) ? 'ok' : 'stale'
+      if (typeof dl !== 'number' || !Number.isFinite(dl)) return { code: 'bad_request', reason: 'deadline_required' }
+      return (await A.taskPostpone(a.chatId, id, dl)) ? { code: 'ok' } : staleOf(deps, a)
     }
     case 'task.rewrite': {
       const text = a.params?.text
-      if (typeof text !== 'string' || text.trim() === '') return 'bad_request'
-      return (await A.taskRewrite(a.chatId, id, text)) ? 'ok' : 'stale'
+      if (typeof text !== 'string' || text.trim() === '') return { code: 'bad_request', reason: 'text_required' }
+      return (await A.taskRewrite(a.chatId, id, text)) ? { code: 'ok' } : staleOf(deps, a)
     }
-    case 'event.confirm': return (await A.eventConfirm(a.chatId, id)) ? 'ok' : 'stale'
-    case 'promise.confirm': return (await A.promiseConfirm(a.chatId, id)) ? 'ok' : 'stale'
-    case 'promise.cancel': return (await A.promiseCancel(a.chatId, id)) ? 'ok' : 'stale'
-    case 'promise.fulfilled': return (await A.promiseFulfilled(a.chatId, id)) ? 'ok' : 'stale'
-    case 'promise.close': return (await A.promiseClose(a.chatId, id)) ? 'ok' : 'stale'
+    case 'event.confirm': return (await A.eventConfirm(a.chatId, id)) ? { code: 'ok' } : staleOf(deps, a)
+    case 'promise.confirm': return (await A.promiseConfirm(a.chatId, id)) ? { code: 'ok' } : staleOf(deps, a)
+    case 'promise.cancel': return (await A.promiseCancel(a.chatId, id)) ? { code: 'ok' } : staleOf(deps, a)
+    case 'promise.fulfilled': return (await A.promiseFulfilled(a.chatId, id)) ? { code: 'ok' } : staleOf(deps, a)
+    case 'promise.close': return (await A.promiseClose(a.chatId, id)) ? { code: 'ok' } : staleOf(deps, a)
     case 'person.follow': {
       const pid = a.params?.pid
-      if (typeof pid !== 'string' || pid === '') return 'bad_request'
-      return (await A.personFollow(a.chatId, pid)) ? 'ok' : 'stale'
+      if (typeof pid !== 'string' || pid === '') return { code: 'bad_request', reason: 'pid_required' }
+      return (await A.personFollow(a.chatId, pid)) ? { code: 'ok' } : staleOf(deps, a)
     }
     case 'person.unfollow': {
       const pid = a.params?.pid
-      if (typeof pid !== 'string' || pid === '') return 'bad_request'
-      return (await A.personUnfollow(a.chatId, pid)) ? 'ok' : 'stale'
+      if (typeof pid !== 'string' || pid === '') return { code: 'bad_request', reason: 'pid_required' }
+      return (await A.personUnfollow(a.chatId, pid)) ? { code: 'ok' } : staleOf(deps, a)
     }
     case 'report.regen': {
       const dateKey = a.params?.dateKey
       const kind = (a.params?.kind ?? 'daily') as ReportKind
-      if (typeof dateKey !== 'string' || dateKey === '') return 'bad_request'
-      return (await A.reportRegen(a.chatId, dateKey, kind)) ? 'ok' : 'stale'
+      if (typeof dateKey !== 'string' || dateKey === '') return { code: 'bad_request', reason: 'dateKey_required' }
+      return (await A.reportRegen(a.chatId, dateKey, kind)) ? { code: 'ok' } : staleOf(deps, a)
     }
     case 'task.mark':
     case 'promise.mark': {
-      if (!deps.marks) return 'unsupported'
+      if (!deps.marks) return { code: 'unsupported' }
       const status = a.params?.status
-      if (status !== 'completed' && status !== 'incomplete' && status !== 'deleted') return 'bad_request'
+      if (status !== 'completed' && status !== 'incomplete' && status !== 'deleted') return { code: 'bad_request', reason: 'status_required' }
       const kind = a.type === 'task.mark' ? 'task' : 'promise'
-      return (await deps.marks.markTarget(a.chatId, kind, id, status, 'web')) ? 'ok' : 'stale'
+      return (await deps.marks.markTarget(a.chatId, kind, id, status, 'web')) ? { code: 'ok' } : staleOf(deps, a)
     }
     default:
-      return 'unsupported'
+      return { code: 'unsupported' }
   }
 }
 
@@ -192,14 +230,25 @@ export class ActionInbox {
   }
 
   private async process(a: ActionLine): Promise<ActionOutcome> {
-    if (!ACTION_TYPES.includes(a.type as ActionType)) return { actionId: a.actionId, ok: false, code: 'unsupported' }
-    if (!this.deps.groups.includes(a.chatId)) return { actionId: a.actionId, ok: false, code: 'forbidden' }
+    if (!ACTION_TYPES.includes(a.type as ActionType)) {
+      return { actionId: a.actionId, ok: false, code: 'type_not_allowed' }
+    }
+    if (!this.deps.groups.includes(a.chatId)) {
+      return { actionId: a.actionId, ok: false, code: 'chat_not_allowed' }
+    }
     if (a.type !== 'person.follow' && a.type !== 'person.unfollow' && a.type !== 'report.regen') {
-      if (!Number.isInteger(a.targetId) || a.targetId <= 0) return { actionId: a.actionId, ok: false, code: 'bad_request' }
+      if (!Number.isInteger(a.targetId) || a.targetId <= 0) {
+        return { actionId: a.actionId, ok: false, code: 'bad_request', reason: 'targetId_required' }
+      }
+    }
+    // W-7：report.regen 入队前校验（kind/dateKey 按-kind 有效性）——队列零污染
+    if (a.type === 'report.regen') {
+      const bad = validateRegenParams(a.params)
+      if (bad) return { actionId: a.actionId, ok: false, code: 'bad_request', reason: bad }
     }
     try {
-      const code = await dispatchAction(this.deps, a)
-      return { actionId: a.actionId, ok: code === 'ok', code }
+      const out = await dispatchAction(this.deps, a)
+      return { actionId: a.actionId, ok: out.code === 'ok', code: out.code, reason: out.reason }
     } catch (error) {
       this.deps.logger.error(`action-inbox: ${a.actionId} failed: ${String(error).slice(0, 120)}`)
       return { actionId: a.actionId, ok: false, code: 'error' }
