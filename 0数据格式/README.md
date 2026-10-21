@@ -30,6 +30,35 @@ python3 report_cli.py --db sample.db doc add --title "示例文档" --category n
 python3 export_md.py --db sample.db --out ./exports
 ```
 
+## 新机器初始化（bootstrap）
+
+新机器上一条命令得到规范、空的 `1数据` 目录（TECH-bootstrap-新机器构建.md）：
+
+```bash
+git clone <本仓库> && cd 0数据格式
+python3 bootstrap.py --target 1数据        # 缺省即 ./1数据，可省略 --target
+```
+
+产出布局（空库 + 目录骨架，零网络、零真实数据，可重复运行）：
+
+```
+1数据/
+├── knowledge.db      # 真实库，schema 直接以 v6 全量 DDL 创建（user_version=6，全表零行）
+├── docs/             # doc.file_path 的相对根（前端只展示，见「前端只读接入约定」）
+├── exports/          # export_md 默认输出根
+└── media/            # 媒体地址登记的相对根（media.path_kind='archive' 的根）
+```
+
+幂等与版本规范：库已存在则**不重建不修改**——`user_version=6` 打印 OK；`<6` 提示走
+`report_cli.py` 自动链式迁移并仍退出 0；`>6` 报错退出非 0。三个子目录已存在则跳过。
+`--account <wxid>` 为 v0.5 预留的可选参数：提供时 `--target` 即账号根，布局不变；
+多账号/目录重排在 v0.5 窗口另行迁移，脚本不预设。
+
+两点边界：TS 镜像默认路径（如 `~/WeChat/1数据/knowledge.db`）是**运行配置**，
+不在 bootstrap 职责内（PRIVACY 红线：家目录路径不进码）；bootstrap 产出的是
+**空库与目录骨架**，历史数据回填走 2水群 的 `scripts/import-state-to-sqlite.mjs`
+导入器与 `extract_docs_from_reports.py`，均不在本脚本范围。
+
 ## 表关系图（ASCII）
 
 ```
