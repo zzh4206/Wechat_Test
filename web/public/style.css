@@ -1,0 +1,83 @@
+:root {
+  --bg: #f7f7f5;
+  --panel: #ffffff;
+  --text: #1f2328;
+  --muted: #6a737d;
+  --line: #e3e3df;
+  --accent: #2f6fdb;
+  --daily: #2f6fdb;
+  --weekly: #1f9d6b;
+  --monthly: #b7791f;
+  --error: #c0392b;
+  color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #15171a;
+    --panel: #1d2024;
+    --text: #e6e6e3;
+    --muted: #9aa1a9;
+    --line: #2f3338;
+    --accent: #6b9cf0;
+    --daily: #6b9cf0;
+    --weekly: #4cc796;
+    --monthly: #e0a84a;
+    --error: #f07167;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.6 system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+button, select, input { font: inherit; color: inherit; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; }
+button { cursor: pointer; }
+button:disabled { opacity: .4; cursor: default; }
+
+.top { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px; padding: 12px 16px; background: var(--panel); border-bottom: 1px solid var(--line); }
+.top h1 { font-size: 17px; margin: 0; }
+#tabs { display: flex; flex-wrap: wrap; gap: 6px; flex: 1; }
+.tab { border-color: transparent; }
+.tab.active { border-color: var(--accent); color: var(--accent); }
+.chat-pick select { max-width: 60vw; }
+
+main { padding: 16px; max-width: 1400px; margin: 0 auto; }
+.split { display: grid; grid-template-columns: minmax(280px, 380px) 1fr; gap: 16px; align-items: start; }
+@media (max-width: 800px) { .split { grid-template-columns: 1fr; } }
+.side, .detail, .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; min-width: 0; }
+.card { margin-bottom: 12px; }
+.muted { color: var(--muted); }
+.error { color: var(--error); }
+.grow { flex: 1; min-width: 0; }
+.mono { font-family: ui-monospace, Menlo, monospace; font-size: 13px; word-break: break-all; }
+
+.month-nav { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+.calendar { display: grid; grid-template-columns: repeat(7, 1fr); gap: 3px; }
+.wd { text-align: center; font-size: 12px; color: var(--muted); }
+.cell { min-height: 46px; border: 1px solid var(--line); border-radius: 4px; padding: 2px; font-size: 12px; }
+.cell.empty { border: none; }
+.cell.has { border-color: var(--accent); }
+.day { display: block; color: var(--muted); }
+.badges { display: flex; flex-wrap: wrap; gap: 2px; }
+.badge { display: inline-block; font-size: 11px; line-height: 16px; padding: 0 4px; border-radius: 3px; border: none; color: #fff; }
+.badge.daily { background: var(--daily); }
+.badge.weekly { background: var(--weekly); }
+.badge.monthly { background: var(--monthly); }
+
+.list-head, .filters { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; margin: 12px 0 6px; }
+.filters { justify-content: flex-start; }
+.list { list-style: none; margin: 0; padding: 0; }
+.row { display: flex; gap: 6px; align-items: center; width: 100%; text-align: left; border: none; border-bottom: 1px solid var(--line); border-radius: 0; padding: 6px 2px; }
+.pill { font-size: 12px; padding: 0 6px; border-radius: 10px; border: 1px solid var(--line); color: var(--muted); white-space: nowrap; }
+.pill.final { color: var(--weekly); border-color: var(--weekly); }
+.chip { font-size: 12px; padding: 1px 8px; margin: 4px 4px 0 0; }
+
+.detail-head { display: flex; gap: 10px; align-items: flex-start; }
+.detail-head h2 { margin: 0; font-size: 19px; }
+.md { overflow-wrap: anywhere; }
+.md pre { background: var(--bg); padding: 8px; border-radius: 6px; overflow-x: auto; }
+.md code { font-family: ui-monospace, Menlo, monospace; font-size: 13px; }
+.md blockquote { margin: 6px 0; padding-left: 10px; border-left: 3px solid var(--line); color: var(--muted); }
+.md a { color: var(--accent); }
+.md li.depth-1 { margin-left: 1.2em; } .md li.depth-2 { margin-left: 2.4em; } .md li.depth-3, .md li.depth-4 { margin-left: 3.6em; }
+.table-wrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 14px; }
+th, td { border-bottom: 1px solid var(--line); padding: 4px 8px; text-align: left; vertical-align: top; }
+.revisions { margin-top: 16px; border-top: 1px dashed var(--line); font-size: 14px; }

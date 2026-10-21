@@ -1,5 +1,5 @@
 node_modules/
-lib/
+/lib/
 state/
 vendor/*
 !vendor/macos-wechat-export/

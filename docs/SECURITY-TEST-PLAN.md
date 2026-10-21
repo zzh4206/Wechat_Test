@@ -31,6 +31,7 @@
 - `2水群/src/**`（含 `src/source/**`）——全部 TS 源码
 - `2水群/lib/**`——编译产物（仅验证与 src 一致，不单独测）
 - `2水群/cordis.patch.yml`、`tsconfig.json`——配置面
+- `web/**`——本地前端工作台（独立进程，只监听 127.0.0.1；边界由 `tests/web-boundary.test.mjs` 钉死，设计见 [TECH-DESIGN-frontend.md](TECH-DESIGN-frontend.md) §6）
 - 子进程调用形态（spawn 参数、cwd、超时）——即便 CLI 本体在外部仓库
 
 ### 1.2 范围外（但需哨兵监控）
@@ -93,6 +94,10 @@
 | 限流/DoS | — | `token-bucket.test` | 🟡 | → DP-sec-6（边界数值） |
 | 单实例锁 | — | — | 🟡 | → DP-sec-6（锁竞态） |
 | 游标持久化/防重投 | — | `cursor.test`（7 例） | ✅ | — |
+| 本机 Web 服务：token / Host / Origin 三校验 | R2 | `web-server.test`（缺/错 token 401、错 Host 403、错 Origin 403、非 GET 405） | ✅ | — |
+| 本机 Web 服务：白名单 fail-closed | R2 | `web-server.test`（清单缺失/为空 503；白名单外群 403、按 id 枚举读不到） | ✅ | — |
+| 本机 Web 服务：正文 XSS | R4 | `web-server.test`（`<script>` 只作文字、`javascript:` 链接降级）+ `web-boundary.test`（public/ 禁 innerHTML 类原语、无内联脚本） | ✅ | — |
+| 本机 Web 服务：与发送出口隔离 | R1/R3 | `web-boundary.test`（只 import node: 与 web/ 内模块、无子进程/出网、FE-1 零写原语、listen 只认 127.0.0.1）+ `web-server.test`（零写入快照） | ✅ | — |
 
 ---
 

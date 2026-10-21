@@ -9,7 +9,7 @@
  */
 import type { Context } from '@deepseek-ai/cordis'
 import Schema from '@deepseek-ai/schemastery'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { createHash } from 'node:crypto'
 import { existsSync as fsExistsSync, readdirSync as fsReaddirSync, statSync as fsStatSync } from 'node:fs'
 import { execFile } from 'node:child_process'
@@ -54,6 +54,7 @@ import { RegenQueue, REGEN_QUEUE_REL } from './regen-queue.js'
 import { processRegenHead } from './regen-processor.js'
 import { ActionInbox } from './action-inbox.js'
 import { createApprovalWiring } from './approval-wiring.js'
+import { writeWebManifest } from './web-manifest.js'
 import { homedir } from 'node:os'
 // M6：保留期清理（T1.1 遗留）+ A/B 脚手架类型（新增行，不动他人行）
 import { RetentionService } from './retention.js'
@@ -381,6 +382,8 @@ export function apply(ctx: Context, config: PluginConfig): void {
   const store = new Store(stateDir, logger, mirrorPath)
   // 初始化即建目录；失败只记日志，不阻断宿主。
   store.ensureDir('.')
+  // 前端 web 进程的只读清单（白名单 + knowledge.db 路径，设计 §11-Q5 b）；失败只 warn。
+  writeWebManifest(store, { groups: config.groups ?? [], knowledgeDb: mirrorPath ? resolve(mirrorPath) : null })
 
   // —— T3：LLM 调用结构化观测（report/distiller 共用同一记录器；JSONL 落 groups/<chatId>/） ——
   // T9：模型名与价格表在 llmClient 就绪后注入（成本五字段进每行 llm_call）。

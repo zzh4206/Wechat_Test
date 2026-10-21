@@ -1,7 +1,7 @@
 # 技术设计：本地前端工作台（报告回溯 + 待审批收件箱）
 
 - 版本：v0.1（草案，2026-10-21 入库；正文保持 v0.1 原貌，仅分期编号按 [REF-prefixes.md](REF-prefixes.md) 改为 FE-N）
-- 状态：§3 方案 B 已采纳；插件侧服务面（FE-2 的 ActionInbox / ApprovalActions）已落地，web 进程待实施
+- 状态：§3 方案 B 已采纳；插件侧服务面（FE-2 的 ActionInbox / ApprovalActions）已落地；**FE-1 web 进程已落地**（`web/`，启动见 RUNBOOK §14），FE-2 收件箱页 / FE-3 待实施
 - 数据层依据：[`0数据格式/`](../0数据格式/README.md)（本稿写于 schema v0.4，现行为 v6）、`src/group-store.ts`（每群库）
 - 安全依据：[SECURITY-TEST-PLAN.md](SECURITY-TEST-PLAN.md) §0 五条红线
 
@@ -12,6 +12,14 @@
 > - 审批/标记后的报告修订流、`report_revision` / `marking` 表：[DESIGN-approval-marking.md](DESIGN-approval-marking.md)
 > - §11-Q2 已决：`upsertReport` 冲突时保持既有 status（T4 裁定，final 不再被打回 draft）
 > - §11-Q3 已决：`regen-queue` 已泛化 `kind`（daily/weekly/monthly）与 `reason`（`manual`）
+> - §11-Q5 已决：采用 (b)，插件启动时写 `<stateDir>/web/allowed-chats.json`（`src/web-manifest.ts`，含白名单与 knowledge.db 路径）；白名单为空照写，web 进程据此拒绝启动
+>
+> **FE-1 实施与本稿的差异**：
+>
+> - token：环境变量 `LURKER_WEB_TOKEN` 传入（不走命令行参数，免得出现在 `ps` 里）；未设时才随机生成并只打印一次。浏览器经 `#token=` 带入，存 sessionStorage 后从地址栏抹掉
+> - 正文渲染：§4.2「安全渲染为 HTML 片段」与 §6.1「前端禁 innerHTML」相互矛盾，实现取后者——服务端把 Markdown 子集解析为 **JSON 块结构**，前端用 createElement + textContent 搭 DOM，整条链路不解析任何 HTML
+> - 接口：增 `/api/docs/:id`（资料正文）；`/api/inbox`、`/api/evidence`、`/api/actions*` 归 FE-2；对比视图未做
+> - 哨兵：§6.3 各条之外，还限定 web/ 只能 import `node:` 内置与 web/ 内模块、`node:http` 只许取 `createServer`
 
 ---
 

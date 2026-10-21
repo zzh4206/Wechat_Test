@@ -8,6 +8,7 @@
 
 ### Added
 
+- 前端工作台 FE-1（只读回溯，前端设计方案 B）：新增独立 web 进程 `web/server.mjs`（零 npm 依赖、只监听 127.0.0.1、只读打开 knowledge.db / 每群库 / digests，FE-1 零写入），页面含报告月历与详情（修订历史、前后期切换）、资料库、媒体清单、会话要点、人员关注摘要；`/api/*` 校验 token（`LURKER_WEB_TOKEN`）、Host、Origin，严格 CSP、不发 CORS 头；正文经服务端解析为 JSON 块结构、前端只用 textContent 渲染。插件启动时写 `<stateDir>/web/allowed-chats.json`（`src/web-manifest.ts`，白名单 + knowledge.db 路径，设计 §11-Q5 方案 b），web 进程据此做白名单校验、清单缺失或为空拒绝启动。新增哨兵 `tests/web-boundary.test.mjs`（web/ 只 import node: 内置与自身模块、无子进程/出网、零写原语、listen 只认 127.0.0.1、页面禁 innerHTML 类原语）与功能/安全用例 `tests/web-server.test.mjs`；启动与排障见 RUNBOOK §14
 - 前端动作通道加固一批（2026-10-20 前端准备审查 W-1/W-2/W-3/W-9）：收件箱水位改**字节偏移**（`web/actions.offset` 存 `{byteOffset, lastActionId}`，每行处理后立即落盘；截断/轮转 → 从头 resync + error 审计、actionId 连续性锚点不符 → resync + warn、尾部半行不消费）——修回设计「水位=字节偏移」口径；审计行增 `operator`（共享 token 的 sha256 前 8 位，新配置 `webActionsToken`，绝不落原 token）；`webActionsEnabled` 开但 task/promise 识别缺失时启动 error 指明缺失依赖与「收件箱不消费」后果；回执写失败入有界内存墓碑下轮补写 + 连续失败 error 告警；RUNBOOK 新增 §13 前端对接硬约定（禁轮转/截断 actions.jsonl、outbox 补丁行读侧归并等）
 - reminder 每日速览 `evidence_ref` 改指 outbox 条目自身（`outbox/<id>`，`appendOutbox` 支持调用方预生成 id）——不再指向从未写入的 `reminder/digest/<day>.txt`（W-11）
 
