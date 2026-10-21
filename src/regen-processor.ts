@@ -109,6 +109,22 @@ export type ManualRegenDeps = Pick<RegenProcessorDeps, 'queue' | 'logger' | 'not
   }
   /** 账号闸：返回 false = 当前错号，跳过本轮（未注入账号闸时恒 true） */
   accountOk?: () => Promise<boolean>
+  /** 日报触达时点 HH:MM（Config.dailyReportTime）：历史日汇总的统计窗口截到该日这一刻 */
+  dailyReportTime?: string
+}
+
+/**
+ * 历史日汇总的统计截止时刻 = 该日原定生成时刻（dateKey 当天 dailyReportTime），且不晚于 now。
+ * 时点缺失/非法时退到该日 24:00。
+ */
+export function summaryCutoff(dateKey: string, dailyReportTime: string | undefined, now: number): number {
+  const d = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateKey)
+  if (!d) return now
+  const t = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(dailyReportTime ?? '')
+  const at = t
+    ? new Date(Number(d[1]), Number(d[2]) - 1, Number(d[3]), Number(t[1]), Number(t[2])).getTime()
+    : new Date(Number(d[1]), Number(d[2]) - 1, Number(d[3]) + 1).getTime()
+  return Math.min(now, at)
 }
 
 /** 处理最早的一条手动重跑（每次一条）。只重新生成报告，不创建 outbox 条目 */
@@ -140,7 +156,7 @@ async function processManualSummary(deps: ManualRegenDeps, entry: RegenEntry): P
   const { chatId, dateKey, kind } = entry
   let s: { path: string | null; groupsIncluded: number } | null = null
   try {
-    s = deps.report.generateSummary ? await deps.report.generateSummary(deps.now(), dateKey) : null
+    s = deps.report.generateSummary ? await deps.report.generateSummary(summaryCutoff(dateKey, deps.dailyReportTime, deps.now()), dateKey) : null
   } catch (error) {
     deps.audit({ result: 'regen_env_deferred', chat_id: chatId, date_key: dateKey, kind, reason: 'manual' })
     deps.logger.warn(`regen-queue: 跨群汇总重跑异常（留在原位） ${dateKey}: ${String(error).slice(0, 120)}`)

@@ -1140,6 +1140,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
             } catch { /* 审计失败不阻塞 */ }
           },
           now: () => Date.now(),
+          dailyReportTime: config.dailyReportTime,
           accountOk: accountGate
             ? async () => {
                 const active = await accountGate.activeAccount()

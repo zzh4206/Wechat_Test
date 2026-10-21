@@ -279,7 +279,7 @@ test('聚合：L1 合并各群判断、L2 每群一节、L3 统一证据；截�
   rmSync(dir, { recursive: true, force: true })
 })
 
-test('聚合回填：generateSummary(asOf, dateKey) 按指定历史日重写该日汇总（读该日各群日报），不写 asOf 当天', async () => {
+test('聚合回填：generateSummary(该日原定生成时刻, dateKey) 重写该日汇总；之后几天的消息不计入统计、不写重跑当天文件', async () => {
   const dir = resolve(mkdtempSync(join(tmpdir(), 'report-agg-backfill-')))
   const gs = new GroupStoreService(dir, { warn() {}, error() {} })
   const store = new Store(dir, { warn() {}, error() {} })
@@ -293,13 +293,19 @@ test('聚合回填：generateSummary(asOf, dateKey) 按指定历史日重写该�
     { msgId: 'g1-c', ts: T(11), senderPid: 'u3', senderName: 'C', text: 'z' },
   ])
   await report.generateReport('g1@chatroom', 'daily', T(20, 30))
+  // 该日 20:30 之后到重跑当天又来了消息：不能算进 2026-06-10 的汇总
+  await gs.appendMessages('g1@chatroom', [
+    { msgId: 'g1-d', ts: T(21), senderPid: 'u1', senderName: 'A', text: '@B 晚上的' },
+    { msgId: 'g1-e', ts: T(10) + 2 * 86_400_000, senderPid: 'u1', senderName: 'A', text: '@B 两天后' },
+  ])
   const later = T(20, 40) + 3 * 86_400_000
-  const sum = await report.generateSummary(later, '2026-06-10')
+  const { summaryCutoff } = await import('../lib/regen-processor.js')
+  const sum = await report.generateSummary(summaryCutoff('2026-06-10', '20:30', later), '2026-06-10')
   assert.equal(sum.path, 'reports/summary/2026-06-10.md')
   const md = readFileSync(join(dir, 'reports', 'summary', '2026-06-10.md'), 'utf8')
   assert.match(md, /# 跨群汇总 · 2026-06-10/)
   assert.match(md, /【g1@chatroom】UI 稿交付时间已提前到周二。/)
-  assert.match(md, /消息 3 条/, '统计窗口锚定该日')
+  assert.match(md, /消息 3 条（关注人物发言 0，@提及 0）/, '统计窗口截到该日 20:30，之后的消息不计入')
   assert.equal(existsSync(join(dir, 'reports', 'summary', '2026-06-13.md')), false)
   gs.dispose()
   report.dispose()

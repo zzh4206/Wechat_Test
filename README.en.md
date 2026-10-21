@@ -32,7 +32,7 @@ One [DSH](https://github.com/deepseek-ai) Cordis plugin plus a zero-data knowled
 | `0数据格式/` | **Pure knowledge-base template**: three-layer schema (`doc` / `report`+`entry` / `chat_digest`) + 3 Python tools. **Nothing is ever entered into it** |
 | `web/` | Local web workbench (separate process, listens on 127.0.0.1 only): read-only browsing of reports by calendar, docs, media, chat digests and watched-person digests, plus an approval inbox (confirm / cancel / complete / set deadline) and report finalize / regenerate / queue-to-outbox (all executed by the plugin's action inbox; queue-to-outbox is off by default and then follows the existing send path). See [RUNBOOK §14](docs/RUNBOOK.md) |
 | `scripts/` | `check-sensitive.sh` (sensitive-data scan), `llm-cost.mjs` (spend roll-up), `import-state-to-sqlite.mjs` (one-shot importer) |
-| `tests/` | 58 test files / 540 cases, fully offline mocks, never touches a real database |
+| `tests/` | 58 test files / 542 cases, fully offline mocks, never touches a real database |
 
 ## Architecture: from chats to knowledge
 
@@ -197,7 +197,7 @@ Rules (full red lines in [`0数据格式/PRIVACY.md`](0数据格式/PRIVACY.md))
 ```bash
 npm install
 npm run build   # tsc → lib/
-npm test        # node --test, 58 files / 540 cases, fully offline mocks
+npm test        # node --test, 58 files / 542 cases, fully offline mocks
 ./scripts/check-sensitive.sh   # must pass before committing; CI enforces it
 ```
 

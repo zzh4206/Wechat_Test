@@ -810,8 +810,9 @@ export class ReportService {
    * - L3：统一证据（各群报告路径 + 引用条数）。
    * 群数 > aggregationMaxGroups：按 rankGroups（默认 相关度+活跃度）取前 N，其余一行带过。
    * 不主动触发各群 LLM 生成——只聚合已存在的报告（缺报告的群计为"未生成"一行带过）。
-   * backfillDateKey：手动重跑历史某日的汇总（前端「重新生成」）——窗口与 generateReport 回填同口径
-   * （[该日前一日 20:20, asOf]），dateKey = 该日，读该日各群日报。
+   * backfillDateKey：手动重跑历史某日的汇总（前端「重新生成」）——窗口 [该日前一日 20:20, asOf]，
+   * dateKey = 该日，读该日各群日报。asOf 由调用方取「该日原定生成时刻」（见 regen-processor
+   * summaryCutoff），否则统计会把之后几天的消息也算进来。
    */
   async generateSummary(asOf?: number, backfillDateKey?: string): Promise<{ path: string | null; groupsIncluded: number; groupsSkipped: number }> {
     if (!this.options.enabled) return { path: null, groupsIncluded: 0, groupsSkipped: 0 }
