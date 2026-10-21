@@ -31,7 +31,7 @@ One [DSH](https://github.com/deepseek-ai) Cordis plugin plus a zero-data knowled
 | `src/` | The plugin: allow-listed reading, per-group buffering, LLM distillation, reports, single controlled send egress, SQLite mirror data layer (`src/db/`) |
 | `0数据格式/` | **Pure knowledge-base template**: three-layer schema (`doc` / `report`+`entry` / `chat_digest`) + 3 Python tools. **Nothing is ever entered into it** |
 | `scripts/` | `check-sensitive.sh` (sensitive-data scan), `llm-cost.mjs` (spend roll-up), `import-state-to-sqlite.mjs` (one-shot importer) |
-| `tests/` | 53 test files / 463 cases, fully offline mocks, never touches a real database |
+| `tests/` | 54 test files / 465 cases, fully offline mocks, never touches a real database |
 
 ## Architecture: from chats to knowledge
 
@@ -196,7 +196,7 @@ Rules (full red lines in [`0数据格式/PRIVACY.md`](0数据格式/PRIVACY.md))
 ```bash
 npm install
 npm run build   # tsc → lib/
-npm test        # node --test, 53 files / 463 cases, fully offline mocks
+npm test        # node --test, 54 files / 465 cases, fully offline mocks
 ./scripts/check-sensitive.sh   # must pass before committing; CI enforces it
 ```
 
