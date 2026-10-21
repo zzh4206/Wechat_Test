@@ -635,7 +635,18 @@ LURKER_WEB_TOKEN='<与插件 webActionsToken 相同的值>' \
 | 60 秒内插件未处理 | — | 插件没在跑或收件箱没开；动作已入队，插件恢复后仍会执行 |
 
 前端只开放这些动作：`task.confirm/cancel/complete/set_deadline`、`event.confirm`、
-`promise.confirm/cancel/fulfilled/close`、`person.follow/unfollow`（插件侧白名单的子集；`report.regen` 等留给 FE-3）。
+`promise.confirm/cancel/fulfilled/close`、`person.follow/unfollow`、`report.finalize`、`report.regen`
+（插件侧白名单的子集）。
+
+**报告操作（FE-3，报告详情页）**——两者都**不发送**：
+
+- 「定稿」`report.finalize`：draft → final，单向。定稿后修订、重新生成照常更新正文，状态保持 final；
+  修订历史记一条 `status`（来源前端）。已定稿再提交回执 `status_conflict`；`sqlitePath='off'` 时回执
+  `unsupported`（定稿状态只存在于 knowledge.db）。
+- 「重新生成」`report.regen`：入手动重跑队列（§12.5 附近「手动重新生成」），插件约 30 秒内开始、
+  LLM 生成需要一会儿，稍后刷新。**只重写报告、不进发件箱**；同一份已在队列中回执 `duplicate`。
+- 参数为 `{kind, dateKey}`，dateKey 必须是周期起点（日报当天、周报周一、月报 1 号）。
+  跨群聚合报告不提供这两个操作（聚合不在群白名单内）。
 
 ### 14.3 拒绝启动 / 接口报错
 

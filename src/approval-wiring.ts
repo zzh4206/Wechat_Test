@@ -71,6 +71,11 @@ export function createApprovalWiring(deps: ApprovalWiringDeps): ApprovalWiring {
         // 完成语义走完整标记链（存在性校验 → 镜像 → 出身日报修订段 → 周/月级联），
         // 与 ActionInbox task.mark 同源；直连 store.mirrorMarking 会跳过校验与修订段
         marks: reportRevision,
+        reports: {
+          finalizeReport: (chatId, kind, periodStart) => store.finalizeReport(chatId, kind, periodStart),
+          recordRevision: (chatId, kind, periodStart, ts, summary, source) =>
+            store.mirrorReport(chatId, kind, periodStart, ts, 'status', { summary, source }),
+        },
       })
     : null
   const resolveInboxTarget: ApprovalWiring['resolveInboxTarget'] = (chatId, kind, id) => {

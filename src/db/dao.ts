@@ -270,6 +270,24 @@ export class KnowledgeDao {
     }
   }
 
+  /**
+   * 定稿（draft → final，单向）：只改 status 与 updated_at，正文不动。
+   * 返回 ok / not_found（无此报告）/ already_final（已定稿，不重复改）/ error。
+   * 与 upsertReport 的 T4 语义配合：定稿后重新生成/修订照常更新正文，status 保持 final。
+   */
+  finalizeReport(periodType: string, periodStart: string, chatId: string): 'ok' | 'not_found' | 'already_final' | 'error' {
+    try {
+      const res = this.db
+        .prepare(`UPDATE report SET status = 'final', updated_at = ? WHERE period_type = ? AND period_start = ? AND chat_id = ? AND status = 'draft'`)
+        .run(this.now(), periodType, periodStart, chatId)
+      if (Number(res.changes) > 0) return 'ok'
+      return this.getReport(periodType, periodStart, chatId) ? 'already_final' : 'not_found'
+    } catch (error) {
+      this.logger.warn(`dao.finalizeReport failed: ${String(error)}`)
+      return 'error'
+    }
+  }
+
   /** chatId 缺省时按 aggregate 语义查（v0.4 唯一键三元组） */
   getReport(periodType: string, periodStart: string, chatId = 'aggregate'): ReportRow | null {
     try {

@@ -8,6 +8,7 @@
 
 ### Added
 
+- 前端工作台 FE-3（报告操作，均不发送）：报告详情页新增「定稿」「重新生成」。插件收件箱新增动作 `report.finalize`（draft → final 单向，`KnowledgeDao.finalizeReport` → Store 透传，记一条 `status` 修订；已定稿回执 `status_conflict`、未启用知识库镜像回执 `unsupported`），对话框通道同步暴露 `reportFinalize`；前端开放 `report.finalize` / `report.regen`，参数 `{kind, dateKey}` 两侧同口径校验（周报须周一、月报须 1 号）。重新生成只入手动重跑队列、不进发件箱。「排入发件箱」另行实施
 - 前端工作台 FE-2（审批收件箱）：「审批」页列出各白名单群待确认的任务/承诺/事件、无时限任务与进行中事项，带证据预览与前后文；可确认、取消、完成、定时间、兑现、关闭，「人员关注」页可关注/取消关注成员。提交经 `POST /api/actions` 追加到 `web/actions.jsonl`（web 进程唯一写入点 `web/lib/actions.mjs`，拒绝符号链接），插件收件箱执行后页面轮询回执显示结果。写动作要求共享 token（`LURKER_WEB_TOKEN` = `webActionsToken`，web 进程比对清单里的 token 指纹，不一致或插件未配 token 即只读）、插件收件箱开启（清单新增 `actionsEnabled` / `operator`）、本服务 Origin 与 JSON 请求体；审计对齐：动作行带 `operator`，插件配置了 token 时不一致即回执 `operator_mismatch` 不执行、审计另记 `claimedOperator`——审计 operator 一定对应浏览器实际使用的 token；web-boundary 哨兵加钉动作模块只许追加写。启动与开启方法见 RUNBOOK §14
 - 前端工作台 FE-1（只读回溯，前端设计方案 B）：新增独立 web 进程 `web/server.mjs`（零 npm 依赖、只监听 127.0.0.1、只读打开 knowledge.db / 每群库 / digests，FE-1 零写入），页面含报告月历与详情（修订历史、前后期切换）、资料库、媒体清单、会话要点、人员关注摘要；`/api/*` 校验 token（`LURKER_WEB_TOKEN`）、Host、Origin，严格 CSP、不发 CORS 头；正文经服务端解析为 JSON 块结构、前端只用 textContent 渲染。插件启动时写 `<stateDir>/web/allowed-chats.json`（`src/web-manifest.ts`，白名单 + knowledge.db 路径，设计 §11-Q5 方案 b），web 进程据此做白名单校验、清单缺失或为空拒绝启动。新增哨兵 `tests/web-boundary.test.mjs`（web/ 只 import node: 内置与自身模块、无子进程/出网、零写原语、listen 只认 127.0.0.1、页面禁 innerHTML 类原语）与功能/安全用例 `tests/web-server.test.mjs`；启动与排障见 RUNBOOK §14
 - 前端动作通道加固一批（2026-10-20 前端准备审查 W-1/W-2/W-3/W-9）：收件箱水位改**字节偏移**（`web/actions.offset` 存 `{byteOffset, lastActionId}`，每行处理后立即落盘；截断/轮转 → 从头 resync + error 审计、actionId 连续性锚点不符 → resync + warn、尾部半行不消费）——修回设计「水位=字节偏移」口径；审计行增 `operator`（共享 token 的 sha256 前 8 位，新配置 `webActionsToken`，绝不落原 token）；`webActionsEnabled` 开但 task/promise 识别缺失时启动 error 指明缺失依赖与「收件箱不消费」后果；回执写失败入有界内存墓碑下轮补写 + 连续失败 error 告警；RUNBOOK 新增 §13 前端对接硬约定（禁轮转/截断 actions.jsonl、outbox 补丁行读侧归并等）
@@ -20,6 +21,7 @@
 
 ### Fixed
 
+- 收件箱 `report.regen` 去重回执：同一报告已在重跑队列时原被映射为 `not_found`（「目标不存在」），改为 `duplicate`
 - 补发队列手动重跑（reason=`manual`，对话框/前端「重新生成」）：原消费端不看 reason——已有正常报告时被判 satisfied 直接出队（重跑无效）；只在日报调度 tick 且配置了账号闸时才处理（最长等一天，未配账号闸永不处理）；生成后自动创建 outbox 条目进发送链路（重跑即发送）。改为独立轮询 `startManualRegen` 处理手动条目：不做 satisfied 检查、空产出不重试、**不进 outbox**，错号在线时跳过本轮；错号补发（`wrong_account`）语义不变，且不再被排在前面的手动条目阻塞。顺带修正错号补发按条目周期处理：satisfied 检查原固定查日报 meta、重试计数原按 daily 落盘（周报条目会原地无限重试）、outbox kind/标题原固定为日报；`regen-queue.json` 载入过滤的运算优先级错误（缺字段的 weekly/monthly 坏行被放行），旧版无 reason 条目视为错号补发
 - 前端收件箱回执：前端动作调审批门面时没传 `source`，落到缺省 `'chat'`，前端审批在修订段被记成「来源：对话框」——改为显式传 `'web'`；生产接线没给 `ActionInbox` 注入 `resolveTarget`，已处理过的目标一律回 `not_found`（且 `event.*` 被当任务 id 查）——`createApprovalWiring` 新增 `resolveInboxTarget` 并注入，按 task/promise/event 区分，已处理过的回 `status_conflict`
 - 前端工作台页面：可选内容为空时出现文字「null」（原生 `replaceChildren` 不跳过 null）——改用过滤空值的 `fill()`

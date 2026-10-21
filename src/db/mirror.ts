@@ -210,6 +210,8 @@ export interface SqliteMirror {
    * 演变 = 追加新行（不可变事实），最新态由 v_marking_latest 承载。
    */
   mirrorMarking(chatId: string, kind: 'done' | 'undone' | 'deleted', targetRef: string, ts: number, opts?: { source?: 'chat' | 'web'; sourceKey?: string }): boolean
+  /** 报告定稿（draft → final 单向；knowledge.db 是 status 的唯一存放处） */
+  finalizeReport(chatId: string, periodType: ReportKindName, periodStart: string): 'ok' | 'not_found' | 'already_final' | 'error'
   /** 修订读侧（报告渲染的修订段；单一查询副本 = knowledge.db） */
   listRevisions(chatId: string, periodType: string, periodStart: string): Array<{ ts: number; type: string; summary: string | null; source: string }>
   /** marking 最新态读侧（完成情况段；v_marking_latest） */
@@ -422,6 +424,10 @@ export function createSqliteMirror(sqlitePath: string | undefined, logger: DbLog
         logger.warn(`mirror: reportRevision 写入失败：${String(error).slice(0, 120)}`)
         return false
       }
+    },
+
+    finalizeReport(chatId, periodType, periodStart) {
+      return dao.finalizeReport(periodType, periodStart, chatId)
     },
 
     mirrorMarking(chatId, kind, targetRef, ts, opts) {

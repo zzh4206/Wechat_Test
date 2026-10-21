@@ -24,7 +24,23 @@ const byTarget = () => null
 const byDeadline = (p) => (Number.isInteger(p?.deadline) && p.deadline >= DEADLINE_MIN && p.deadline < DEADLINE_MAX ? { deadline: p.deadline } : 'deadline_invalid')
 const byPid = (p) => (typeof p?.pid === 'string' && ID_RE.test(p.pid) ? { pid: p.pid } : 'pid_invalid')
 
-/** FE-2 动作白名单：type → [是否需要 targetId, 参数校验（返回 params / null=无参数 / string=错误原因）] */
+/**
+ * 报告周期参数（与插件 validateRegenParams 同口径）：kind 三选一；dateKey 为周期起点——
+ * 日报当天、周报周一、月报 1 号。日期按字面校验（不经时区换算）。
+ */
+const byReportPeriod = (p) => {
+  const kind = p?.kind
+  const dateKey = p?.dateKey
+  if (kind !== 'daily' && kind !== 'weekly' && kind !== 'monthly') return 'kind_not_allowed'
+  if (typeof dateKey !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) return 'date_format'
+  const d = new Date(`${dateKey}T00:00:00Z`)
+  if (Number.isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== dateKey) return 'date_format'
+  if (kind === 'weekly' && d.getUTCDay() !== 1) return 'not_monday'
+  if (kind === 'monthly' && d.getUTCDate() !== 1) return 'not_month_start'
+  return { kind, dateKey }
+}
+
+/** 前端动作白名单（FE-2 审批 + FE-3 报告操作）：type → [是否需要 targetId, 参数校验（返回 params / null=无参数 / string=错误原因）] */
 export const WEB_ACTIONS = Object.freeze({
   'task.confirm': [true, byTarget],
   'task.cancel': [true, byTarget],
@@ -37,6 +53,9 @@ export const WEB_ACTIONS = Object.freeze({
   'promise.close': [true, byTarget],
   'person.follow': [false, byPid],
   'person.unfollow': [false, byPid],
+  // FE-3：报告定稿 / 重新生成（重新生成只重写报告、不进发件箱——插件侧手动重跑语义）
+  'report.finalize': [false, byReportPeriod],
+  'report.regen': [false, byReportPeriod],
 })
 
 /**

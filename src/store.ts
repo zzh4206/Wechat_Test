@@ -50,6 +50,13 @@ export class Store {
     return this.mirror?.mirrorReportRevision(chatId, periodType, periodStart, ts, type, opts) ?? false
   }
 
+  /**
+   * 报告定稿透传（draft → final）。status 只存在于 knowledge.db：未启用镜像返回 'unavailable'。
+   */
+  finalizeReport(chatId: string, periodType: 'daily' | 'weekly' | 'monthly', periodStart: string): 'ok' | 'not_found' | 'already_final' | 'error' | 'unavailable' {
+    return this.mirror?.finalizeReport(chatId, periodType, periodStart) ?? 'unavailable'
+  }
+
   /** marking 镜像透传（单一查询副本架构：ReportRevisionService 直连；未启用镜像返回 false） */
   mirrorMarking(chatId: string, kind: 'done' | 'undone' | 'deleted', targetRef: string, ts: number, opts?: { source?: 'chat' | 'web'; sourceKey?: string }): boolean {
     return this.mirror?.mirrorMarking(chatId, kind, targetRef, ts, opts) ?? false

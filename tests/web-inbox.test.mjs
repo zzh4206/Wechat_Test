@@ -18,6 +18,8 @@ const { createApprovalWiring } = await import('../lib/approval-wiring.js')
 const { ActionInbox } = await import('../lib/action-inbox.js')
 const { writeWebManifest } = await import('../lib/web-manifest.js')
 const { reportRelPath } = await import('../lib/report.js')
+const { RegenQueue } = await import('../lib/regen-queue.js')
+const { Outbox } = await import('../lib/outbox.js')
 
 const CHAT = '12345678@chatroom'
 const OUTSIDE = '1234567890@chatroom'
@@ -37,7 +39,12 @@ async function makeEnv({ allowActions = true, actionsEnabled = true, pluginToken
   const llm = { async complete() { return '{}' } }
   const task = new TaskRecognitionService({ groupStore, llm, logger, enabled: true, store })
   const promise = new PromiseRecognitionService({ groupStore, llm, logger, enabled: true })
-  const { reportRevision, approvalActions, resolveInboxTarget } = createApprovalWiring({ store, groupStore, task, promise, notify: () => {}, logger })
+  const regenQueue = new RegenQueue({ store, logger })
+  const { reportRevision, approvalActions, resolveInboxTarget } = createApprovalWiring({
+    store, groupStore, task, promise, notify: () => {}, logger,
+    // 与 index.ts 同口径：前端/对话框重跑一律 reason='manual'
+    enqueueReportRegen: (c, d, k) => regenQueue.enqueue(c, d, Date.now(), k, 'manual') !== 'deduped',
+  })
   const inbox = new ActionInbox({
     store, actions: approvalActions, groups: [CHAT], logger, resolveTarget: resolveInboxTarget, operator: pluginOperator,
     marks: { markTarget: (c, k, id, s, src) => reportRevision.markTarget(c, k, id, s, src) },
@@ -64,7 +71,7 @@ async function makeEnv({ allowActions = true, actionsEnabled = true, pluginToken
   const self = `http://127.0.0.1:${port}`
   const headers = (extra = {}) => ({ host: `127.0.0.1:${port}`, authorization: `Bearer ${TOKEN}`, ...extra })
   return {
-    dir, port, store, groupStore, inbox, ids: { pendingTask, undatedTask, pendingPromise, pendingEvent },
+    dir, port, store, groupStore, inbox, regenQueue, ids: { pendingTask, undatedTask, pendingPromise, pendingEvent },
     get: (path) => call(port, 'GET', path, headers()),
     post: (body, extra = { origin: self, 'content-type': 'application/json' }) => call(port, 'POST', '/api/actions', headers(extra), typeof body === 'string' ? body : JSON.stringify(body)),
     async stop() {
@@ -203,7 +210,7 @@ test('写请求：白名单外类型/群、非法 targetId/deadline/pid、超大
   const env = await makeEnv()
   try {
     const cases = [
-      [{ type: 'report.regen', chatId: CHAT, params: { kind: 'daily', dateKey: '2026-10-14' } }, 400, 'type_not_allowed'],
+      [{ type: 'task.rewrite', chatId: CHAT, targetId: 1, params: { text: 'x' } }, 400, 'type_not_allowed'],
       [{ type: '__proto__', chatId: CHAT, targetId: 1 }, 400, 'type_not_allowed'],
       [{ type: 'task.confirm', chatId: OUTSIDE, targetId: 1 }, 403, 'chat_not_allowed'],
       [{ type: 'task.confirm', chatId: 'aggregate', targetId: 1 }, 403, 'chat_not_allowed'],
@@ -312,5 +319,61 @@ test('插件侧兜底：入队后插件换了 token（清单未及刷新）→ o
     await rotated.poll()
     assert.deepEqual((await env.get(`/api/actions/${p.body.actionId}`)).body, { actionId: p.body.actionId, status: 'done', ok: false, code: 'operator_mismatch' })
     assert.equal(env.groupStore.getTask(CHAT, env.ids.pendingTask).status, 'pending_confirm', '未执行')
+  } finally { await env.stop() }
+})
+
+// —— FE-3：报告定稿 / 重新生成 ——
+
+test('定稿闭环：前端提交 → 插件定稿 → 详情页 status=final 且修订历史有定稿记录；重复定稿 status_conflict', async () => {
+  const env = await makeEnv()
+  try {
+    env.store.writeReport('daily', CHAT, ORIGIN_KEY, `# 日报 ${ORIGIN_KEY}\n\n正文\n`)
+    const list = (await env.get(`/api/reports?chat=${encodeURIComponent(CHAT)}`)).body
+    const rep = list.find(r => r.periodStart === ORIGIN_KEY && r.periodType === 'daily')
+    assert.equal(rep.status, 'draft')
+    const p = await env.post({ type: 'report.finalize', chatId: CHAT, params: { kind: 'daily', dateKey: ORIGIN_KEY } })
+    assert.equal(p.status, 202)
+    assert.deepEqual(actionLines(env.dir).at(-1).params, { kind: 'daily', dateKey: ORIGIN_KEY })
+    await env.inbox.poll()
+    assert.equal((await env.get(`/api/actions/${p.body.actionId}`)).body.code, 'ok')
+    const detail = (await env.get(`/api/reports/${rep.id}`)).body
+    assert.equal(detail.status, 'final')
+    assert.ok(detail.revisions.some(v => v.type === 'status' && v.source === 'web'), '修订历史记定稿（来源前端）')
+    const again = await env.post({ type: 'report.finalize', chatId: CHAT, params: { kind: 'daily', dateKey: ORIGIN_KEY } })
+    await env.inbox.poll()
+    assert.equal((await env.get(`/api/actions/${again.body.actionId}`)).body.code, 'status_conflict')
+  } finally { await env.stop() }
+})
+
+test('重新生成：前端提交 → 插件入手动重跑队列（reason=manual）；不进发件箱；重复提交 duplicate', async () => {
+  const env = await makeEnv()
+  try {
+    const a = await env.post({ type: 'report.regen', chatId: CHAT, params: { kind: 'weekly', dateKey: '2026-10-12' } })
+    const b = await env.post({ type: 'report.regen', chatId: CHAT, params: { kind: 'weekly', dateKey: '2026-10-12' } })
+    await env.inbox.poll()
+    assert.equal((await env.get(`/api/actions/${a.body.actionId}`)).body.code, 'ok')
+    assert.equal((await env.get(`/api/actions/${b.body.actionId}`)).body.code, 'duplicate')
+    assert.deepEqual(env.regenQueue.list().map(e => [e.kind, e.dateKey, e.reason]), [['weekly', '2026-10-12', 'manual']])
+    assert.equal(new Outbox({ store: env.store }).listOutbox().length, 0, '入队即止，发件箱零条目')
+  } finally { await env.stop() }
+})
+
+test('报告操作参数校验：周报须周一、月报须 1 号、非法日期/周期、聚合与白名单外群 → 拒绝且零落盘', async () => {
+  const env = await makeEnv()
+  try {
+    const cases = [
+      [{ type: 'report.finalize', chatId: CHAT, params: { kind: 'weekly', dateKey: '2026-10-14' } }, 400, 'not_monday'],
+      [{ type: 'report.regen', chatId: CHAT, params: { kind: 'monthly', dateKey: '2026-10-02' } }, 400, 'not_month_start'],
+      [{ type: 'report.regen', chatId: CHAT, params: { kind: 'daily', dateKey: '2026-02-30' } }, 400, 'date_format'],
+      [{ type: 'report.regen', chatId: CHAT, params: { kind: 'yearly', dateKey: '2026-01-01' } }, 400, 'kind_not_allowed'],
+      [{ type: 'report.finalize', chatId: 'aggregate', params: { kind: 'daily', dateKey: ORIGIN_KEY } }, 403, undefined],
+      [{ type: 'report.finalize', chatId: OUTSIDE, params: { kind: 'daily', dateKey: ORIGIN_KEY } }, 403, undefined],
+    ]
+    for (const [body, status, reason] of cases) {
+      const r = await env.post(body)
+      assert.equal(r.status, status, JSON.stringify(body))
+      if (reason) assert.equal(r.body.reason, reason)
+    }
+    assert.equal(actionLines(env.dir).length, 0)
   } finally { await env.stop() }
 })

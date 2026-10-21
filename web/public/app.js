@@ -154,7 +154,10 @@ async function loadReports() {
           r.revisionCount ? h('span', { class: 'pill' }, `修订 ${r.revisionCount}`) : null,
           h('span', { class: `pill ${r.status}` }, r.status === 'final' ? '定稿' : '草稿')))))),
     detail))
-  if (list[0]) openReport(list[0].id, detail)
+  // 操作后整页刷新时回到原来那份报告（state.reopen），否则打开本月最新一期
+  const pick = list.find(x => x.id === state.reopen) ?? list[0]
+  state.reopen = null
+  if (pick) openReport(pick.id, detail)
 }
 
 async function openReport(id, into) {
@@ -167,6 +170,7 @@ async function openReport(id, into) {
           h('h2', {}, r.title),
           h('p', { class: 'muted' }, `${chatLabel(r.chatId)} · ${PERIOD_NAME[r.periodType]} ${r.periodStart}${r.periodEnd !== r.periodStart ? ` – ${r.periodEnd}` : ''} · ${r.status === 'final' ? '定稿' : '草稿'} · 更新于 ${fmtTime(r.updatedAt)}`)),
         h('button', { type: 'button', disabled: !r.next, onclick: () => r.next && openReport(r.next.id, into) }, r.next ? `${r.next.periodStart} ›` : '›')),
+      reportActions(r, into),
       h('article', { class: 'md' }, renderBlocks(r.blocks)),
       r.revisions.length
         ? h('section', { class: 'revisions' }, h('h3', {}, `修订历史（${r.revisions.length}）`),
@@ -175,6 +179,34 @@ async function openReport(id, into) {
   } catch (err) {
     showError(err, into)
   }
+}
+
+// —— 报告操作（FE-3：定稿 / 重新生成；均不发送） ——
+
+/** 详情页操作条。跨群聚合不是群，插件白名单里没有它，不提供操作 */
+function reportActions(r, into) {
+  if (r.chatId === AGGREGATE) return null
+  const status = h('span', { class: 'status' })
+  const buttons = []
+  const params = { kind: r.periodType, dateKey: r.periodStart }
+  const label = `${PERIOD_NAME[r.periodType]} ${r.periodStart}`
+  const finalize = r.status === 'draft'
+    ? h('button', { type: 'button', class: 'primary', disabled: !state.actions.enabled, onclick: async () => {
+        if (!confirm(`把「${label}」定稿？定稿是单向的，之后不能改回草稿（修订和重新生成仍会更新正文）。`)) return
+        const ok = await submitAction({ type: 'report.finalize', chatId: r.chatId, params }, status, buttons,
+          { ok: '已定稿', status_conflict: '已是定稿' })
+        if (ok) setTimeout(() => { state.reopen = r.id; load() }, 800) // 整页刷新：左侧列表的草稿/定稿标签同步
+      } }, '定稿')
+    : null
+  const regen = h('button', { type: 'button', disabled: !state.actions.enabled, onclick: async () => {
+    if (!confirm(`重新生成「${label}」？会用当前消息重写正文（${r.status === 'final' ? '定稿状态保持；' : ''}修订历史保留），不会发送。`)) return
+    await submitAction({ type: 'report.regen', chatId: r.chatId, params }, status, buttons,
+      { ok: '已排入重新生成：插件约 30 秒内开始，LLM 生成需要一会儿，稍后刷新查看', duplicate: '已在重新生成队列中' })
+  } }, '重新生成')
+  if (finalize) buttons.push(finalize)
+  buttons.push(regen)
+  return h('div', { class: 'actions report-actions' }, finalize, regen, status,
+    state.actions.enabled ? null : h('span', { class: 'muted' }, '（只读模式）'))
 }
 
 // —— 审批收件箱（FE-2） ——
@@ -186,10 +218,10 @@ const RESULT_WAIT_MS = 60000
 const sleep = (ms) => new Promise(ok => setTimeout(ok, ms))
 
 /**
- * 提交一条动作并等回执：status 元素依次显示「已提交…」→ 结果。
+ * 提交一条动作并等回执：status 元素依次显示「已提交…」→ 结果（texts 可按回执码覆盖文案）。
  * 插件按 webActionsPollSec（默认 5s）轮询，超过 60s 没回执多半是插件没在跑。
  */
-async function submitAction(action, statusEl, buttons) {
+async function submitAction(action, statusEl, buttons, texts = {}) {
   for (const b of buttons) b.disabled = true
   statusEl.className = 'status'
   statusEl.textContent = '已提交，等待插件处理…'
@@ -201,7 +233,7 @@ async function submitAction(action, statusEl, buttons) {
       const r = await api(`actions/${actionId}`)
       if (r.status === 'done') {
         statusEl.className = r.ok ? 'status ok' : 'status error'
-        statusEl.textContent = RESULT_TEXT[r.code] ?? r.code
+        statusEl.textContent = texts[r.code] ?? RESULT_TEXT[r.code] ?? r.code
         if (!r.ok) for (const b of buttons) b.disabled = false
         return r.ok
       }

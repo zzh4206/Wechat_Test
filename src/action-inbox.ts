@@ -26,7 +26,7 @@ export const ACTION_TYPES = [
   'event.confirm',
   'promise.confirm', 'promise.cancel', 'promise.fulfilled', 'promise.close',
   'person.follow', 'person.unfollow',
-  'report.regen',
+  'report.regen', 'report.finalize',
   'task.mark', 'promise.mark',
 ] as const
 export type ActionType = (typeof ACTION_TYPES)[number]
@@ -194,7 +194,17 @@ export async function dispatchAction(
       const dateKey = a.params?.dateKey
       const kind = (a.params?.kind ?? 'daily') as ReportKind
       if (typeof dateKey !== 'string' || dateKey === '') return { code: 'bad_request', reason: 'dateKey_required' }
-      return (await A.reportRegen(a.chatId, dateKey, kind)) ? { code: 'ok' } : staleOf(deps, a)
+      // false = 同一 (chatId, dateKey, kind) 已在重跑队列（去重）；不是目标不存在，不能走 staleOf
+      return (await A.reportRegen(a.chatId, dateKey, kind)) ? { code: 'ok' } : { code: 'duplicate', reason: 'already_queued' }
+    }
+    case 'report.finalize': {
+      // 参数已在 process() 经 validateRegenParams 校验（kind 枚举 + dateKey 为周期起点）
+      const r = await A.reportFinalize(a.chatId, String(a.params?.dateKey), a.params?.kind as ReportKind, 'web')
+      if (r === 'ok') return { code: 'ok' }
+      if (r === 'already_final') return { code: 'status_conflict', reason: 'already_final' }
+      if (r === 'not_found') return { code: 'not_found' }
+      if (r === 'unavailable') return { code: 'unsupported', reason: 'knowledge_db_off' }
+      return { code: 'error' }
     }
     case 'task.mark':
     case 'promise.mark': {
@@ -364,13 +374,13 @@ export class ActionInbox {
     if (!this.deps.groups.includes(a.chatId)) {
       return { actionId: a.actionId, ok: false, code: 'chat_not_allowed' }
     }
-    if (a.type !== 'person.follow' && a.type !== 'person.unfollow' && a.type !== 'report.regen') {
+    if (a.type !== 'person.follow' && a.type !== 'person.unfollow' && a.type !== 'report.regen' && a.type !== 'report.finalize') {
       if (!Number.isInteger(a.targetId) || a.targetId <= 0) {
         return { actionId: a.actionId, ok: false, code: 'bad_request', reason: 'targetId_required' }
       }
     }
-    // W-7：report.regen 入队前校验（kind/dateKey 按-kind 有效性）——队列零污染
-    if (a.type === 'report.regen') {
+    // W-7：report.regen / report.finalize 执行前校验（kind/dateKey 按-kind 有效性）——队列零污染
+    if (a.type === 'report.regen' || a.type === 'report.finalize') {
       const bad = validateRegenParams(a.params)
       if (bad) return { actionId: a.actionId, ok: false, code: 'bad_request', reason: bad }
     }

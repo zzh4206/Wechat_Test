@@ -1,7 +1,7 @@
 # 技术设计：本地前端工作台（报告回溯 + 待审批收件箱）
 
 - 版本：v0.1（草案，2026-10-21 入库；正文保持 v0.1 原貌，仅分期编号按 [REF-prefixes.md](REF-prefixes.md) 改为 FE-N）
-- 状态：§3 方案 B 已采纳；插件侧服务面（FE-2 的 ActionInbox / ApprovalActions）已落地；**FE-1 / FE-2 已落地**（`web/`，启动与开启审批见 RUNBOOK §14），FE-3 待实施
+- 状态：§3 方案 B 已采纳；插件侧服务面（FE-2 的 ActionInbox / ApprovalActions）已落地；**FE-1 / FE-2 已落地**（`web/`，启动与开启审批见 RUNBOOK §14）；FE-3 已落地定稿与重新生成，「排入发件箱」待实施（单独 PR，带默认关闭的插件侧开关）
 - 数据层依据：[`0数据格式/`](../0数据格式/README.md)（本稿写于 schema v0.4，现行为 v6）、`src/group-store.ts`（每群库）
 - 安全依据：[SECURITY-TEST-PLAN.md](SECURITY-TEST-PLAN.md) §0 五条红线
 
@@ -28,6 +28,12 @@
 > - 前端只开放插件白名单的子集（见 RUNBOOK §14.2）；`actionId` 由服务端生成，不信任请求体
 > - 动作类型沿用插件侧命名（`task.set_deadline`，非本稿 §5 的 `task.setDeadline`）
 > - 收件箱除待确认三类外，还列进行中的任务/承诺（完成、兑现、关闭），无时限任务单列「待定时间」
+>
+> **FE-3（定稿、重新生成）实施与本稿的差异**：
+>
+> - 定稿走插件收件箱新动作 `report.finalize`（不是 §5 设想的 web 侧直调 `setReportStatus`）：参数为 `{kind, dateKey}`（周期起点），与 `report.regen` 同一校验，不依赖 knowledge.db 行号；定稿记一条 `status` 修订
+> - 重新生成只入手动重跑队列、**不进发件箱**（补发队列修正后的语义）；推送到手机只能走「排入发件箱」一个入口
+> - 跨群聚合报告暂不提供这两个操作
 
 ---
 

@@ -342,6 +342,8 @@ export interface GroupLurker {
     personFollow(chatId: string, pid: string): Promise<boolean>
     personUnfollow(chatId: string, pid: string): Promise<boolean>
     reportRegen(chatId: string, dateKey: string, kind: 'daily' | 'weekly' | 'monthly'): Promise<boolean>
+    /** 报告定稿（draft → final 单向）；periodStart = 周期起点 */
+    reportFinalize(chatId: string, periodStart: string, kind: 'daily' | 'weekly' | 'monthly'): Promise<'ok' | 'not_found' | 'already_final' | 'unavailable' | 'error'>
   } | null
   /** 只读运行状态（W-6） */
   readonly inboxStatus: () => { enabled: boolean; ready: { taskRecognition: boolean; promiseRecognition: boolean }; backlog: number; offset: number; lastError: string | null }
@@ -1028,6 +1030,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
           personFollow: (chatId: string, pid: string) => approvalActions.personFollow(chatId, pid),
           personUnfollow: (chatId: string, pid: string) => approvalActions.personUnfollow(chatId, pid),
           reportRegen: (chatId: string, dateKey: string, kind: 'daily' | 'weekly' | 'monthly') => approvalActions.reportRegen(chatId, dateKey, kind),
+          reportFinalize: (chatId: string, periodStart: string, kind: 'daily' | 'weekly' | 'monthly') => approvalActions.reportFinalize(chatId, periodStart, kind),
         }
       : null,
     inboxStatus: () =>
