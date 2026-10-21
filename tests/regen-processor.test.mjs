@@ -227,3 +227,26 @@ test('队列载入：旧版无 reason 条目视为错号补发；缺字段的 we
   assert.deepEqual(q.list().map(e => [e.dateKey, e.reason]), [[DAY, 'wrong_account']])
   rmSync(dir, { recursive: true, force: true })
 })
+
+test('手动重跑跨群汇总：改调 generateSummary(now, dateKey)，不调 generateReport、不进 outbox；未接 generateSummary → manual_failed 出队', async () => {
+  const env = makeEnv([])
+  const calls = []
+  env.deps.report.generateReport = async () => { throw new Error('聚合不应调用 generateReport') }
+  env.deps.report.generateSummary = async (asOf, dateKey) => { calls.push([asOf, dateKey]); return { path: `reports/summary/${dateKey}.md`, groupsIncluded: 2, groupsSkipped: 0 } }
+  env.queue.enqueue('aggregate', DAY, 1, 'daily', 'manual')
+  const r = await processManualRegen(env.deps)
+  assert.equal(r.action, 'manual_regenerated')
+  assert.deepEqual(calls, [[5000, DAY]])
+  assert.equal(env.queue.list().length, 0)
+  assert.equal(env.outbox.listOutbox().length, 0)
+  assert.deepEqual([env.audits[0].result, env.audits[0].chat_id], ['regen_manual_done', 'aggregate'])
+  // 写入失败（path=null）或未接 generateSummary：如实出队，不无限重试
+  env.deps.report.generateSummary = async () => ({ path: null, groupsIncluded: 0, groupsSkipped: 0 })
+  env.queue.enqueue('aggregate', DAY, 2, 'daily', 'manual')
+  assert.equal((await processManualRegen(env.deps)).action, 'manual_failed')
+  delete env.deps.report.generateSummary
+  env.queue.enqueue('aggregate', DAY, 3, 'daily', 'manual')
+  assert.equal((await processManualRegen(env.deps)).action, 'manual_failed')
+  assert.equal(env.queue.list().length, 0)
+  rmSync(env.dir, { recursive: true, force: true })
+})

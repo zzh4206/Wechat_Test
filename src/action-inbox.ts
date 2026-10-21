@@ -14,6 +14,7 @@
 import type { Store } from './store.js'
 import type { StoreLogger } from './store.js'
 import type { ApprovalActions, ReportKind } from './approval-actions.js'
+import { AGGREGATE_CHAT_ID } from './regen-processor.js'
 
 export const ACTIONS_REL = 'web/actions.jsonl'
 export const ACTIONS_OFFSET_REL = 'web/actions.offset'
@@ -384,7 +385,9 @@ export class ActionInbox {
     if (!ACTION_TYPES.includes(a.type as ActionType)) {
       return { actionId: a.actionId, ok: false, code: 'type_not_allowed' }
     }
-    if (!this.deps.groups.includes(a.chatId)) {
+    // 跨群汇总不是群、不在白名单里：只放行 report.* 三个报告操作（且只有日报，见下方参数校验）
+    const aggregate = a.chatId === AGGREGATE_CHAT_ID && a.type.startsWith('report.')
+    if (!aggregate && !this.deps.groups.includes(a.chatId)) {
       return { actionId: a.actionId, ok: false, code: 'chat_not_allowed' }
     }
     if (a.type !== 'person.follow' && a.type !== 'person.unfollow' && !a.type.startsWith('report.')) {
@@ -394,7 +397,7 @@ export class ActionInbox {
     }
     // W-7：report.regen / report.finalize / report.toOutbox 执行前校验（kind/dateKey 按-kind 有效性）——队列零污染
     if (a.type.startsWith('report.')) {
-      const bad = validateRegenParams(a.params)
+      const bad = validateRegenParams(a.params) ?? (aggregate && a.params?.kind !== 'daily' ? 'aggregate_daily_only' : null)
       if (bad) return { actionId: a.actionId, ok: false, code: 'bad_request', reason: bad }
     }
     try {

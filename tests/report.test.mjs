@@ -279,6 +279,33 @@ test('聚合：L1 合并各群判断、L2 每群一节、L3 统一证据；截�
   rmSync(dir, { recursive: true, force: true })
 })
 
+test('聚合回填：generateSummary(asOf, dateKey) 按指定历史日重写该日汇总（读该日各群日报），不写 asOf 当天', async () => {
+  const dir = resolve(mkdtempSync(join(tmpdir(), 'report-agg-backfill-')))
+  const gs = new GroupStoreService(dir, { warn() {}, error() {} })
+  const store = new Store(dir, { warn() {}, error() {} })
+  const report = new ReportService({
+    groupStore: gs, store, stateDir: dir, llm: mockLlm([legalOutput(3)]),
+    logger: { warn() {}, error() {} }, enabled: true, groups: ['g1@chatroom'],
+  })
+  await gs.appendMessages('g1@chatroom', [
+    { msgId: 'g1-a', ts: T(9), senderPid: 'u1', senderName: 'A', text: 'x' },
+    { msgId: 'g1-b', ts: T(10), senderPid: 'u2', senderName: 'B', text: 'y' },
+    { msgId: 'g1-c', ts: T(11), senderPid: 'u3', senderName: 'C', text: 'z' },
+  ])
+  await report.generateReport('g1@chatroom', 'daily', T(20, 30))
+  const later = T(20, 40) + 3 * 86_400_000
+  const sum = await report.generateSummary(later, '2026-06-10')
+  assert.equal(sum.path, 'reports/summary/2026-06-10.md')
+  const md = readFileSync(join(dir, 'reports', 'summary', '2026-06-10.md'), 'utf8')
+  assert.match(md, /# 跨群汇总 · 2026-06-10/)
+  assert.match(md, /【g1@chatroom】UI 稿交付时间已提前到周二。/)
+  assert.match(md, /消息 3 条/, '统计窗口锚定该日')
+  assert.equal(existsSync(join(dir, 'reports', 'summary', '2026-06-13.md')), false)
+  gs.dispose()
+  report.dispose()
+  rmSync(dir, { recursive: true, force: true })
+})
+
 test('聚合默认排序：相关度（watch 命中×100 + @提及×10）优先于活跃度；可注入 rankGroups', async () => {
   const dir = resolve(mkdtempSync(join(tmpdir(), 'report-rank-')))
   const gs = new GroupStoreService(dir, { warn() {}, error() {} })

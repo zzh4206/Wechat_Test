@@ -61,6 +61,19 @@ test('报告不存在 → not_found 零入队；10 分钟内重复 → duplicate
   } finally { env.cleanup() }
 })
 
+test('跨群汇总：标题为「跨群汇总 <日期>（前端补推）」，evidence_ref 指向 reports/summary/', () => {
+  const env = makeEnv()
+  try {
+    env.store.writeReport('daily', 'aggregate', DAY, `# 跨群汇总 · ${DAY}\n\n- ${SECRET}\n`)
+    const push = createReportOutbox({ store: env.store, outbox: env.outbox, now: env.now })
+    assert.equal(push('aggregate', 'daily', DAY), 'ok')
+    const [e] = env.outbox.listOutbox()
+    assert.equal(e.title, `跨群汇总 ${DAY}${WEB_PUSH_MARK}`)
+    assert.equal(e.evidence_ref, `reports/summary/${DAY}.md`)
+    assert.equal(JSON.stringify(e).includes(SECRET), false)
+  } finally { env.cleanup() }
+})
+
 test('定时报告的 outbox 条目不影响去重（只认前端补推标记）', () => {
   const env = makeEnv()
   try {

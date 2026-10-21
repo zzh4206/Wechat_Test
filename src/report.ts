@@ -810,11 +810,15 @@ export class ReportService {
    * - L3：统一证据（各群报告路径 + 引用条数）。
    * 群数 > aggregationMaxGroups：按 rankGroups（默认 相关度+活跃度）取前 N，其余一行带过。
    * 不主动触发各群 LLM 生成——只聚合已存在的报告（缺报告的群计为"未生成"一行带过）。
+   * backfillDateKey：手动重跑历史某日的汇总（前端「重新生成」）——窗口与 generateReport 回填同口径
+   * （[该日前一日 20:20, asOf]），dateKey = 该日，读该日各群日报。
    */
-  async generateSummary(asOf?: number): Promise<{ path: string | null; groupsIncluded: number; groupsSkipped: number }> {
+  async generateSummary(asOf?: number, backfillDateKey?: string): Promise<{ path: string | null; groupsIncluded: number; groupsSkipped: number }> {
     if (!this.options.enabled) return { path: null, groupsIncluded: 0, groupsSkipped: 0 }
     const ts = asOf ?? this.now()
-    const win = reportWindow('daily', ts)
+    let win = reportWindow('daily', ts)
+    const dayStart = backfillDateKey ? parseLocalDayStart(backfillDateKey) : null
+    if (dayStart !== null) win = { start: dayStart - 86_400_000 + 20 * 3600_000 + 20 * 60_000, end: ts, dateKey: backfillDateKey! }
     const rel = `reports/summary/${win.dateKey}.md`
     assertInsideState(this.options.stateDir, this.options.stateDir + '/' + rel)
     this.options.store.ensureDir('reports/summary')
