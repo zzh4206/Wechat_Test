@@ -6,6 +6,11 @@
 
 ## [Unreleased]
 
+### Changed
+
+- 报告修订落位规则（用户裁决，文档）：标记写「操作当天」日报（工作流演化），审批写「出身日」日报（现状不变）；修订行时间戳=操作时刻。见 `docs/ANALYSIS-2026-10-21-report-cutoff-window.md` §六
+- **直推记录**：`fix/report-placement-doc` 快进合并进 main 后以 `--no-verify` 直推（2026-10-22，分支闸门 `3901fcc` 的紧急直推例外）——原因：仅一份文档修正，且需避免与 `llm/synthetic-bench` 分支冲突
+
 ### Added
 
 - 基准 `--storm` 模式：同一 fixture/seed 跑两遍（零失败基线 → 注入失败），按方法论 §2 L2 判 I3「注入失败后调用数 ≤ 基线 1.5x」，输出 `baseline.{calls,distillCalls,costCny,failRate}`。单次重放下 I3 如实给 `pass: null`（N/A）并提示怎么判，不再假装有结论。`retryAmplification` 更名为 `callFanout`（= `distill.calls / ceil(msgs/batch)`，观测量而非判据），新增 `distill.intervalRounds` / `distill.expectedRounds` 说明扇出的两个来源
