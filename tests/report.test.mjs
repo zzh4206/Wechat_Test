@@ -279,7 +279,7 @@ test('聚合：L1 合并各群判断、L2 每群一节、L3 统一证据；截�
   rmSync(dir, { recursive: true, force: true })
 })
 
-test('聚合回填：generateSummary(该日原定生成时刻, dateKey) 重写该日汇总；之后几天的消息不计入统计、不写重跑当天文件', async () => {
+test('聚合重跑历史日：generateSummary(该日原定生成时刻) 重写该日汇总；之后几天的消息不计入统计、不写重跑当天文件', async () => {
   const dir = resolve(mkdtempSync(join(tmpdir(), 'report-agg-backfill-')))
   const gs = new GroupStoreService(dir, { warn() {}, error() {} })
   const store = new Store(dir, { warn() {}, error() {} })
@@ -300,7 +300,7 @@ test('聚合回填：generateSummary(该日原定生成时刻, dateKey) 重写�
   ])
   const later = T(20, 40) + 3 * 86_400_000
   const { dailyCutoff } = await import('../lib/regen-processor.js')
-  const sum = await report.generateSummary(dailyCutoff('2026-06-10', '20:30', later), '2026-06-10')
+  const sum = await report.generateSummary(dailyCutoff('2026-06-10', '20:30', later))
   assert.equal(sum.path, 'reports/summary/2026-06-10.md')
   const md = readFileSync(join(dir, 'reports', 'summary', '2026-06-10.md'), 'utf8')
   assert.match(md, /# 跨群汇总 · 2026-06-10/)

@@ -228,15 +228,15 @@ test('队列载入：旧版无 reason 条目视为错号补发；缺字段的 we
   rmSync(dir, { recursive: true, force: true })
 })
 
-test('手动重跑跨群汇总：改调 generateSummary(now, dateKey)，不调 generateReport、不进 outbox；未接 generateSummary → manual_failed 出队', async () => {
+test('手动重跑跨群汇总：改调 generateSummary(asOf)，不调 generateReport、不进 outbox；未接 generateSummary → manual_failed 出队', async () => {
   const env = makeEnv([])
   const calls = []
   env.deps.report.generateReport = async () => { throw new Error('聚合不应调用 generateReport') }
-  env.deps.report.generateSummary = async (asOf, dateKey) => { calls.push([asOf, dateKey]); return { path: `reports/summary/${dateKey}.md`, groupsIncluded: 2, groupsSkipped: 0 } }
+  env.deps.report.generateSummary = async (asOf) => { calls.push(asOf); return { path: 'reports/summary/x.md', groupsIncluded: 2, groupsSkipped: 0 } }
   env.queue.enqueue('aggregate', DAY, 1, 'daily', 'manual')
   const r = await processManualRegen(env.deps)
   assert.equal(r.action, 'manual_regenerated')
-  assert.deepEqual(calls, [[5000, DAY]])
+  assert.deepEqual(calls, [5000])
   assert.equal(env.queue.list().length, 0)
   assert.equal(env.outbox.listOutbox().length, 0)
   assert.deepEqual([env.audits[0].result, env.audits[0].chat_id], ['regen_manual_done', 'aggregate'])
@@ -251,24 +251,24 @@ test('手动重跑跨群汇总：改调 generateSummary(now, dateKey)，不调 g
   rmSync(env.dir, { recursive: true, force: true })
 })
 
-test('dailyCutoff：历史日截到该日 dailyReportTime；当天未到点取 now；时点非法退到该日 24:00', async () => {
+test('dailyCutoff：历史日截到该日 dailyReportTime；当天未到点取 now；时点非法退到该日最后一毫秒', async () => {
   const { dailyCutoff } = await import('../lib/regen-processor.js')
   const at = (y, m, d, h = 0, mi = 0) => new Date(y, m - 1, d, h, mi).getTime()
   const now = at(2026, 10, 21, 9)
   assert.equal(dailyCutoff('2026-10-14', '20:30', now), at(2026, 10, 14, 20, 30))
   assert.equal(dailyCutoff('2026-10-21', '20:30', now), now, '当天还没到生成时刻：截到现在')
-  assert.equal(dailyCutoff('2026-10-14', 'bad', now), at(2026, 10, 15))
-  assert.equal(dailyCutoff('2026-10-14', undefined, now), at(2026, 10, 15))
+  assert.equal(dailyCutoff('2026-10-14', 'bad', now), at(2026, 10, 15) - 1, '仍落在该日（reportWindow 据 asOf 推 dateKey）')
+  assert.equal(dailyCutoff('2026-10-14', undefined, now), at(2026, 10, 15) - 1)
 })
 
 test('手动重跑历史日汇总：传给 generateSummary 的 asOf 是该日原定生成时刻而不是现在', async () => {
   const env = makeEnv([])
   const calls = []
-  env.deps.report.generateSummary = async (asOf, dateKey) => { calls.push([asOf, dateKey]); return { path: `reports/summary/${dateKey}.md`, groupsIncluded: 1, groupsSkipped: 0 } }
+  env.deps.report.generateSummary = async (asOf) => { calls.push(asOf); return { path: 'reports/summary/x.md', groupsIncluded: 1, groupsSkipped: 0 } }
   env.deps.now = () => new Date(2026, 9, 21, 9).getTime()
   env.queue.enqueue('aggregate', '2026-10-14', 1, 'daily', 'manual')
   await processManualRegen({ ...env.deps, dailyReportTime: '20:30' })
-  assert.deepEqual(calls, [[new Date(2026, 9, 14, 20, 30).getTime(), '2026-10-14']])
+  assert.deepEqual(calls, [new Date(2026, 9, 14, 20, 30).getTime()])
   rmSync(env.dir, { recursive: true, force: true })
 })
 

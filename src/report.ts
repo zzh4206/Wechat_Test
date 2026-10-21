@@ -817,16 +817,13 @@ export class ReportService {
    * - L3：统一证据（各群报告路径 + 引用条数）。
    * 群数 > aggregationMaxGroups：按 rankGroups（默认 相关度+活跃度）取前 N，其余一行带过。
    * 不主动触发各群 LLM 生成——只聚合已存在的报告（缺报告的群计为"未生成"一行带过）。
-   * backfillDateKey：手动重跑历史某日的汇总（前端「重新生成」）——窗口 [该日前一日 20:20, asOf]，
-   * dateKey = 该日，读该日各群日报。asOf 由调用方取「该日原定生成时刻」（见 regen-processor
-   * dailyCutoff），否则统计会把之后几天的消息也算进来。
+   * 重跑历史某日（前端「重新生成」）：调用方传 asOf = 该日原定生成时刻（regen-processor dailyCutoff），
+   * reportWindow 即得 [该日前一日 20:20, 该日 20:30] 与 dateKey = 该日——与定时生成同一条路径，不另设回填分支。
    */
-  async generateSummary(asOf?: number, backfillDateKey?: string): Promise<{ path: string | null; groupsIncluded: number; groupsSkipped: number }> {
+  async generateSummary(asOf?: number): Promise<{ path: string | null; groupsIncluded: number; groupsSkipped: number }> {
     if (!this.options.enabled) return { path: null, groupsIncluded: 0, groupsSkipped: 0 }
     const ts = asOf ?? this.now()
-    let win = reportWindow('daily', ts)
-    const dayStart = backfillDateKey ? parseLocalDayStart(backfillDateKey) : null
-    if (dayStart !== null) win = { start: dayStart - 86_400_000 + 20 * 3600_000 + 20 * 60_000, end: ts, dateKey: backfillDateKey! }
+    const win = reportWindow('daily', ts)
     const rel = `reports/summary/${win.dateKey}.md`
     assertInsideState(this.options.stateDir, this.options.stateDir + '/' + rel)
     this.options.store.ensureDir('reports/summary')

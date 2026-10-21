@@ -20,7 +20,7 @@
  *    - 空产出不重试（重试是为错号切换后等消息同步，手动重跑无此前提），如实结束；
  *    - 独立轮询触发（不依赖日报 tick 与账号闸是否注入）；账号闸注入且当前错号时跳过本轮，
  *      避免用错号的空数据覆盖正常报告；
- *    - chatId='aggregate'（跨群汇总，只有日报）改调 generateSummary：按各群该日现有日报重新汇总，不调 LLM。
+ *    - chatId='aggregate'（跨群汇总，只有日报）改调 generateSummary(该日原定生成时刻)：按各群该日现有日报重新汇总，不调 LLM。
  */
 import type { Outbox } from './outbox.js'
 import type { Store } from './store.js'
@@ -112,7 +112,7 @@ export async function processRegenHead(deps: RegenProcessorDeps): Promise<RegenP
 export type ManualRegenDeps = Pick<RegenProcessorDeps, 'queue' | 'logger' | 'notify' | 'audit' | 'now' | 'dailyReportTime'> & {
   report: RegenProcessorDeps['report'] & {
     /** 跨群汇总重跑（缺省 = aggregate 条目按失败出队） */
-    generateSummary?: (asOf?: number, backfillDateKey?: string) => Promise<{ path: string | null; groupsIncluded: number }>
+    generateSummary?: (asOf?: number) => Promise<{ path: string | null; groupsIncluded: number }>
   }
   /** 账号闸：返回 false = 当前错号，跳过本轮（未注入账号闸时恒 true） */
   accountOk?: () => Promise<boolean>
@@ -121,7 +121,7 @@ export type ManualRegenDeps = Pick<RegenProcessorDeps, 'queue' | 'logger' | 'not
 /**
  * 历史日的窗口截止时刻 = 该日原定生成时刻（dateKey 当天 dailyReportTime），且不晚于 now。
  * 日报重跑/补发与汇总重跑共用：之后几天的消息不进该日窗口（审批/标记的后续变化走修订流，不靠扩窗）。
- * 时点缺失/非法时退到该日 24:00。
+ * 时点缺失/非法时退到该日 23:59:59.999（仍落在该日：reportWindow 据 asOf 推 dateKey）。
  */
 export function dailyCutoff(dateKey: string, dailyReportTime: string | undefined, now: number): number {
   const d = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateKey)
@@ -129,7 +129,7 @@ export function dailyCutoff(dateKey: string, dailyReportTime: string | undefined
   const t = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(dailyReportTime ?? '')
   const at = t
     ? new Date(Number(d[1]), Number(d[2]) - 1, Number(d[3]), Number(t[1]), Number(t[2])).getTime()
-    : new Date(Number(d[1]), Number(d[2]) - 1, Number(d[3]) + 1).getTime()
+    : new Date(Number(d[1]), Number(d[2]) - 1, Number(d[3]) + 1).getTime() - 1
   return Math.min(now, at)
 }
 
@@ -162,7 +162,7 @@ async function processManualSummary(deps: ManualRegenDeps, entry: RegenEntry): P
   const { chatId, dateKey, kind } = entry
   let s: { path: string | null; groupsIncluded: number } | null = null
   try {
-    s = deps.report.generateSummary ? await deps.report.generateSummary(dailyCutoff(dateKey, deps.dailyReportTime, deps.now()), dateKey) : null
+    s = deps.report.generateSummary ? await deps.report.generateSummary(dailyCutoff(dateKey, deps.dailyReportTime, deps.now())) : null
   } catch (error) {
     deps.audit({ result: 'regen_env_deferred', chat_id: chatId, date_key: dateKey, kind, reason: 'manual' })
     deps.logger.warn(`regen-queue: 跨群汇总重跑异常（留在原位） ${dateKey}: ${String(error).slice(0, 120)}`)
