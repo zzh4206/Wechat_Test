@@ -103,15 +103,51 @@ test('W-1：审计行含 operator（token 哈希前缀），未注入记 unknown
   const svc = fakeActions()
   const inbox = new ActionInbox({
     store,
-    actions: new ApprovalActions({ task: svc.task, promise: svc.promise, store: { updateTaskDeadline: async () => true, setIdentityWatchLevel: async () => true }, notify: () => {}, logger: { warn() {}, error() {} } }),
+    actions: new ApprovalActions({ task: svc.task, promise: svc.promise, store: { updateTaskDeadline: async () => true, setIdentityWatchLevel: async () => true }, notify: () => {}, logger: { warn() {}, error() {} }, revision: { onApproval: async () => true }, marks: { markTarget: async () => true } }),
     groups: [CHAT], operator: 'op123456', logger: { warn() {}, error() {} }, pollSec: 1, now: () => 1,
   })
-  store.writeText(ACTIONS_REL, line({ actionId: 'op1' }) + '\n')
+  store.writeText(ACTIONS_REL, line({ actionId: 'op1', operator: 'op123456' }) + '\n')
   await inbox.poll()
   const audit = readFileSync(join(dir, WEB_ACTIONS_AUDIT_REL), 'utf8').trim().split('\n').map(JSON.parse)
   assert.equal(audit[0].operator, 'op123456')
+  assert.equal(audit[0].code, 'ok')
   assert.ok(!readFileSync(join(dir, WEB_ACTIONS_AUDIT_REL), 'utf8').includes('tok_'), '审计无原 token')
   rmSync(dir, { recursive: true, force: true })
+})
+
+test('审计对齐：配置了 token 时，动作行 operator 不一致或缺失 → operator_mismatch 不执行，审计另记自称指纹', async () => {
+  const dir = resolve(mkdtempSync(join(tmpdir(), 'inbox-opm-')))
+  const store = new Store(dir, { warn() {}, error() {} })
+  store.ensureDir('web')
+  store.ensureDir('audit')
+  const svc = fakeActions()
+  const actions = new ApprovalActions({
+    task: svc.task, promise: svc.promise, store: { updateTaskDeadline: async () => true, setIdentityWatchLevel: async () => true },
+    notify: () => {}, logger: { warn() {}, error() {} },
+    revision: { onApproval: async () => true }, marks: { markTarget: async () => true },
+  })
+  const inbox = new ActionInbox({ store, actions, groups: [CHAT], operator: 'aaaa1111', logger: { warn() {}, error() {} }, pollSec: 1, now: () => 1 })
+  store.writeText(ACTIONS_REL, [
+    line({ actionId: 'm1', operator: 'bbbb2222' }),
+    line({ actionId: 'm2' }),
+    line({ actionId: 'm3', operator: 'aaaa1111' }),
+  ].join('\n') + '\n')
+  await inbox.poll()
+  const results = readFileSync(join(dir, ACTION_RESULTS_REL), 'utf8').trim().split('\n').map(JSON.parse)
+  assert.deepEqual(results.map(r => [r.actionId, r.code]), [['m1', 'operator_mismatch'], ['m2', 'operator_mismatch'], ['m3', 'ok']])
+  assert.deepEqual(svc.calls.filter(c => c[0] === 'task.confirm').length, 1, '不一致的行不执行')
+  const audit = readFileSync(join(dir, WEB_ACTIONS_AUDIT_REL), 'utf8').trim().split('\n').map(JSON.parse)
+  assert.deepEqual(audit.map(a => [a.operator, a.claimedOperator]), [['aaaa1111', 'bbbb2222'], ['aaaa1111', 'none'], ['aaaa1111', undefined]])
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('未配置 token 时不校验 operator（维持原行为，审计记 unknown）', async () => {
+  const env = makeEnv()
+  env.store.writeText(ACTIONS_REL, line({ actionId: 'u1', operator: 'whatever' }) + '\n')
+  await env.inbox.poll()
+  const results = readFileSync(join(env.dir, ACTION_RESULTS_REL), 'utf8').trim().split('\n').map(JSON.parse)
+  assert.equal(results[0].code, 'ok')
+  rmSync(env.dir, { recursive: true, force: true })
 })
 
 test('白名单外 type 拒绝（unsupported）；越权 chatId 拒绝（forbidden）', async () => {

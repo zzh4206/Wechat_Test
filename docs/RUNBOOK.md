@@ -558,13 +558,19 @@ Accessibility Inspector 确认元素层级）。**实证结论回填此处：___
   `webActionsPollSec`）。写失败（磁盘满等）由插件墓碑补写；若长期失败前端会等不到回执——
   排障看 error 日志「回执写失败连续」。
 - 失败码：`not_found` / `status_conflict`（stale 细分）、`chat_not_allowed` / `type_not_allowed`、
-  `unsupported` / `bad_request`（带 reason）/ `error`。
+  `operator_mismatch`（见 §13.3）、`unsupported` / `bad_request`（带 reason）/ `error`。
 
 ### 13.3 审计与身份（W-1）
 
 - `audit/web-actions.jsonl` 只记元数据（ts/actionId/type/chatId/code/ok/**operator**），绝无语句原文。
 - `operator` = 共享 token 的 sha256 前 8 位（插件配置 `webActionsToken`，与 web 进程同一 token；
   真实值只放 cordis.patch.yml，**任何一侧日志/审计都不落原 token**）。未配置记 `unknown`。
+- **对齐保证**：只有两侧 token 一致，审计 `operator` 才能用浏览器实际 token 的哈希核对。因此：
+  - 插件把指纹写进 `web/allowed-chats.json` 的 `operator` 字段；web 进程用自己的 `LURKER_WEB_TOKEN` 算同一指纹，
+    不一致（`token_mismatch`）或插件未配置 token（`plugin_token_unset`）时写动作禁用；
+  - web 进程在每条动作行写 `operator`（本进程 token 的指纹）；插件配置了 token 时，行内 `operator` 缺失或不一致
+    → 不执行，回执 `operator_mismatch`，审计行另记 `claimedOperator`（行自称的指纹，便于定位配错的进程）。
+    这一层兜住「入队后插件换了 token」与手工写入的行。未配置 token 的插件维持原行为。
 
 ### 13.4 读通道（插件 → 前端，outbox）
 
@@ -600,7 +606,8 @@ LURKER_WEB_TOKEN='<与插件 webActionsToken 相同的值>' \
 三项都满足，「审批」页的按钮才可用（否则页面顶部提示原因、只读展示）：
 
 1. 插件配置 `webActionsEnabled: true`（并重启插件，清单里 `actionsEnabled` 随之变为 true）；
-2. 插件配置 `webActionsToken` 与 web 进程的 `LURKER_WEB_TOKEN` 是**同一个值**（审计 operator 即其 sha256 前 8 位）；
+2. 插件配置 `webActionsToken` 与 web 进程的 `LURKER_WEB_TOKEN` 是**同一个值**（审计 operator 即其 sha256 前 8 位）。
+   web 进程会比对两边指纹：不一致或插件没配 token 时页面只读，提示 `token_mismatch` / `plugin_token_unset`（§13.3）；
 3. web 进程用 `LURKER_WEB_TOKEN` 启动（随机 token 只读）。
 
 提交后页面显示「已提交，等待插件处理…」，插件按 `webActionsPollSec`（默认 5 秒）消费，回执到达后显示结果：
@@ -610,6 +617,7 @@ LURKER_WEB_TOKEN='<与插件 webActionsToken 相同的值>' \
 | 已生效 | `ok` | 已执行；确认类动作同时登记模式学习、出身日报追加修订段（来源：前端） |
 | 状态已变化 | `status_conflict` | 目标已在别处处理（如对话框里已确认），刷新即可 |
 | 目标不存在 | `not_found` | 行已被删除或 id 不对 |
+| 插件拒绝：token 不一致 | `operator_mismatch` | 提交后插件换了 `webActionsToken`；两边改成同一值后重新提交 |
 | 60 秒内插件未处理 | — | 插件没在跑或收件箱没开；动作已入队，插件恢复后仍会执行 |
 
 前端只开放这些动作：`task.confirm/cancel/complete/set_deadline`、`event.confirm`、
@@ -623,7 +631,7 @@ LURKER_WEB_TOKEN='<与插件 webActionsToken 相同的值>' \
 | 页面提示 token 无效（401） | 地址没带 `#token=`，或与进程的 token 不一致 | 用启动时的 token 重开 |
 | 403 `bad_host` / `bad_origin` | 用了 127.0.0.1/localhost 以外的主机名访问，或其它网页在跨站请求 | 预期行为（防 DNS rebinding / CSRF），用 `127.0.0.1` 访问 |
 | 503 `knowledge_db_unavailable` | knowledge.db 不存在或镜像已关 | 检查 `sqlitePath` / `--db` |
-| 409 `actions_disabled` | 写动作未开启（`reason`：`no_shared_token` / `inbox_disabled`） | 见 §14.2 |
+| 409 `actions_disabled` | 写动作未开启（`reason`：`no_shared_token` / `inbox_disabled` / `plugin_token_unset` / `token_mismatch`） | 见 §14.2 |
 | 415 / 403 `bad_origin`（提交时） | 写请求必须是本页面发出的 JSON 请求 | 预期行为（防 CSRF），从工作台页面操作 |
 
 白名单每个请求都重读：插件改 `groups` 重启后，web 进程无需重启即生效。

@@ -278,7 +278,7 @@ export const Config: Schema<PluginConfig> = Schema.object({
     sendTargetChat: Schema.string().default('').description('发送目标会话名（搜索词；真实值放运行配置。默认空 = fail-closed 不发送；搜索结果多条时 Enter 选第一个，异常由 DB 回读兜底报警）'),
   webActionsEnabled: Schema.boolean().default(false).description('前端动作收件箱（审批双通道 web 侧）：消费 web/actions.jsonl 调 ApprovalActions，写结果/审计文件。默认关'),
   webActionsPollSec: Schema.number().default(5).description('动作收件箱轮询周期秒（默认 5）'),
-    webActionsToken: Schema.string().default('').description('前端动作通道共享 token（与前端 web 进程一致；真实值放 cordis.patch.yml，绝不入日志/审计原文）。审计只记 sha256 前 8 位操作者标识（W-1）；空 = 审计 operator 记 unknown'),
+    webActionsToken: Schema.string().default('').description('前端动作通道共享 token（与前端 web 进程一致；真实值放 cordis.patch.yml，绝不入日志/审计原文）。审计只记 sha256 前 8 位操作者标识（W-1）；配置后动作行的 operator 必须与之一致才执行（不一致回执 operator_mismatch），web 进程也会比对指纹、不一致即只读；空 = 不校验、审计记 unknown，且前端写动作禁用'),
     readbackChatId: Schema.string().default('').description('DB 回读验证目标会话 wxid（P0 兜底闸目标；必填——缺失 fail-closed 不发送。真实值放 cordis.patch.yml）'),
   sendSearchViaClipboard: Schema.boolean().default(false).description('搜索词键入走剪贴板回退（默认 false = System Events 直接键入；CJK IME 拦截实测失败时开启）'),
     idleSkipBelowSec: Schema.number().default(10).description('用户空闲让路阈值秒（默认 10 = 系统空闲 <10s 视为正在操作→跳过本轮让路；0 = 不让路，空闲检测失效直接抢前台发送。日常单日报场景可设 0——每天一次的抢前台可接受；频繁发送建议保持 10）'),
@@ -745,11 +745,12 @@ export function apply(ctx: Context, config: PluginConfig): void {
         pollSec: config.webActionsPollSec,
       })
     : null
-  // 前端 web 进程的只读清单（白名单 + knowledge.db 路径 + 收件箱是否在消费，设计 §11-Q5 b）；失败只 warn。
+  // 前端 web 进程的只读清单（白名单 + knowledge.db 路径 + 收件箱是否在消费 + token 指纹，设计 §11-Q5 b）；失败只 warn。
   writeWebManifest(store, {
     groups: config.groups ?? [],
     knowledgeDb: mirrorPath ? resolve(mirrorPath) : null,
     actionsEnabled: actionInbox !== null,
+    operator: webActionsOperator ?? null,
   })
 
   // —— M5-T5.3：文件索引（默认关 = 零活动）。 ——

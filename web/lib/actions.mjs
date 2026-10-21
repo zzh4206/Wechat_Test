@@ -40,16 +40,17 @@ export const WEB_ACTIONS = Object.freeze({
 })
 
 /**
- * 校验前端提交并组装动作行。
+ * 校验前端提交并组装动作行（operator：本进程 token 指纹，见 http-guard operatorOf）。
  * @returns {{ line: object } | { error: string, reason?: string }}
  */
-export function buildAction(body, allowedGroups, now = Date.now()) {
+export function buildAction(body, allowedGroups, operator, now = Date.now()) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return { error: 'bad_request', reason: 'body' }
   const spec = Object.hasOwn(WEB_ACTIONS, body.type) ? WEB_ACTIONS[body.type] : null
   if (!spec) return { error: 'type_not_allowed' }
   if (typeof body.chatId !== 'string' || !allowedGroups.has(body.chatId)) return { error: 'chat_not_allowed' }
   const [needsTarget, check] = spec
-  const line = { actionId: `a-${now}-${randomBytes(4).toString('hex')}`, ts: now, type: body.type, chatId: body.chatId }
+  // operator = 本进程 token 的指纹：插件核对它与 webActionsToken 一致才执行，审计 operator 因此可信
+  const line = { actionId: `a-${now}-${randomBytes(4).toString('hex')}`, ts: now, type: body.type, chatId: body.chatId, operator }
   if (needsTarget) {
     if (!Number.isSafeInteger(body.targetId) || body.targetId <= 0) return { error: 'bad_request', reason: 'targetId' }
     line.targetId = body.targetId

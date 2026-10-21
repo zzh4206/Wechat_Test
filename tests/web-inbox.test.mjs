@@ -7,6 +7,7 @@ import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync, existsSy
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { request } from 'node:http'
+import { createHash } from 'node:crypto'
 
 const { createWebServer } = await import('../web/server.mjs')
 const { GroupStoreService } = await import('../lib/group-store.js')
@@ -23,8 +24,12 @@ const OUTSIDE = '1234567890@chatroom'
 const TOKEN = 'synth-token-0002-abcdef'
 const ORIGIN_TS = new Date(2026, 9, 14, 10, 0, 0).getTime() // 本地 2026-10-14 10:00
 const ORIGIN_KEY = '2026-10-14'
+// 与插件 index.ts 的 webActionsOperator 同算法：sha256 十六进制前 8 位
+const fingerprint = (t) => createHash('sha256').update(t, 'utf8').digest('hex').slice(0, 8)
 
-async function makeEnv({ allowActions = true, actionsEnabled = true } = {}) {
+/** pluginToken：插件配置 webActionsToken（null = 未配置）；web 进程固定用 TOKEN */
+async function makeEnv({ allowActions = true, actionsEnabled = true, pluginToken = TOKEN } = {}) {
+  const pluginOperator = pluginToken ? fingerprint(pluginToken) : undefined
   const dir = resolve(mkdtempSync(join(tmpdir(), 'web-inbox-')))
   const logger = { warn() {}, error() {}, info() {}, debug() {} }
   const groupStore = new GroupStoreService(dir, logger)
@@ -34,10 +39,10 @@ async function makeEnv({ allowActions = true, actionsEnabled = true } = {}) {
   const promise = new PromiseRecognitionService({ groupStore, llm, logger, enabled: true })
   const { reportRevision, approvalActions, resolveInboxTarget } = createApprovalWiring({ store, groupStore, task, promise, notify: () => {}, logger })
   const inbox = new ActionInbox({
-    store, actions: approvalActions, groups: [CHAT], logger, resolveTarget: resolveInboxTarget,
+    store, actions: approvalActions, groups: [CHAT], logger, resolveTarget: resolveInboxTarget, operator: pluginOperator,
     marks: { markTarget: (c, k, id, s, src) => reportRevision.markTarget(c, k, id, s, src) },
   })
-  writeWebManifest(store, { groups: [CHAT], knowledgeDb: join(dir, 'knowledge.db'), actionsEnabled })
+  writeWebManifest(store, { groups: [CHAT], knowledgeDb: join(dir, 'knowledge.db'), actionsEnabled, operator: pluginOperator ?? null })
 
   // 合成数据：证据消息前后各有消息；一条待确认任务、一条无时限进行中任务、一条待确认承诺、一条待确认事件
   await groupStore.appendIdentity(CHAT, { pid: 'wx_p1', wxid: 'wxid_a', groupNick: '张三', watchLevel: 'off' })
@@ -261,5 +266,51 @@ test('/api/actions/:id 只认服务端 actionId 格式', async () => {
   try {
     assert.equal((await env.get('/api/actions/..%2F..%2Fetc')).status, 400)
     assert.equal((await env.get('/api/actions/bad-line')).status, 400)
+  } finally { await env.stop() }
+})
+
+// —— 审计对齐：审计 operator 必须能用浏览器实际 token 的哈希核对 ——
+
+test('审计 operator = 浏览器实际 token 的指纹；动作行带同一指纹', async () => {
+  const env = await makeEnv()
+  try {
+    const p = await env.post({ type: 'task.confirm', chatId: CHAT, targetId: env.ids.pendingTask })
+    assert.equal(actionLines(env.dir)[0].operator, fingerprint(TOKEN))
+    await env.inbox.poll()
+    const audit = readFileSync(join(env.dir, 'audit', 'web-actions.jsonl'), 'utf8').trim().split('\n').map(JSON.parse)
+    const row = audit.find(a => a.actionId === p.body.actionId)
+    assert.deepEqual([row.code, row.operator], ['ok', fingerprint(TOKEN)])
+    assert.equal(readFileSync(join(env.dir, 'audit', 'web-actions.jsonl'), 'utf8').includes(TOKEN), false, '审计不落原 token')
+  } finally { await env.stop() }
+})
+
+test('LURKER_WEB_TOKEN ≠ webActionsToken → 只读（token_mismatch），提交 409 零落盘', async () => {
+  const env = await makeEnv({ pluginToken: 'synth-token-other-999999' })
+  try {
+    assert.deepEqual((await env.get('/api/chats')).body.actions, { enabled: false, reason: 'token_mismatch' })
+    const r = await env.post({ type: 'task.confirm', chatId: CHAT, targetId: env.ids.pendingTask })
+    assert.deepEqual([r.status, r.body.reason], [409, 'token_mismatch'])
+    assert.equal(actionLines(env.dir).length, 0)
+  } finally { await env.stop() }
+})
+
+test('插件未配置 webActionsToken → 只读（plugin_token_unset）：审计 operator 只会是 unknown，无法核对', async () => {
+  const env = await makeEnv({ pluginToken: null })
+  try {
+    assert.deepEqual((await env.get('/api/chats')).body.actions, { enabled: false, reason: 'plugin_token_unset' })
+    assert.equal((await env.post({ type: 'task.confirm', chatId: CHAT, targetId: env.ids.pendingTask })).status, 409)
+  } finally { await env.stop() }
+})
+
+test('插件侧兜底：入队后插件换了 token（清单未及刷新）→ operator_mismatch 不执行，回执透传', async () => {
+  const env = await makeEnv()
+  try {
+    const p = await env.post({ type: 'task.confirm', chatId: CHAT, targetId: env.ids.pendingTask })
+    // 模拟插件以新 token 重启：收件箱的 operator 变了，队列里的旧行不再被执行
+    const { ActionInbox: Inbox } = await import('../lib/action-inbox.js')
+    const rotated = new Inbox({ store: env.store, actions: env.inbox.deps.actions, groups: [CHAT], logger: { warn() {}, error() {} }, operator: fingerprint('synth-token-rotated-0000') })
+    await rotated.poll()
+    assert.deepEqual((await env.get(`/api/actions/${p.body.actionId}`)).body, { actionId: p.body.actionId, status: 'done', ok: false, code: 'operator_mismatch' })
+    assert.equal(env.groupStore.getTask(CHAT, env.ids.pendingTask).status, 'pending_confirm', '未执行')
   } finally { await env.stop() }
 })

@@ -23,7 +23,8 @@
 >
 > **FE-2 实施与本稿的差异**：
 >
-> - 写动作三个前提：web 进程用共享 token 启动、插件清单 `actionsEnabled=true`（插件把收件箱是否在消费写进 allowed-chats.json）、请求带本服务 Origin 且为 JSON；任一不满足返回 409/403/415，页面只读
+> - 写动作前提：web 进程用共享 token 启动且其指纹与插件 `webActionsToken` 的指纹一致、插件清单 `actionsEnabled=true`（插件把收件箱是否在消费、token 指纹写进 allowed-chats.json）、请求带本服务 Origin 且为 JSON；任一不满足返回 409/403/415，页面只读
+> - 审计对齐：动作行带 `operator`（web 进程 token 指纹），插件配置了 token 时不一致即 `operator_mismatch` 不执行——审计 `operator` 因此一定对应浏览器实际使用的 token（RUNBOOK §13.3）
 > - 前端只开放插件白名单的子集（见 RUNBOOK §14.2）；`actionId` 由服务端生成，不信任请求体
 > - 动作类型沿用插件侧命名（`task.set_deadline`，非本稿 §5 的 `task.setDeadline`）
 > - 收件箱除待确认三类外，还列进行中的任务/承诺（完成、兑现、关闭），无时限任务单列「待定时间」

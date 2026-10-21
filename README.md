@@ -32,7 +32,7 @@
 | `0数据格式/` | **知识库纯模板**：三层 schema（资料 `doc` + 日志 `report`/`entry` + 会话要点 `chat_digest`）+ 3 个 Python 工具。**不录入任何数据** |
 | `web/` | 本地前端工作台（独立进程，只监听 127.0.0.1）：报告日历/详情、资料库、媒体、会话要点、人员关注的只读回溯，以及审批收件箱（确认/取消/完成/定时间，经插件收件箱执行）。启动见 [RUNBOOK §14](docs/RUNBOOK.md) |
 | `scripts/` | `check-sensitive.sh`（敏感信息扫描）、`llm-cost.mjs`（费用汇总）、`import-state-to-sqlite.mjs`（一次性导入器） |
-| `tests/` | 57 个测试文件、502 例，全离线 mock，不碰真实库 |
+| `tests/` | 57 个测试文件、508 例，全离线 mock，不碰真实库 |
 
 ## 架构：从聊天到知识库
 
@@ -138,7 +138,7 @@ node scripts/import-state-to-sqlite.mjs --state-dir ~/.dsh/dsh-group-lurker
 | `sendSearchViaClipboard` | false | 搜索词剪贴板回退（CJK IME 兜底） |
 | `webActionsEnabled` | false | 前端动作收件箱总闸（审批 web 通道） |
 | `webActionsPollSec` | 5 | 动作收件箱轮询周期秒 |
-| `webActionsToken` | '' | 前端动作通道共享 token（真实值放 cordis.patch.yml；审计只记 sha256 前 8 位 operator，绝不落原文） |
+| `webActionsToken` | '' | 前端动作通道共享 token，须与 web 进程 `LURKER_WEB_TOKEN` 一致（真实值放 cordis.patch.yml；审计只记 sha256 前 8 位 operator，绝不落原文）。两侧指纹不一致时前端只读、插件拒绝执行（`operator_mismatch`）；留空则前端写动作禁用 |
 | `batchThreshold` | 120 | 大窗口分批归纳阈值 |
 | `accountWhitelist` | [] | 账号白名单（账号生命周期自动化） |
 | `allowAutoRekey` | false | 小号回归自动取钥 |
@@ -207,7 +207,7 @@ node scripts/import-state-to-sqlite.mjs --state-dir ~/.dsh/dsh-group-lurker
 ```bash
 npm install
 npm run build   # tsc → lib/
-npm test        # node --test，57 文件 / 502 例，全离线 mock
+npm test        # node --test，57 文件 / 508 例，全离线 mock
 ./scripts/check-sensitive.sh   # 提交前必跑，CI 会拦
 ```
 

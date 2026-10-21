@@ -30,5 +30,7 @@ export function loadManifest(stateDir) {
   const knowledgeDb = typeof raw.knowledgeDb === 'string' && raw.knowledgeDb ? raw.knowledgeDb : null
   // 插件收件箱是否在消费 actions.jsonl（旧清单无此字段 = 否）
   const actionsEnabled = raw.actionsEnabled === true
-  return { groups, knowledgeDb, actionsEnabled }
+  // 插件 webActionsToken 的指纹（审计 operator）；null = 插件未配置 token
+  const operator = typeof raw.operator === 'string' && /^[0-9a-f]{8}$/.test(raw.operator) ? raw.operator : null
+  return { groups, knowledgeDb, actionsEnabled, operator }
 }

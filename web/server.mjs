@@ -9,8 +9,8 @@
 // - 不 import src/ 或插件 lib/ 的任何模块，没有 child_process、没有出网；
 // - 只读打开 knowledge.db、groups/*/store.db、digests/*.md；唯一写入是 lib/actions.mjs 向
 //   web/actions.jsonl 追加动作行（RUNBOOK §13），由插件 ActionInbox 消费执行；
-// - 写动作要求：Origin 必须是本服务、Content-Type 为 JSON、token 来自 LURKER_WEB_TOKEN（与插件
-//   webActionsToken 共享），且插件清单声明收件箱在消费（actionsEnabled）；
+// - 写动作要求：Origin 必须是本服务、Content-Type 为 JSON、token 来自 LURKER_WEB_TOKEN 且其指纹
+//   与插件清单里 webActionsToken 的指纹一致（审计 operator 对齐），插件清单声明收件箱在消费；
 // - 白名单取 <stateDir>/web/allowed-chats.json（插件启动时写入），缺失或为空拒绝启动（R2）。
 import { createServer } from 'node:http'
 import { randomBytes } from 'node:crypto'
@@ -18,7 +18,7 @@ import { readFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { parseArgs } from 'node:util'
-import { SECURITY_HEADERS, hostAllowed, originAllowed, tokenAllowed } from './lib/http-guard.mjs'
+import { SECURITY_HEADERS, hostAllowed, operatorOf, originAllowed, tokenAllowed } from './lib/http-guard.mjs'
 import { AGGREGATE, loadManifest } from './lib/manifest.mjs'
 import * as Q from './lib/queries.mjs'
 import { ACTION_ID_RE, appendAction, buildAction, readResult } from './lib/actions.mjs'
@@ -97,10 +97,16 @@ function route(path, q, ctx) {
   return [404, { error: 'not_found' }]
 }
 
-/** 写动作是否可用；不可用时给出原因（前端据此禁用按钮并提示） */
-function actionsState(allowActions, manifest) {
+/**
+ * 写动作是否可用；不可用时给出原因（前端据此禁用按钮并提示）。
+ * token 指纹必须与插件 webActionsToken 的一致：否则审计 operator 记的是另一个 token，
+ * 无法用浏览器实际 token 核对是谁提交的（插件侧也会以 operator_mismatch 拒绝执行）。
+ */
+function actionsState(allowActions, manifest, operator) {
   if (!allowActions) return { enabled: false, reason: 'no_shared_token' }
   if (!manifest.actionsEnabled) return { enabled: false, reason: 'inbox_disabled' }
+  if (!manifest.operator) return { enabled: false, reason: 'plugin_token_unset' }
+  if (manifest.operator !== operator) return { enabled: false, reason: 'token_mismatch' }
   return { enabled: true, reason: null }
 }
 
@@ -128,11 +134,11 @@ function readJsonBody(req) {
 /** POST /api/actions：校验后追加一行到 web/actions.jsonl，立即返回 actionId（不等执行） */
 async function postAction(req, res, ctx) {
   if (!/^application\/json(;|$)/i.test(req.headers['content-type'] ?? '')) return json(res, 415, { error: 'unsupported_media_type' })
-  const state = actionsState(ctx.allowActions, ctx.manifest)
+  const state = actionsState(ctx.allowActions, ctx.manifest, ctx.operator)
   if (!state.enabled) return json(res, 409, { error: 'actions_disabled', reason: state.reason })
   const body = await readJsonBody(req)
   if (body === null) return json(res, 400, { error: 'bad_request', reason: 'body' })
-  const built = buildAction(body, new Set(ctx.manifest.groups))
+  const built = buildAction(body, new Set(ctx.manifest.groups), ctx.operator)
   if (built.error) return json(res, built.error === 'chat_not_allowed' ? 403 : 400, built)
   appendAction(ctx.stateDir, built.line)
   return json(res, 202, { actionId: built.line.actionId })
@@ -147,6 +153,7 @@ export function createWebServer(opts) {
   const stateDir = resolve(opts.stateDir)
   if (typeof opts.token !== 'string' || opts.token.length < 16) throw new Error('web: token 至少 16 字符')
   const allowActions = opts.allowActions === true
+  const operator = operatorOf(opts.token)
   const server = createServer(async (req, res) => {
     const port = server.address()?.port
     if (!hostAllowed(req.headers.host, port)) return json(res, 403, { error: 'bad_host' })
@@ -173,7 +180,7 @@ export function createWebServer(opts) {
     const allowed = new Set([...manifest.groups, AGGREGATE])
     if (isPost) {
       try {
-        return await postAction(req, res, { stateDir, manifest, allowActions })
+        return await postAction(req, res, { stateDir, manifest, allowActions, operator })
       } catch {
         return json(res, 500, { error: 'error' })
       }
@@ -182,7 +189,7 @@ export function createWebServer(opts) {
     try {
       // 收件箱/回执/人员不依赖 knowledge.db；打开失败（损坏/锁）只影响回溯类接口
       try { kdb = Q.openReadOnly(opts.dbPath ?? manifest.knowledgeDb) } catch { kdb = null }
-      const [status, body] = route(url.pathname, queryOf(url), { kdb, allowed, stateDir, actions: actionsState(allowActions, manifest) })
+      const [status, body] = route(url.pathname, queryOf(url), { kdb, allowed, stateDir, actions: actionsState(allowActions, manifest, operator) })
       return json(res, status, body)
     } catch (error) {
       if (error instanceof Q.BadRequest) return json(res, 400, { error: 'bad_request', reason: error.message })

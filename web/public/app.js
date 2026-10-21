@@ -58,12 +58,15 @@ const RESULT_TEXT = {
   type_not_allowed: '插件不支持该动作',
   unsupported: '插件未接通该动作',
   bad_request: '参数不合法',
+  operator_mismatch: '插件拒绝：提交方 token 与插件 webActionsToken 不一致',
   error: '插件执行出错，查看插件日志',
 }
 
 const ACTIONS_OFF_TEXT = {
   no_shared_token: '只读模式：web 进程未用 LURKER_WEB_TOKEN 启动，审批动作不可用（见 RUNBOOK §14）。',
   inbox_disabled: '只读模式：插件未开启前端收件箱（webActionsEnabled=false 或依赖缺失），审批动作不可用。',
+  plugin_token_unset: '只读模式：插件未配置 webActionsToken，审计无法对应到操作者，审批动作不可用（见 RUNBOOK §14.2）。',
+  token_mismatch: '只读模式：web 进程的 LURKER_WEB_TOKEN 与插件 webActionsToken 不一致，审批动作不可用（见 RUNBOOK §14.2）。',
 }
 
 const view = () => document.getElementById('view')

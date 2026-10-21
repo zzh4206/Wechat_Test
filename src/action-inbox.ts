@@ -39,6 +39,8 @@ export interface ActionLine {
   type: string
   targetId: number
   params?: Record<string, unknown>
+  /** 提交方 token 的 sha256 前 8 位（web 进程写入）；插件配置了 token 时必须与之一致（审计对齐） */
+  operator?: string
 }
 
 export interface ActionInboxDeps {
@@ -61,6 +63,7 @@ export type ActionCode =
   | 'ok' | 'duplicate'
   | 'not_found' | 'status_conflict' // W-8：stale 细分
   | 'chat_not_allowed' | 'type_not_allowed' // W-8：forbidden 细分
+  | 'operator_mismatch' // 动作行的 operator 与插件 webActionsToken 指纹不一致（审计标签对不上真实 token）
   | 'unsupported' | 'bad_request' | 'error'
 
 export interface ActionOutcome {
@@ -98,6 +101,7 @@ export function parseActionLine(line: string): ActionLine | null {
       type: v.type,
       targetId: typeof v.targetId === 'number' ? v.targetId : NaN,
       params: (typeof v.params === 'object' && v.params !== null ? v.params : undefined) as Record<string, unknown> | undefined,
+      operator: typeof v.operator === 'string' ? v.operator : undefined,
     }
   } catch {
     return null
@@ -349,6 +353,11 @@ export class ActionInbox {
   }
 
   private async process(a: ActionLine): Promise<ActionOutcome> {
+    // 审计对齐：配置了 token 时，动作行必须带同一 token 的指纹——否则审计里的 operator
+    // 对应的不是浏览器实际使用的 token，无法据此核对是谁提交的。未配置 token 时维持原行为（记 unknown）。
+    if (this.deps.operator && a.operator !== this.deps.operator) {
+      return { actionId: a.actionId, ok: false, code: 'operator_mismatch' }
+    }
     if (!ACTION_TYPES.includes(a.type as ActionType)) {
       return { actionId: a.actionId, ok: false, code: 'type_not_allowed' }
     }
@@ -397,7 +406,9 @@ export class ActionInbox {
   private audit(a: ActionLine, outcome: ActionOutcome): void {
     this.deps.store.ensureDir('audit')
     // 只记元数据：actionId/type/chatId/code/operator（W-1：操作者=web token 哈希前缀，绝不落原 token/语句原文）
-    this.deps.store.appendJsonl(WEB_ACTIONS_AUDIT_REL, { ts: this.now(), actionId: a.actionId, type: a.type, chatId: a.chatId, code: outcome.code, ok: outcome.ok, operator: this.deps.operator ?? 'unknown' })
+    // operator_mismatch 时另记动作行自称的指纹（claimedOperator，同为哈希前缀），便于排查是哪个 web 进程配错了
+    const claimed = outcome.code === 'operator_mismatch' ? { claimedOperator: a.operator ?? 'none' } : {}
+    this.deps.store.appendJsonl(WEB_ACTIONS_AUDIT_REL, { ts: this.now(), actionId: a.actionId, type: a.type, chatId: a.chatId, code: outcome.code, ok: outcome.ok, operator: this.deps.operator ?? 'unknown', ...claimed })
   }
 
   /** 启动轮询（接线层 ctx.effect 挂 dispose） */
