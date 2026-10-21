@@ -62,7 +62,9 @@ export function createApprovalWiring(deps: ApprovalWiringDeps): ApprovalWiring {
         enqueueReportRegen: deps.enqueueReportRegen,
         now: deps.now,
         revision: reportRevision,
-        marks: { markTarget: async (chatId2, kind2, targetId2, status2, source2) => store.mirrorMarking(chatId2, status2 === 'completed' ? 'done' : status2 === 'incomplete' ? 'undone' : 'deleted', `${chatId2}:${kind2}:${targetId2}`, Date.now(), { source: source2 }) },
+        // 完成语义走完整标记链（存在性校验 → 镜像 → 出身日报修订段 → 周/月级联），
+        // 与 ActionInbox task.mark 同源；直连 store.mirrorMarking 会跳过校验与修订段
+        marks: reportRevision,
       })
     : null
   return { reportRevision, approvalActions }

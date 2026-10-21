@@ -18,6 +18,7 @@
 
 ### Fixed
 
+- 审批接线：`taskComplete` 的 `marks` 依赖改走 `reportRevision.markTarget`（原直连 `store.mirrorMarking`）——不存在的任务不再"完成成功"，完成时出身日报照常追加修订段并级联周/月报，与收件箱 `task.mark` 同源同效。组装抽成 `src/approval-wiring.ts` 的 `createApprovalWiring`，`index.ts` 与 `tests/wiring.test.mjs` 共用，接线测试从此测的是生产接线
 - outbox `updateSendState` 由整文件读-改-写改**追加状态补丁行**（`{patch:true, id, …patch}`），读取侧（`tailOutbox`/`listOutbox` 及测试 helper）按 id fold 归并——与 `appendOutbox` 并发不再丢追加（审查 W-4）；regen 整文件覆写与修订段追加的并发安全以并发断言测试钉死（渲染 span 与追加 span 内零 await，单线程原子，W-5）
 - T4 语义：`upsertReport` 冲突分支不再用 `excluded.status` 覆盖既有 status——`final` 报告被修订后仍 `final`（修订不降级），`draft` 也不会被自动 final（draft→final 单向定稿由 finalize 通道承载），测试钉死
 
