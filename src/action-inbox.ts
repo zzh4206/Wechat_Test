@@ -49,7 +49,7 @@ export interface ActionInboxDeps {
   /** 白名单群（R2：chatId ∈ groups，白名单外拒绝） */
   groups: readonly string[]
   /** W-8 stale 细分用：目标存在性解析（缺省 = 一律 status_conflict） */
-  resolveTarget?: (chatId: string, targetKind: 'task' | 'promise', targetId: number) => { createdAt: number } | null
+  resolveTarget?: (chatId: string, targetKind: 'task' | 'promise' | 'event', targetId: number) => { createdAt: number } | null
   /** W-1：操作者标识（web token 哈希前缀；审计元数据） */
   operator?: string
   logger: StoreLogger
@@ -122,7 +122,8 @@ export function validateRegenParams(params: Record<string, unknown> | undefined)
 
 /** W-8：stale 细分——目标不存在 → not_found；存在但状态不符 → status_conflict */
 function staleOf(deps: Pick<ActionInboxDeps, 'resolveTarget'>, a: ActionLine): { code: ActionOutcome['code']; reason?: string } {
-  const t = deps.resolveTarget?.(a.chatId, a.type === 'promise.mark' || a.type.startsWith('promise.') ? 'promise' : 'task', a.targetId)
+  const kind = a.type.startsWith('promise.') ? 'promise' : a.type.startsWith('event.') ? 'event' : 'task'
+  const t = deps.resolveTarget?.(a.chatId, kind, a.targetId)
   if (!t) return { code: 'not_found' }
   return { code: 'status_conflict' }
 }

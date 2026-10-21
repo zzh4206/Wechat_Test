@@ -714,7 +714,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
   }
 
   // —— 审批双通道（confirm-loop C1/C2）+ 标记修订流（approval-marking M1/M2）接线 ——
-  const { reportRevision, approvalActions } = createApprovalWiring({
+  const { reportRevision, approvalActions, resolveInboxTarget } = createApprovalWiring({
     store,
     groupStore,
     task: taskRecognition,
@@ -741,6 +741,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
         actions: approvalActions,
         marks: { markTarget: (chatId2, kind2, targetId2, status2, source2) => reportRevision.markTarget(chatId2, kind2, targetId2, status2, source2) },
         groups: config.groups,
+        resolveTarget: resolveInboxTarget,
         operator: webActionsOperator,
         logger: logger as unknown as StoreLogger,
         pollSec: config.webActionsPollSec,
