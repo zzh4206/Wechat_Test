@@ -1,7 +1,7 @@
 # 技术设计：本地前端工作台（报告回溯 + 待审批收件箱）
 
 - 版本：v0.1（草案，2026-10-21 入库；正文保持 v0.1 原貌，仅分期编号按 [REF-prefixes.md](REF-prefixes.md) 改为 FE-N）
-- 状态：§3 方案 B 已采纳；插件侧服务面（FE-2 的 ActionInbox / ApprovalActions）已落地；**FE-1 web 进程已落地**（`web/`，启动见 RUNBOOK §14），FE-2 收件箱页 / FE-3 待实施
+- 状态：§3 方案 B 已采纳；插件侧服务面（FE-2 的 ActionInbox / ApprovalActions）已落地；**FE-1 / FE-2 已落地**（`web/`，启动与开启审批见 RUNBOOK §14），FE-3 待实施
 - 数据层依据：[`0数据格式/`](../0数据格式/README.md)（本稿写于 schema v0.4，现行为 v6）、`src/group-store.ts`（每群库）
 - 安全依据：[SECURITY-TEST-PLAN.md](SECURITY-TEST-PLAN.md) §0 五条红线
 
@@ -20,6 +20,14 @@
 > - 正文渲染：§4.2「安全渲染为 HTML 片段」与 §6.1「前端禁 innerHTML」相互矛盾，实现取后者——服务端把 Markdown 子集解析为 **JSON 块结构**，前端用 createElement + textContent 搭 DOM，整条链路不解析任何 HTML
 > - 接口：增 `/api/docs/:id`（资料正文）；`/api/inbox`、`/api/evidence`、`/api/actions*` 归 FE-2；对比视图未做
 > - 哨兵：§6.3 各条之外，还限定 web/ 只能 import `node:` 内置与 web/ 内模块、`node:http` 只许取 `createServer`
+>
+> **FE-2 实施与本稿的差异**：
+>
+> - 写动作前提：web 进程用共享 token 启动且其指纹与插件 `webActionsToken` 的指纹一致、插件清单 `actionsEnabled=true`（插件把收件箱是否在消费、token 指纹写进 allowed-chats.json）、请求带本服务 Origin 且为 JSON；任一不满足返回 409/403/415，页面只读
+> - 审计对齐：动作行带 `operator`（web 进程 token 指纹），插件配置了 token 时不一致即 `operator_mismatch` 不执行——审计 `operator` 因此一定对应浏览器实际使用的 token（RUNBOOK §13.3）
+> - 前端只开放插件白名单的子集（见 RUNBOOK §14.2）；`actionId` 由服务端生成，不信任请求体
+> - 动作类型沿用插件侧命名（`task.set_deadline`，非本稿 §5 的 `task.setDeadline`）
+> - 收件箱除待确认三类外，还列进行中的任务/承诺（完成、兑现、关闭），无时限任务单列「待定时间」
 
 ---
 

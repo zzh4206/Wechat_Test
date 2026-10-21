@@ -3,7 +3,7 @@
 // 与 ActionInbox 的 task.mark 同源同效。直连 store.mirrorMarking 会跳过校验与修订段。
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
@@ -72,4 +72,36 @@ test('taskComplete：修订行写入条目出身日报（与 ActionInbox task.ma
   } finally {
     env.cleanup()
   }
+})
+
+test('收件箱 stale 细分：已处理过的目标报 status_conflict，不存在报 not_found（含事件）', async () => {
+  const env = makeEnv()
+  const { ActionInbox, ACTIONS_REL, ACTION_RESULTS_REL } = await import('../lib/action-inbox.js')
+  const { resolveInboxTarget } = createApprovalWiring({ store: env.store, groupStore: env.groupStore, task: null, promise: null, notify: () => {}, logger: { warn() {}, error() {} } })
+  try {
+    const tid = await env.groupStore.appendTask(CHAT, { statement: '交材料', status: 'active' }, ORIGIN)
+    // 事件 id 刻意与任务 id 错开：按任务表去查事件 id 时查不到（id 重合会让错误实现碰巧通过）
+    await env.groupStore.appendEvent(CHAT, { category: 'meeting', statement: '占位', status: 'active' })
+    const eid = await env.groupStore.appendEvent(CHAT, { category: 'meeting', statement: '开会', status: 'active' })
+    assert.equal(env.groupStore.getTask(CHAT, eid), null)
+    const inbox = new ActionInbox({ store: env.store, actions: env.approvalActions, groups: [CHAT], logger: { warn() {}, error() {} }, resolveTarget: resolveInboxTarget })
+    const lines = [
+      { actionId: 'x1', type: 'task.confirm', targetId: tid }, // 已 active → 状态不符
+      { actionId: 'x2', type: 'task.confirm', targetId: 9999 },
+      { actionId: 'x3', type: 'event.confirm', targetId: eid }, // 事件按事件解析，不能当任务查
+      { actionId: 'x4', type: 'event.confirm', targetId: 9999 },
+    ]
+    env.store.ensureDir('web')
+    env.store.writeText(ACTIONS_REL, lines.map(l => JSON.stringify({ ts: 1, chatId: CHAT, ...l })).join('\n') + '\n')
+    await inbox.poll()
+    const codes = Object.fromEntries(env.store.readText(ACTION_RESULTS_REL).trim().split('\n').map(JSON.parse).map(r => [r.actionId, r.code]))
+    assert.deepEqual(codes, { x1: 'status_conflict', x2: 'not_found', x3: 'status_conflict', x4: 'not_found' })
+  } finally {
+    env.cleanup()
+  }
+})
+
+test('index.ts 把 resolveInboxTarget 注入 ActionInbox（未注入时收件箱一律报 not_found）', () => {
+  const src = readFileSync(join(import.meta.dirname, '..', 'src', 'index.ts'), 'utf8')
+  assert.match(src, /resolveTarget: resolveInboxTarget/)
 })

@@ -27,6 +27,12 @@ export interface ApprovalWiringDeps {
 export interface ApprovalWiring {
   reportRevision: ReportRevisionService
   approvalActions: ApprovalActions | null
+  /**
+   * 收件箱 stale 细分用的目标解析（ActionInbox.resolveTarget）：只看行是否存在——
+   * 不存在 → not_found，存在但状态不符 → status_conflict。未注入时收件箱一律报 not_found，
+   * 前端会把「已在别处处理」误显示成「目标不存在」。
+   */
+  resolveInboxTarget: (chatId: string, kind: 'task' | 'promise' | 'event', id: number) => { createdAt: number } | null
 }
 
 /** 组装审批服务图（index.ts 与接线测试共用） */
@@ -67,5 +73,9 @@ export function createApprovalWiring(deps: ApprovalWiringDeps): ApprovalWiring {
         marks: reportRevision,
       })
     : null
-  return { reportRevision, approvalActions }
+  const resolveInboxTarget: ApprovalWiring['resolveInboxTarget'] = (chatId, kind, id) => {
+    const row = kind === 'task' ? groupStore.getTask(chatId, id) : kind === 'promise' ? groupStore.getPromise(chatId, id) : groupStore.getEvent(chatId, id)
+    return row ? { createdAt: 'createdAt' in row ? row.createdAt : 0 } : null
+  }
+  return { reportRevision, approvalActions, resolveInboxTarget }
 }

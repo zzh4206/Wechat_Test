@@ -39,6 +39,8 @@ export interface ActionLine {
   type: string
   targetId: number
   params?: Record<string, unknown>
+  /** 提交方 token 的 sha256 前 8 位（web 进程写入）；插件配置了 token 时必须与之一致（审计对齐） */
+  operator?: string
 }
 
 export interface ActionInboxDeps {
@@ -49,7 +51,7 @@ export interface ActionInboxDeps {
   /** 白名单群（R2：chatId ∈ groups，白名单外拒绝） */
   groups: readonly string[]
   /** W-8 stale 细分用：目标存在性解析（缺省 = 一律 status_conflict） */
-  resolveTarget?: (chatId: string, targetKind: 'task' | 'promise', targetId: number) => { createdAt: number } | null
+  resolveTarget?: (chatId: string, targetKind: 'task' | 'promise' | 'event', targetId: number) => { createdAt: number } | null
   /** W-1：操作者标识（web token 哈希前缀；审计元数据） */
   operator?: string
   logger: StoreLogger
@@ -61,6 +63,7 @@ export type ActionCode =
   | 'ok' | 'duplicate'
   | 'not_found' | 'status_conflict' // W-8：stale 细分
   | 'chat_not_allowed' | 'type_not_allowed' // W-8：forbidden 细分
+  | 'operator_mismatch' // 动作行的 operator 与插件 webActionsToken 指纹不一致（审计标签对不上真实 token）
   | 'unsupported' | 'bad_request' | 'error'
 
 export interface ActionOutcome {
@@ -98,6 +101,7 @@ export function parseActionLine(line: string): ActionLine | null {
       type: v.type,
       targetId: typeof v.targetId === 'number' ? v.targetId : NaN,
       params: (typeof v.params === 'object' && v.params !== null ? v.params : undefined) as Record<string, unknown> | undefined,
+      operator: typeof v.operator === 'string' ? v.operator : undefined,
     }
   } catch {
     return null
@@ -122,7 +126,8 @@ export function validateRegenParams(params: Record<string, unknown> | undefined)
 
 /** W-8：stale 细分——目标不存在 → not_found；存在但状态不符 → status_conflict */
 function staleOf(deps: Pick<ActionInboxDeps, 'resolveTarget'>, a: ActionLine): { code: ActionOutcome['code']; reason?: string } {
-  const t = deps.resolveTarget?.(a.chatId, a.type === 'promise.mark' || a.type.startsWith('promise.') ? 'promise' : 'task', a.targetId)
+  const kind = a.type.startsWith('promise.') ? 'promise' : a.type.startsWith('event.') ? 'event' : 'task'
+  const t = deps.resolveTarget?.(a.chatId, kind, a.targetId)
   if (!t) return { code: 'not_found' }
   return { code: 'status_conflict' }
 }
@@ -141,7 +146,10 @@ interface ResultTombstone { actionId: string; ok: boolean; code: string }
 /** W-9 墓碑队列上限（防磁盘长期满时无界增长） */
 export const RESULT_TOMBSTONE_MAX = 100
 
-/** 前端动作 → ApprovalActions / MarkActions 单入口分发。返回 code（stale = 服务返回 false） */
+/**
+ * 前端动作 → ApprovalActions / MarkActions 单入口分发。返回 code（stale = 服务返回 false）。
+ * 带 source 的门面方法一律显式传 'web'——缺省值是 'chat'，漏传会把前端审批记成「来源：对话框」。
+ */
 export async function dispatchAction(
   deps: Pick<ActionInboxDeps, 'actions' | 'marks' | 'resolveTarget'>,
   a: ActionLine,
@@ -149,29 +157,29 @@ export async function dispatchAction(
   const A = deps.actions
   const id = a.targetId
   switch (a.type) {
-    case 'task.confirm': return (await A.taskConfirm(a.chatId, id)) ? { code: 'ok' } : staleOf(deps, a)
-    case 'task.cancel': return (await A.taskCancel(a.chatId, id)) ? { code: 'ok' } : staleOf(deps, a)
-    case 'task.complete': return (await A.taskComplete(a.chatId, id)) ? { code: 'ok' } : staleOf(deps, a)
+    case 'task.confirm': return (await A.taskConfirm(a.chatId, id, 'web')) ? { code: 'ok' } : staleOf(deps, a)
+    case 'task.cancel': return (await A.taskCancel(a.chatId, id, 'web')) ? { code: 'ok' } : staleOf(deps, a)
+    case 'task.complete': return (await A.taskComplete(a.chatId, id, 'web')) ? { code: 'ok' } : staleOf(deps, a)
     case 'task.set_deadline': {
       const dl = a.params?.deadline
       if (typeof dl !== 'number' || !Number.isFinite(dl)) return { code: 'bad_request', reason: 'deadline_required' }
-      return (await A.taskSetDeadline(a.chatId, id, dl)) ? { code: 'ok' } : staleOf(deps, a)
+      return (await A.taskSetDeadline(a.chatId, id, dl, 'web')) ? { code: 'ok' } : staleOf(deps, a)
     }
     case 'task.postpone': {
       const dl = a.params?.deadline
       if (typeof dl !== 'number' || !Number.isFinite(dl)) return { code: 'bad_request', reason: 'deadline_required' }
-      return (await A.taskPostpone(a.chatId, id, dl)) ? { code: 'ok' } : staleOf(deps, a)
+      return (await A.taskPostpone(a.chatId, id, dl, 'web')) ? { code: 'ok' } : staleOf(deps, a)
     }
     case 'task.rewrite': {
       const text = a.params?.text
       if (typeof text !== 'string' || text.trim() === '') return { code: 'bad_request', reason: 'text_required' }
-      return (await A.taskRewrite(a.chatId, id, text)) ? { code: 'ok' } : staleOf(deps, a)
+      return (await A.taskRewrite(a.chatId, id, text, 'web')) ? { code: 'ok' } : staleOf(deps, a)
     }
-    case 'event.confirm': return (await A.eventConfirm(a.chatId, id)) ? { code: 'ok' } : staleOf(deps, a)
-    case 'promise.confirm': return (await A.promiseConfirm(a.chatId, id)) ? { code: 'ok' } : staleOf(deps, a)
-    case 'promise.cancel': return (await A.promiseCancel(a.chatId, id)) ? { code: 'ok' } : staleOf(deps, a)
+    case 'event.confirm': return (await A.eventConfirm(a.chatId, id, 'web')) ? { code: 'ok' } : staleOf(deps, a)
+    case 'promise.confirm': return (await A.promiseConfirm(a.chatId, id, 'web')) ? { code: 'ok' } : staleOf(deps, a)
+    case 'promise.cancel': return (await A.promiseCancel(a.chatId, id, 'web')) ? { code: 'ok' } : staleOf(deps, a)
     case 'promise.fulfilled': return (await A.promiseFulfilled(a.chatId, id)) ? { code: 'ok' } : staleOf(deps, a)
-    case 'promise.close': return (await A.promiseClose(a.chatId, id)) ? { code: 'ok' } : staleOf(deps, a)
+    case 'promise.close': return (await A.promiseClose(a.chatId, id, 'web')) ? { code: 'ok' } : staleOf(deps, a)
     case 'person.follow': {
       const pid = a.params?.pid
       if (typeof pid !== 'string' || pid === '') return { code: 'bad_request', reason: 'pid_required' }
@@ -345,6 +353,11 @@ export class ActionInbox {
   }
 
   private async process(a: ActionLine): Promise<ActionOutcome> {
+    // 审计对齐：配置了 token 时，动作行必须带同一 token 的指纹——否则审计里的 operator
+    // 对应的不是浏览器实际使用的 token，无法据此核对是谁提交的。未配置 token 时维持原行为（记 unknown）。
+    if (this.deps.operator && a.operator !== this.deps.operator) {
+      return { actionId: a.actionId, ok: false, code: 'operator_mismatch' }
+    }
     if (!ACTION_TYPES.includes(a.type as ActionType)) {
       return { actionId: a.actionId, ok: false, code: 'type_not_allowed' }
     }
@@ -393,7 +406,9 @@ export class ActionInbox {
   private audit(a: ActionLine, outcome: ActionOutcome): void {
     this.deps.store.ensureDir('audit')
     // 只记元数据：actionId/type/chatId/code/operator（W-1：操作者=web token 哈希前缀，绝不落原 token/语句原文）
-    this.deps.store.appendJsonl(WEB_ACTIONS_AUDIT_REL, { ts: this.now(), actionId: a.actionId, type: a.type, chatId: a.chatId, code: outcome.code, ok: outcome.ok, operator: this.deps.operator ?? 'unknown' })
+    // operator_mismatch 时另记动作行自称的指纹（claimedOperator，同为哈希前缀），便于排查是哪个 web 进程配错了
+    const claimed = outcome.code === 'operator_mismatch' ? { claimedOperator: a.operator ?? 'none' } : {}
+    this.deps.store.appendJsonl(WEB_ACTIONS_AUDIT_REL, { ts: this.now(), actionId: a.actionId, type: a.type, chatId: a.chatId, code: outcome.code, ok: outcome.ok, operator: this.deps.operator ?? 'unknown', ...claimed })
   }
 
   /** 启动轮询（接线层 ctx.effect 挂 dispose） */
