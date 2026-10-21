@@ -617,7 +617,8 @@ export class ReportService {
     chatId: string,
     kind: ReportKind,
     asOf?: number,
-    /** 补发队列用：锚定历史 dateKey 的窗口起点（前一日 20:20），end = 再生成时刻，dateKey = 该历史日 */
+    /** 补发/重跑队列用：锚定历史 dateKey 的窗口起点（前一日 20:20），end = asOf，dateKey = 该历史日。
+     *  日报的 asOf 由 regen-processor 取该日原定生成时刻（dailyCutoff），不再是「现在」 */
     backfillDateKey?: string,
   ): Promise<GenerateReportResult> {
     if (!this.options.enabled) return { status: 'disabled', path: null, judgmentCount: 0, topicCount: 0, messageCount: 0 }
@@ -626,7 +627,7 @@ export class ReportService {
     const ts = asOf ?? this.now()
     let win = reportWindow(kind, ts)
     if (backfillDateKey) {
-      // 补发/回填覆盖窗口：daily 锚定 [dateKey 前一日 20:20, now]（调度对齐口径）；
+      // 补发/回填覆盖窗口：daily 锚定 [dateKey 前一日 20:20, asOf]（asOf = 该日原定生成时刻，调度对齐口径）；
       // weekly/monthly 锚定 periodStart（周一/当月 1 号）当日 00:00 起——把正号登录后
       // 同步进库的消息全部纳入；dateKey 不变（月报补发锚定当月 1 号，验收裁定 §三-2）。
       const dayStart = parseLocalDayStart(backfillDateKey)
@@ -812,7 +813,7 @@ export class ReportService {
    * 不主动触发各群 LLM 生成——只聚合已存在的报告（缺报告的群计为"未生成"一行带过）。
    * backfillDateKey：手动重跑历史某日的汇总（前端「重新生成」）——窗口 [该日前一日 20:20, asOf]，
    * dateKey = 该日，读该日各群日报。asOf 由调用方取「该日原定生成时刻」（见 regen-processor
-   * summaryCutoff），否则统计会把之后几天的消息也算进来。
+   * dailyCutoff），否则统计会把之后几天的消息也算进来。
    */
   async generateSummary(asOf?: number, backfillDateKey?: string): Promise<{ path: string | null; groupsIncluded: number; groupsSkipped: number }> {
     if (!this.options.enabled) return { path: null, groupsIncluded: 0, groupsSkipped: 0 }

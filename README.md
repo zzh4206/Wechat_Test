@@ -32,7 +32,7 @@
 | `0数据格式/` | **知识库纯模板**：三层 schema（资料 `doc` + 日志 `report`/`entry` + 会话要点 `chat_digest`）+ 3 个 Python 工具。**不录入任何数据** |
 | `web/` | 本地前端工作台（独立进程，只监听 127.0.0.1）：报告日历/详情、资料库、媒体、会话要点、人员关注的只读回溯，审批收件箱（确认/取消/完成/定时间）与报告定稿、重新生成、排入发件箱（均经插件收件箱执行；排入发件箱默认关闭，之后走既有发送链路）。启动见 [RUNBOOK §14](docs/RUNBOOK.md) |
 | `scripts/` | `check-sensitive.sh`（敏感信息扫描）、`llm-cost.mjs`（费用汇总）、`import-state-to-sqlite.mjs`（一次性导入器） |
-| `tests/` | 58 个测试文件、542 例，全离线 mock，不碰真实库 |
+| `tests/` | 58 个测试文件、543 例，全离线 mock，不碰真实库 |
 
 ## 架构：从聊天到知识库
 
@@ -208,7 +208,7 @@ node scripts/import-state-to-sqlite.mjs --state-dir ~/.dsh/dsh-group-lurker
 ```bash
 npm install
 npm run build   # tsc → lib/
-npm test        # node --test，58 文件 / 542 例，全离线 mock
+npm test        # node --test，58 文件 / 543 例，全离线 mock
 ./scripts/check-sensitive.sh   # 提交前必跑，CI 会拦
 ```
 

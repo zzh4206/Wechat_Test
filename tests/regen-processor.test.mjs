@@ -251,14 +251,14 @@ test('手动重跑跨群汇总：改调 generateSummary(now, dateKey)，不调 g
   rmSync(env.dir, { recursive: true, force: true })
 })
 
-test('summaryCutoff：历史日截到该日 dailyReportTime；当天未到点取 now；时点非法退到该日 24:00', async () => {
-  const { summaryCutoff } = await import('../lib/regen-processor.js')
+test('dailyCutoff：历史日截到该日 dailyReportTime；当天未到点取 now；时点非法退到该日 24:00', async () => {
+  const { dailyCutoff } = await import('../lib/regen-processor.js')
   const at = (y, m, d, h = 0, mi = 0) => new Date(y, m - 1, d, h, mi).getTime()
   const now = at(2026, 10, 21, 9)
-  assert.equal(summaryCutoff('2026-10-14', '20:30', now), at(2026, 10, 14, 20, 30))
-  assert.equal(summaryCutoff('2026-10-21', '20:30', now), now, '当天还没到生成时刻：截到现在')
-  assert.equal(summaryCutoff('2026-10-14', 'bad', now), at(2026, 10, 15))
-  assert.equal(summaryCutoff('2026-10-14', undefined, now), at(2026, 10, 15))
+  assert.equal(dailyCutoff('2026-10-14', '20:30', now), at(2026, 10, 14, 20, 30))
+  assert.equal(dailyCutoff('2026-10-21', '20:30', now), now, '当天还没到生成时刻：截到现在')
+  assert.equal(dailyCutoff('2026-10-14', 'bad', now), at(2026, 10, 15))
+  assert.equal(dailyCutoff('2026-10-14', undefined, now), at(2026, 10, 15))
 })
 
 test('手动重跑历史日汇总：传给 generateSummary 的 asOf 是该日原定生成时刻而不是现在', async () => {
@@ -269,5 +269,26 @@ test('手动重跑历史日汇总：传给 generateSummary 的 asOf 是该日原
   env.queue.enqueue('aggregate', '2026-10-14', 1, 'daily', 'manual')
   await processManualRegen({ ...env.deps, dailyReportTime: '20:30' })
   assert.deepEqual(calls, [[new Date(2026, 9, 14, 20, 30).getTime(), '2026-10-14']])
+  rmSync(env.dir, { recursive: true, force: true })
+})
+
+test('群日报回填（错号补发 + 手动重跑）：asOf 截到该日原定生成时刻；周报沿用 now', async () => {
+  const env = makeEnv(['ok', 'ok', 'ok'])
+  const asOfs = []
+  const inner = env.deps.report.generateReport
+  env.deps.report.generateReport = async (c, k, asOf, d) => { asOfs.push([k, d, asOf]); return inner(c, k, asOf, d) }
+  const now = new Date(2026, 9, 21, 9).getTime()
+  const deps = { ...env.deps, now: () => now, dailyReportTime: '20:30' }
+  env.queue.enqueue(CHAT, '2026-10-14', 1, 'daily', 'wrong_account')
+  env.queue.enqueue(CHAT, '2026-10-15', 2, 'daily', 'manual')
+  env.queue.enqueue(CHAT, '2026-10-12', 3, 'weekly', 'manual')
+  await processRegenHead(deps)
+  await processManualRegen(deps)
+  await processManualRegen(deps)
+  assert.deepEqual(asOfs, [
+    ['daily', '2026-10-14', new Date(2026, 9, 14, 20, 30).getTime()],
+    ['daily', '2026-10-15', new Date(2026, 9, 15, 20, 30).getTime()],
+    ['weekly', '2026-10-12', now],
+  ])
   rmSync(env.dir, { recursive: true, force: true })
 })

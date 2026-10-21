@@ -28,6 +28,11 @@ import type { StoreLogger } from './store.js'
 import type { RegenEntry, RegenQueue } from './regen-queue.js'
 
 export const REGEN_EMPTY_MAX_ATTEMPTS = 2 // 空产出重试上限（共 1+2=3 次生成尝试）
+/** 回填生成的 asOf：日报截到该日原定生成时刻；周/月报沿用 now（窗口终点口径另议） */
+function regenAsOf(deps: Pick<RegenProcessorDeps, 'now' | 'dailyReportTime'>, kind: RegenEntry['kind'], dateKey: string): number {
+  return kind === 'daily' ? dailyCutoff(dateKey, deps.dailyReportTime, deps.now()) : deps.now()
+}
+
 /** 跨群汇总的 chatId（与 store / knowledge.db 的 report.chat_id 同值） */
 export const AGGREGATE_CHAT_ID = 'aggregate'
 
@@ -42,6 +47,8 @@ export interface RegenProcessorDeps {
   /** 审计出口（零正文：只记元数据） */
   audit: (entry: Record<string, unknown>) => void
   now: () => number
+  /** 日报触达时点 HH:MM（Config.dailyReportTime）：历史日的日报/汇总窗口截到该日这一刻（见 dailyCutoff） */
+  dailyReportTime?: string
 }
 
 export interface RegenProcessOutcome {
@@ -69,7 +76,7 @@ export async function processRegenHead(deps: RegenProcessorDeps): Promise<RegenP
 
   let rr
   try {
-    rr = await deps.report.generateReport(chatId, kind, deps.now(), dateKey)
+    rr = await deps.report.generateReport(chatId, kind, regenAsOf(deps, kind, dateKey), dateKey)
   } catch (error) {
     // 环境类失败：留在原位，不消耗重试次数（与熄屏 deferred 同语义）
     deps.audit({ result: 'regen_env_deferred', chat_id: chatId, date_key: dateKey, kind })
@@ -102,22 +109,21 @@ export async function processRegenHead(deps: RegenProcessorDeps): Promise<RegenP
 }
 
 /** 手动重跑的依赖：不需要 outbox / groupStore（不发送、不做 satisfied 检查） */
-export type ManualRegenDeps = Pick<RegenProcessorDeps, 'queue' | 'logger' | 'notify' | 'audit' | 'now'> & {
+export type ManualRegenDeps = Pick<RegenProcessorDeps, 'queue' | 'logger' | 'notify' | 'audit' | 'now' | 'dailyReportTime'> & {
   report: RegenProcessorDeps['report'] & {
     /** 跨群汇总重跑（缺省 = aggregate 条目按失败出队） */
     generateSummary?: (asOf?: number, backfillDateKey?: string) => Promise<{ path: string | null; groupsIncluded: number }>
   }
   /** 账号闸：返回 false = 当前错号，跳过本轮（未注入账号闸时恒 true） */
   accountOk?: () => Promise<boolean>
-  /** 日报触达时点 HH:MM（Config.dailyReportTime）：历史日汇总的统计窗口截到该日这一刻 */
-  dailyReportTime?: string
 }
 
 /**
- * 历史日汇总的统计截止时刻 = 该日原定生成时刻（dateKey 当天 dailyReportTime），且不晚于 now。
+ * 历史日的窗口截止时刻 = 该日原定生成时刻（dateKey 当天 dailyReportTime），且不晚于 now。
+ * 日报重跑/补发与汇总重跑共用：之后几天的消息不进该日窗口（审批/标记的后续变化走修订流，不靠扩窗）。
  * 时点缺失/非法时退到该日 24:00。
  */
-export function summaryCutoff(dateKey: string, dailyReportTime: string | undefined, now: number): number {
+export function dailyCutoff(dateKey: string, dailyReportTime: string | undefined, now: number): number {
   const d = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateKey)
   if (!d) return now
   const t = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(dailyReportTime ?? '')
@@ -139,7 +145,7 @@ export async function processManualRegen(deps: ManualRegenDeps): Promise<RegenPr
   if (chatId === AGGREGATE_CHAT_ID) return processManualSummary(deps, entry)
   let rr
   try {
-    rr = await deps.report.generateReport(chatId, kind, deps.now(), dateKey)
+    rr = await deps.report.generateReport(chatId, kind, regenAsOf(deps, kind, dateKey), dateKey)
   } catch (error) {
     deps.audit({ result: 'regen_env_deferred', chat_id: chatId, date_key: dateKey, kind, reason: 'manual' })
     deps.logger.warn(`regen-queue: 手动重跑生成异常（留在原位） ${chatId}/${dateKey}: ${String(error).slice(0, 120)}`)
@@ -156,7 +162,7 @@ async function processManualSummary(deps: ManualRegenDeps, entry: RegenEntry): P
   const { chatId, dateKey, kind } = entry
   let s: { path: string | null; groupsIncluded: number } | null = null
   try {
-    s = deps.report.generateSummary ? await deps.report.generateSummary(summaryCutoff(dateKey, deps.dailyReportTime, deps.now()), dateKey) : null
+    s = deps.report.generateSummary ? await deps.report.generateSummary(dailyCutoff(dateKey, deps.dailyReportTime, deps.now()), dateKey) : null
   } catch (error) {
     deps.audit({ result: 'regen_env_deferred', chat_id: chatId, date_key: dateKey, kind, reason: 'manual' })
     deps.logger.warn(`regen-queue: 跨群汇总重跑异常（留在原位） ${dateKey}: ${String(error).slice(0, 120)}`)

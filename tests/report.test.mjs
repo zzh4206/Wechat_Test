@@ -299,8 +299,8 @@ test('聚合回填：generateSummary(该日原定生成时刻, dateKey) 重写�
     { msgId: 'g1-e', ts: T(10) + 2 * 86_400_000, senderPid: 'u1', senderName: 'A', text: '@B 两天后' },
   ])
   const later = T(20, 40) + 3 * 86_400_000
-  const { summaryCutoff } = await import('../lib/regen-processor.js')
-  const sum = await report.generateSummary(summaryCutoff('2026-06-10', '20:30', later), '2026-06-10')
+  const { dailyCutoff } = await import('../lib/regen-processor.js')
+  const sum = await report.generateSummary(dailyCutoff('2026-06-10', '20:30', later), '2026-06-10')
   assert.equal(sum.path, 'reports/summary/2026-06-10.md')
   const md = readFileSync(join(dir, 'reports', 'summary', '2026-06-10.md'), 'utf8')
   assert.match(md, /# 跨群汇总 · 2026-06-10/)
