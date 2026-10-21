@@ -662,6 +662,11 @@ LURKER_WEB_TOKEN='<与插件 webActionsToken 相同的值>' \
   `kind: 'daily'`（其它周期回执 `bad_request`，原因 `aggregate_daily_only`），任务/承诺等动作仍回
   `chat_not_allowed`。聚合的「重新生成」**不调 LLM**：按各群当天现有日报重新汇总（窗口与群日报回填
   同口径）；想更新某个群在汇总里的内容，先重新生成那个群的日报、再重新生成汇总。
+  周/月汇总目前**尚未生成**（knowledge.db 里的 weekly/monthly aggregate 行只是占位），详情页对它们不显示操作。
+  以后接上周/月汇总时，除 `generateSummary` 里 `writeReport` 的 kind 外，还要一起改：同函数里写死的
+  `reportWindow('daily')` 与 `reports/summary/<日期>.md` 路径、读各群报告时的 kind；调度端 `maybeSummarize`
+  （目前只在日报后触发）；手动重跑 `processManualSummary` 传 kind；收件箱与 `web/lib/actions.mjs` 的
+  `aggregate_daily_only` 两道校验；`app.js` 的 `reportActions` 周/月汇总提示。
 
 ### 14.3 拒绝启动 / 接口报错
 

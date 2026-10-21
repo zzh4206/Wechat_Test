@@ -187,6 +187,8 @@ async function openReport(id, into) {
 /** 详情页操作条。跨群聚合（只有日报）同样可定稿 / 重新生成 / 排入发件箱；它的重新生成只是按各群现有日报重新汇总 */
 function reportActions(r, into) {
   const aggregate = r.chatId === AGGREGATE
+  // 周/月汇总尚未生成（knowledge.db 里只是占位行），插件只认日报汇总的操作
+  if (aggregate && r.periodType !== 'daily') return h('div', { class: 'actions report-actions' }, h('span', { class: 'muted' }, '周/月汇总暂未生成，不提供操作'))
   const status = h('span', { class: 'status' })
   const buttons = []
   const params = { kind: r.periodType, dateKey: r.periodStart }
