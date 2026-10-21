@@ -573,28 +573,49 @@ Accessibility Inspector 确认元素层级）。**实证结论回填此处：___
   无 `id` 的旧行按 ts+kind+行号兜底（W-10 兼容规则）。
 - 条目 `evidence_ref` 指向报告 md 路径、`outbox/<id>`（详情在 body 的速览类）或消息 msg_id。
 
-## 14. 前端工作台（FE-1 只读回溯）
+## 14. 前端工作台（FE-1 只读回溯 + FE-2 审批收件箱）
 
-本地网页，按 日期 × 群 × 周期 回看报告，另有资料库、媒体清单、会话要点、人员关注摘要。
-它是**独立 node 进程**（`web/server.mjs`），不在插件里：不持有任何发送能力，只读本项目自己的库，FE-1 不写任何文件。
+本地网页，按 日期 × 群 × 周期 回看报告，另有资料库、媒体清单、会话要点、人员关注摘要（FE-1）；
+「审批」页集中处理待确认的任务/承诺/事件、给任务定时间、标记完成，「人员关注」页可关注/取消关注成员（FE-2）。
+它是**独立 node 进程**（`web/server.mjs`），不在插件里：不持有任何发送能力，只读本项目自己的库；
+唯一的写入是向 `<stateDir>/web/actions.jsonl` 追加动作行，由插件收件箱执行（§13）。
 
 ### 14.1 启动
 
 ```bash
-# 前提：插件至少启动过一次——它会写 <stateDir>/web/allowed-chats.json（白名单 + knowledge.db 路径）
+# 前提：插件至少启动过一次——它会写 <stateDir>/web/allowed-chats.json（白名单 + knowledge.db 路径 + 收件箱是否开启）
 LURKER_WEB_TOKEN='<与插件 webActionsToken 相同的值>' \
   node web/server.mjs --state-dir "$HOME/.dsh/dsh-group-lurker" [--db /path/to/knowledge.db] [--port 8787]
 ```
 
 - 浏览器打开 `http://127.0.0.1:8787/#token=<token>`。页面把 token 存进当前标签页的 sessionStorage 后立即从地址栏抹掉；
   关掉标签页即失效，再开需重新带 `#token=`。
-- 不设 `LURKER_WEB_TOKEN` 时进程生成一次性随机 token，**只在启动时打印一次**——适合临时查看；
-  FE-2 起动作通道要求与插件 `webActionsToken` 一致（RUNBOOK §13.3），届时须用环境变量传入。
-  token 不走命令行参数，避免出现在 `ps` 输出里。
+- 不设 `LURKER_WEB_TOKEN` 时进程生成一次性随机 token，**只在启动时打印一次**，且为**只读模式**（审批按钮禁用）——
+  适合临时查看。token 不走命令行参数，避免出现在 `ps` 输出里。
 - `--db` 缺省取清单里的路径（即插件 `sqlitePath`）；插件 `sqlitePath='off'` 时回溯类页面提示不可用，人员关注照常。
 - 只监听 `127.0.0.1`，**没有**改监听地址的参数（手机直连不在本期范围，见前端设计 §11-Q4）。
 
-### 14.2 拒绝启动 / 接口报错
+### 14.2 开启审批（FE-2）
+
+三项都满足，「审批」页的按钮才可用（否则页面顶部提示原因、只读展示）：
+
+1. 插件配置 `webActionsEnabled: true`（并重启插件，清单里 `actionsEnabled` 随之变为 true）；
+2. 插件配置 `webActionsToken` 与 web 进程的 `LURKER_WEB_TOKEN` 是**同一个值**（审计 operator 即其 sha256 前 8 位）；
+3. web 进程用 `LURKER_WEB_TOKEN` 启动（随机 token 只读）。
+
+提交后页面显示「已提交，等待插件处理…」，插件按 `webActionsPollSec`（默认 5 秒）消费，回执到达后显示结果：
+
+| 页面提示 | 回执码 | 含义 |
+|---|---|---|
+| 已生效 | `ok` | 已执行；确认类动作同时登记模式学习、出身日报追加修订段（来源：前端） |
+| 状态已变化 | `status_conflict` | 目标已在别处处理（如对话框里已确认），刷新即可 |
+| 目标不存在 | `not_found` | 行已被删除或 id 不对 |
+| 60 秒内插件未处理 | — | 插件没在跑或收件箱没开；动作已入队，插件恢复后仍会执行 |
+
+前端只开放这些动作：`task.confirm/cancel/complete/set_deadline`、`event.confirm`、
+`promise.confirm/cancel/fulfilled/close`、`person.follow/unfollow`（插件侧白名单的子集；`report.regen` 等留给 FE-3）。
+
+### 14.3 拒绝启动 / 接口报错
 
 | 现象 | 原因 | 处置 |
 |---|---|---|
@@ -602,12 +623,15 @@ LURKER_WEB_TOKEN='<与插件 webActionsToken 相同的值>' \
 | 页面提示 token 无效（401） | 地址没带 `#token=`，或与进程的 token 不一致 | 用启动时的 token 重开 |
 | 403 `bad_host` / `bad_origin` | 用了 127.0.0.1/localhost 以外的主机名访问，或其它网页在跨站请求 | 预期行为（防 DNS rebinding / CSRF），用 `127.0.0.1` 访问 |
 | 503 `knowledge_db_unavailable` | knowledge.db 不存在或镜像已关 | 检查 `sqlitePath` / `--db` |
+| 409 `actions_disabled` | 写动作未开启（`reason`：`no_shared_token` / `inbox_disabled`） | 见 §14.2 |
+| 415 / 403 `bad_origin`（提交时） | 写请求必须是本页面发出的 JSON 请求 | 预期行为（防 CSRF），从工作台页面操作 |
 
 白名单每个请求都重读：插件改 `groups` 重启后，web 进程无需重启即生效。
 
-### 14.3 停用
+### 14.4 停用
 
-`Ctrl-C`（或 SIGTERM）即可。web 进程没有后台任务、不写文件，停掉不影响插件。
+`Ctrl-C`（或 SIGTERM）即可。web 进程没有后台任务，停掉不影响插件；已提交未执行的动作留在 actions.jsonl，
+插件照常消费。要彻底关闭审批通道，把插件 `webActionsEnabled` 设回 `false`。
 
 ## 排障：重新登录/切换微信账号后读取失效（code 15）
 

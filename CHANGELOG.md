@@ -8,6 +8,7 @@
 
 ### Added
 
+- 前端工作台 FE-2（审批收件箱）：「审批」页列出各白名单群待确认的任务/承诺/事件、无时限任务与进行中事项，带证据预览与前后文；可确认、取消、完成、定时间、兑现、关闭，「人员关注」页可关注/取消关注成员。提交经 `POST /api/actions` 追加到 `web/actions.jsonl`（web 进程唯一写入点 `web/lib/actions.mjs`，拒绝符号链接），插件收件箱执行后页面轮询回执显示结果。写动作要求共享 token（`LURKER_WEB_TOKEN` = `webActionsToken`）、插件收件箱开启（清单新增 `actionsEnabled`）、本服务 Origin 与 JSON 请求体；web-boundary 哨兵加钉动作模块只许追加写。启动与开启方法见 RUNBOOK §14
 - 前端工作台 FE-1（只读回溯，前端设计方案 B）：新增独立 web 进程 `web/server.mjs`（零 npm 依赖、只监听 127.0.0.1、只读打开 knowledge.db / 每群库 / digests，FE-1 零写入），页面含报告月历与详情（修订历史、前后期切换）、资料库、媒体清单、会话要点、人员关注摘要；`/api/*` 校验 token（`LURKER_WEB_TOKEN`）、Host、Origin，严格 CSP、不发 CORS 头；正文经服务端解析为 JSON 块结构、前端只用 textContent 渲染。插件启动时写 `<stateDir>/web/allowed-chats.json`（`src/web-manifest.ts`，白名单 + knowledge.db 路径，设计 §11-Q5 方案 b），web 进程据此做白名单校验、清单缺失或为空拒绝启动。新增哨兵 `tests/web-boundary.test.mjs`（web/ 只 import node: 内置与自身模块、无子进程/出网、零写原语、listen 只认 127.0.0.1、页面禁 innerHTML 类原语）与功能/安全用例 `tests/web-server.test.mjs`；启动与排障见 RUNBOOK §14
 - 前端动作通道加固一批（2026-10-20 前端准备审查 W-1/W-2/W-3/W-9）：收件箱水位改**字节偏移**（`web/actions.offset` 存 `{byteOffset, lastActionId}`，每行处理后立即落盘；截断/轮转 → 从头 resync + error 审计、actionId 连续性锚点不符 → resync + warn、尾部半行不消费）——修回设计「水位=字节偏移」口径；审计行增 `operator`（共享 token 的 sha256 前 8 位，新配置 `webActionsToken`，绝不落原 token）；`webActionsEnabled` 开但 task/promise 识别缺失时启动 error 指明缺失依赖与「收件箱不消费」后果；回执写失败入有界内存墓碑下轮补写 + 连续失败 error 告警；RUNBOOK 新增 §13 前端对接硬约定（禁轮转/截断 actions.jsonl、outbox 补丁行读侧归并等）
 - reminder 每日速览 `evidence_ref` 改指 outbox 条目自身（`outbox/<id>`，`appendOutbox` 支持调用方预生成 id）——不再指向从未写入的 `reminder/digest/<day>.txt`（W-11）
@@ -19,6 +20,8 @@
 
 ### Fixed
 
+- 前端收件箱回执：前端动作调审批门面时没传 `source`，落到缺省 `'chat'`，前端审批在修订段被记成「来源：对话框」——改为显式传 `'web'`；生产接线没给 `ActionInbox` 注入 `resolveTarget`，已处理过的目标一律回 `not_found`（且 `event.*` 被当任务 id 查）——`createApprovalWiring` 新增 `resolveInboxTarget` 并注入，按 task/promise/event 区分，已处理过的回 `status_conflict`
+- 前端工作台页面：可选内容为空时出现文字「null」（原生 `replaceChildren` 不跳过 null）——改用过滤空值的 `fill()`
 - 审批接线：`taskComplete` 的 `marks` 依赖改走 `reportRevision.markTarget`（原直连 `store.mirrorMarking`）——不存在的任务不再"完成成功"，完成时出身日报照常追加修订段并级联周/月报，与收件箱 `task.mark` 同源同效。组装抽成 `src/approval-wiring.ts` 的 `createApprovalWiring`，`index.ts` 与 `tests/wiring.test.mjs` 共用，接线测试从此测的是生产接线
 - outbox `updateSendState` 由整文件读-改-写改**追加状态补丁行**（`{patch:true, id, …patch}`），读取侧（`tailOutbox`/`listOutbox` 及测试 helper）按 id fold 归并——与 `appendOutbox` 并发不再丢追加（审查 W-4）；regen 整文件覆写与修订段追加的并发安全以并发断言测试钉死（渲染 span 与追加 span 内零 await，单线程原子，W-5）
 - T4 语义：`upsertReport` 冲突分支不再用 `excluded.status` 覆盖既有 status——`final` 报告被修订后仍 `final`（修订不降级），`draft` 也不会被自动 final（draft→final 单向定稿由 finalize 通道承载），测试钉死
