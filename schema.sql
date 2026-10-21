@@ -6,7 +6,7 @@
 
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
-PRAGMA user_version = 5;   -- schema 版本 v0.6（4→5：纯新增 report_revision/marking 两表两视图，既有表零改动）
+PRAGMA user_version = 6;   -- schema 版本 6（5→6：entry 增 chat_id 群归属 + v_marking_latest 分组加 chat_id；report_revision/marking 表不动）
 
 -- ------------------------------------------------------------
 -- 2.1 资料：一切沉淀的知识单元
@@ -122,11 +122,16 @@ CREATE TABLE entry (
   content_md  TEXT NOT NULL,
   report_id   INTEGER REFERENCES report(id) ON DELETE SET NULL,  -- 空=未归档
   doc_id      INTEGER REFERENCES doc(id)    ON DELETE SET NULL,
-  created_at  INTEGER NOT NULL
+  created_at  INTEGER NOT NULL,
+  -- 修订11：群归属（chat_id 列加在表尾，与 5→6 迁移 ALTER TABLE ADD COLUMN 后的列序一致；
+  -- 既有行经迁移回填 'aggregate'）
+  chat_id     TEXT NOT NULL DEFAULT 'aggregate'
+              CHECK (length(chat_id) BETWEEN 1 AND 128)
 );
 CREATE INDEX idx_entry_ts      ON entry(ts);
 CREATE INDEX idx_entry_pending ON entry(report_id) WHERE report_id IS NULL; -- 修订5
 CREATE INDEX idx_entry_doc     ON entry(doc_id)     WHERE doc_id IS NOT NULL; -- 修订5
+CREATE INDEX idx_entry_chat    ON entry(chat_id, ts);                          -- 修订11
 
 -- ------------------------------------------------------------
 -- 2.5 会话摘要（二期由「2水群」项目自动写入）：只存要点，绝不存原文。
@@ -189,11 +194,14 @@ CREATE TABLE marking (
 CREATE INDEX idx_marking_chat ON marking(chat_id, kind, ts);
 CREATE INDEX idx_marking_target ON marking(target_ref);
 
--- 「未完成事项」聚合 = 每 target_ref 取最新一条；同 ts 并列时取 id 大者（MAX(id) 兜底）
+-- 「未完成事项」聚合 = 每 (chat_id, target_ref) 取最新一条；同 ts 并列时取 id 大者（MAX(id) 兜底）。
+-- 修订11：分组加 chat_id——不同群可各自维护同一 target_ref（如同名任务）而互不串态。
 CREATE VIEW v_marking_latest AS
 SELECT m.* FROM marking m
-JOIN (SELECT target_ref, MAX(ts) AS mx, MAX(id) AS mi FROM marking GROUP BY target_ref) t
-  ON m.target_ref = t.target_ref AND m.ts = t.mx AND m.id = t.mi;
+JOIN (SELECT chat_id, target_ref, MAX(ts) AS mx, MAX(id) AS mi
+      FROM marking GROUP BY chat_id, target_ref) t
+  ON m.chat_id = t.chat_id AND m.target_ref = t.target_ref
+ AND m.ts = t.mx AND m.id = t.mi;
 
 -- ------------------------------------------------------------
 -- 2.3.4 v_report_revised 修订视图（v0.6，T1 方案 b：不加 report 列，视图推导）
@@ -234,5 +242,11 @@ ORDER BY r.period_type, r.period_start DESC;
 -- 10. 新增 marking 表（完成情况标记，kind 三态 done/undone/deleted）：source_key 幂等、
 --    同 target_ref 追加行表达状态演变；视图 v_marking_latest（每 target_ref 最新一条，
 --    同 ts 并列取 MAX(id) 兜底）。
+-- （v6，会话级 entry 群归属，工单 D-3/D-4，2026-10-20）
+-- 11. entry 增列 chat_id TEXT NOT NULL DEFAULT 'aggregate'（列序在表尾，与迁移
+--     ALTER TABLE ADD COLUMN 后一致；既有行回填 'aggregate'）；补索引 idx_entry_chat；
+--     视图 v_marking_latest 分组改 (chat_id, target_ref)——不同群同名任务各留最新态。
+--     迁移（user_version 5→6）：ALTER ADD + 回填 + DROP/重建 v_marking_latest，
+--     report_revision/marking 表零改动，单事务幂等。
 -- 二期规划（本期不做）：FTS5 全文索引、report_doc 关联表、uuid 业务键、category 表。
 -- ============================================================
