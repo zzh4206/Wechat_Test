@@ -535,6 +535,44 @@ Accessibility Inspector 确认元素层级）。**实证结论回填此处：___
 - **测试模式隔离**：`scheduleTestMode` 产生的报告同样进 outbox、同样可发——测试期务必保持
   `sendDryRun: true`，验证完及时关掉 scheduleTestMode。
 
+## 13. 前端动作通道对接（web/actions.jsonl，2026-10-20 审查 W-1/W-3/W-4/W-10/W-13 后定稿）
+
+前端工作台（web 进程）与插件之间**只**通过 stateDir 内的 jsonl 文件交换，零 RPC。本节是硬约定：
+
+### 13.1 写通道（前端 → 插件）
+
+- 唯一入口 `POST /api/actions`（web 进程实现，须逐条落实设计 §6.2 token/Origin/Host 三校验）；
+  落盘为**追加写** `<stateDir>/web/actions.jsonl`（§4.3 行格式，actionId 全局唯一幂等键）。
+- **明令禁止轮转/截断 `web/actions.jsonl`**：插件水位是**字节偏移**（`web/actions.offset`，
+  JSON `{byteOffset, lastActionId}`）。文件一旦被截断/轮转（长度 < 水位），插件只能从头 resync
+  （error 审计 + 靠 actionId 幂等防重复执行）——这是兜底不是正常路径；历史归档由前端自己负责。
+- 每行必须以 `\n` 结尾才算完整一行：半行（写到一半）插件不消费，下轮再读。
+- **一切写只走 actions.jsonl**：前端不得直调进程内服务/直接改库；进程内失败对前端永远表现为
+  回执非 ok 或 `not_found`。
+
+### 13.2 水位与回执
+
+- 插件每消费一行立即落盘水位（字节偏移 + 最后一条 actionId 锚点）——插件中途崩溃重启只重放
+  恰好未处理的部分；锚点对不上（文件被改写）→ 从头 resync + warn。
+- 回执：`web/action-results.jsonl` 追加 `{actionId, ok, code, ts}`，前端轮询（默认 5s，
+  `webActionsPollSec`）。写失败（磁盘满等）由插件墓碑补写；若长期失败前端会等不到回执——
+  排障看 error 日志「回执写失败连续」。
+- 失败码：`not_found` / `status_conflict`（stale 细分）、`chat_not_allowed` / `type_not_allowed`、
+  `unsupported` / `bad_request`（带 reason）/ `error`。
+
+### 13.3 审计与身份（W-1）
+
+- `audit/web-actions.jsonl` 只记元数据（ts/actionId/type/chatId/code/ok/**operator**），绝无语句原文。
+- `operator` = 共享 token 的 sha256 前 8 位（插件配置 `webActionsToken`，与 web 进程同一 token；
+  真实值只放 cordis.patch.yml，**任何一侧日志/审计都不落原 token**）。未配置记 `unknown`。
+
+### 13.4 读通道（插件 → 前端，outbox）
+
+- `outbox.jsonl` 只有两种行：完整条目（有 `kind`/`ts`）与**状态补丁行**（`{patch:true, id, status, …}`）。
+  前端读取必须按 `id` fold 归并（行序优先，后写覆盖先写，补丁是 merge 不是 replace）；
+  无 `id` 的旧行按 ts+kind+行号兜底（W-10 兼容规则）。
+- 条目 `evidence_ref` 指向报告 md 路径、`outbox/<id>`（详情在 body 的速览类）或消息 msg_id。
+
 ## 排障：重新登录/切换微信账号后读取失效（code 15）
 
 **现象**：微信重新登录（或切换账号）后，读取层报 SQLCipher code 15 / audit 出现 ok:false / 报告与摘要停更。

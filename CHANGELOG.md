@@ -8,6 +8,9 @@
 
 ### Added
 
+- 前端动作通道加固一批（2026-10-20 前端准备审查 W-1/W-2/W-3/W-9）：收件箱水位改**字节偏移**（`web/actions.offset` 存 `{byteOffset, lastActionId}`，每行处理后立即落盘；截断/轮转 → 从头 resync + error 审计、actionId 连续性锚点不符 → resync + warn、尾部半行不消费）——修回设计「水位=字节偏移」口径；审计行增 `operator`（共享 token 的 sha256 前 8 位，新配置 `webActionsToken`，绝不落原 token）；`webActionsEnabled` 开但 task/promise 识别缺失时启动 error 指明缺失依赖与「收件箱不消费」后果；回执写失败入有界内存墓碑下轮补写 + 连续失败 error 告警；RUNBOOK 新增 §13 前端对接硬约定（禁轮转/截断 actions.jsonl、outbox 补丁行读侧归并等）
+- reminder 每日速览 `evidence_ref` 改指 outbox 条目自身（`outbox/<id>`，`appendOutbox` 支持调用方预生成 id）——不再指向从未写入的 `reminder/digest/<day>.txt`（W-11）
+
 - schema v0.6（审批双通道与报告修订流，TECH-v0.6 定稿）：纯新增 `report_revision`（修订历史，`source_key` 幂等、不可变事实、不建 report 外键）与 `marking`（完成情况标记，kind 三态 done/undone/deleted，同 `target_ref` 状态演变=追加行）两表及 `v_report_revised` / `v_marking_latest` 两视图，既有表零改动；`KnowledgeDao` 增 `insertReportRevision` / `insertMarking`（source_key 冲突→返回已有 id 不更新）/ `listRevisions` / `listMarkingsLatest`，`SqliteMirror` 增 `mirrorReportRevision` / `mirrorMarking`（safe 包裹，事件源接线由插件侧后续完成）；自动迁移升 user_version 4→5 单事务幂等（v3 先升 4 再升 5，0=全新建 v5，其余 <4 或 >5 拒开），与 Python 侧（0数据格式）逻辑一致
 
 - schema v6（工单 D-3/D-4/D-5/D-7，2026-10-20）：`entry` 增列 `chat_id`（迁移回填 `'aggregate'`）+ 索引 `idx_entry_chat`，`v_marking_latest` 分组改 `(chat_id, target_ref)`（不同群同名任务各留最新态）；`KnowledgeDao.insertEntry` / 镜像 `opportunity→entry` 带群 `chatId`；自动迁移升 user_version 5→6 链式幂等（v4 先升 5 再 6、v3 先升 4 再 5 再 6，0=全新建 v6，>6 拒开），与 Python 侧逻辑一致
@@ -15,6 +18,7 @@
 
 ### Fixed
 
+- outbox `updateSendState` 由整文件读-改-写改**追加状态补丁行**（`{patch:true, id, …patch}`），读取侧（`tailOutbox`/`listOutbox` 及测试 helper）按 id fold 归并——与 `appendOutbox` 并发不再丢追加（审查 W-4）；regen 整文件覆写与修订段追加的并发安全以并发断言测试钉死（渲染 span 与追加 span 内零 await，单线程原子，W-5）
 - T4 语义：`upsertReport` 冲突分支不再用 `excluded.status` 覆盖既有 status——`final` 报告被修订后仍 `final`（修订不降级），`draft` 也不会被自动 final（draft→final 单向定稿由 finalize 通道承载），测试钉死
 
 ### Fixed

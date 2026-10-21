@@ -137,6 +137,7 @@ node scripts/import-state-to-sqlite.mjs --state-dir ~/.dsh/dsh-group-lurker
 | `sendSearchViaClipboard` | false | 搜索词剪贴板回退（CJK IME 兜底） |
 | `webActionsEnabled` | false | 前端动作收件箱总闸（审批 web 通道） |
 | `webActionsPollSec` | 5 | 动作收件箱轮询周期秒 |
+| `webActionsToken` | '' | 前端动作通道共享 token（真实值放 cordis.patch.yml；审计只记 sha256 前 8 位 operator，绝不落原文） |
 | `batchThreshold` | 120 | 大窗口分批归纳阈值 |
 | `accountWhitelist` | [] | 账号白名单（账号生命周期自动化） |
 | `allowAutoRekey` | false | 小号回归自动取钥 |
