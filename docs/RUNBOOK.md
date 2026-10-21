@@ -91,7 +91,7 @@ pnpm add file:/path/to/2水群
 2. 把**运行 DSH 的宿主程序**（终端 / DSH app 实际进程）加入并打开开关；
 3. **完全退出并重启宿主**（授权只对新启动的进程生效）。
 
-只读旁听**不需要**屏幕录制/辅助功能授权（那是发送/UI 自动化才用的，本插件不发送）。
+只读旁听**不需要**任何辅助功能/屏幕录制授权（读取层只读数据库文件）；发送时才需要「辅助功能」（键盘模拟）。
 
 ## 6. 启动与审计日志查看
 
@@ -341,9 +341,9 @@ rm -rf /path/to/macos-wechat-export/.wechat-local
 2. **切勿**把旧机器的 `.wechat-local/` 拷过去：旧签名快照会让 `bootstrap_keys.py` 的原版签名对照（第 101 行）误判"原版被改动"而中止；旧 keys.json 对新环境的库也不适用；
 3. 取钥成功后插件侧只需核对 `sourceDbRoot`/`sourceToolDir` 指向无误，游标（stateDir/cursor.json）与新库位点不一致时会自动按新库重新对齐（最坏情况：少量近期消息重复投递，下游幂等消化）。
 
-## 12.5 filehelper 发送 worker（发送原语：键盘模拟 + 定位闸 + DB 回读验证，2026-10-16 增补定位闸）
+## 12.5 发送 worker（发送原语：⌘⇧W+⌘F 键序 + DB 回读验证；2026-10-20 起不再有定位闸/OCR）
 
-> **2026-10-16 定位闸上线（HANDOFF-sender-autotarget 交付）**：键序前置一档
+> **历史存档（2026-10-16 定位闸时代，2026-10-20 已随 OCR 闸整体移除——现行流程见本节末与 §12.5 首段）**：键序前置一档
 > `wechat-ui open --chat '文件传输助手'`（侧栏 Vision OCR 精确定位 + 合成点击 + 标题核验）——
 > **废除"文件传输助手必须常驻当前会话"的 P0 级前提**。定位闸语义：
 > - 工具侧流程：主窗解析（多窗口态重试加固）→ 激活并确认**真实前台**（防坐标点击落进别的应用/
@@ -413,23 +413,27 @@ rm -rf /path/to/macos-wechat-export/.wechat-local
 - 全失败 → **deferred**：审计 `result='wrong_chat_open'` + `reason` 字段，**attempts 不增**
   （用户环境状态不是发送失败），条目保持 pending 下轮自动重试，并 warn 人工介入。
 
-**审计 reason 三枚举**（排障看 reason 即可区分三类失败）：
+**审计 result 枚举**（排障看 `audit/sender.jsonl` 的 result 区分结局；OCR 时代的 `wrong_chat_open`/`ui_tool_missing`/`tcc_denied` 已随闸移除，不再出现）：
 
-| reason | 含义 | 处置 |
+| result | 含义 | 处置 |
 |---|---|---|
-| `wrong_chat_open` | OCR 核验 3 次全失败（当前会话不是文件传输助手 / 读不到标题） | warn「请将微信当前会话切换到文件传输助手」，人工切回后下轮自动恢复 |
-| `ui_tool_missing` | wechat-ui 二进制缺失 / 无法执行（spawn ENOENT/EACCES） | 检查 `wechatUiPath` 配置；确定性失败不空转重试 |
-| `tcc_denied` | DSH 宿主缺「屏幕录制」权限（截图被 TCC 拦截） | 系统设置 → 隐私与安全性 → 屏幕录制 授权 DSH 宿主 |
+| `transmitted` → `sent`/`take_focus_sent` | 已发出并回读命中（后者=抢前台模式） | — |
+| `failed_wrong_target`（P0） | 已 transmitted 但回读未命中：可能发错会话/目标不对 | 立即核查目标会话与 `sendTargetChat`；终态不重试 |
+| `verify_read_deferred` | 回读 CLI 报错（环境问题）：保持 sent_pending_verify，绝不重发 | 查工具/库/密钥；累计 5 轮人工告警 |
+| `account_unknown_deferred` | 活跃账号**不可判定**（无写入流且 WAL 时间歧义）→ 挂起 | 正常：登录对应账号后自动恢复 |
+| `non_whitelisted_account_suspended` | 白名单外账号活跃 → 全面挂起 | 切回配置账号；审计附活跃 wxid 摘要 |
+| `account_key_check_deferred` | 发送前密钥预检失败（keys 失效/库不可读） | 重跑取钥（见文末排障） |
+| `unverified_missing_config` | 缺 `sourceToolDir`/`sourceDbRoot`/`sendTargetChat`/`readbackChatId` | 补配置（fail-closed 不发） |
+| `screen_locked_deferred` / `not_frontmost` / `user_active` | 环境等待（熄屏/非前台/用户正在操作） | 不计 attempts，下轮自动重试 |
+| `skipped_quota` / `skipped_channel` / `dry_run` / `send_failed` | 配额/通道/干跑/真失败 | 见相应小节 |
 
 ### TCC 前置（首次必做）
 
 系统设置 → 隐私与安全性 → 给 **DSH 宿主应用**（运行本插件的进程）开启：
 
-- **辅助功能**（System Events 按键 + osascript 激活/查询前台）——键序必需；
-- **屏幕录制**（**2026-10-15 恢复必需**：发送前合规闸的 `wechat-ui read` 要截取微信窗口做
-  OCR 标题核验）。**未授权 = 合规闸每次 deferred（审计 reason='tcc_denied'），永不发送**
-  ——fail-closed：缺权限比发错会话安全。上线前用 sendDryRun=true 干跑即可验证该权限是否
-  就绪（dry_run 合规闸照常执行；审计/日志出现 `tcc_denied` 即权限未授权）。
+- **辅助功能**（System Events 按键 + osascript 激活/查询前台）——**发送唯一必需**的权限；
+- **屏幕录制不需要**（2026-10-20 OCR 闸移除后，发送链路只做键盘模拟 + DB 回读，不截屏）。
+  仅在使用诊断工具（`wechat-ui doctor` 等截屏类命令）时需要，排障时按需授权。
 
 ### 真实键位实证（已回填 2026-10-15）
 
@@ -449,7 +453,7 @@ Accessibility Inspector 确认元素层级）。**实证结论回填此处：___
      不做二次选择。人工在微信搜索框里输入 `sendTargetChat` 的值，看排在**第一条**的是不是要发的那个会话；
      若第一条是别的联系人 / 群 / 聊天记录 / 搜一搜条目，换一个更独特的搜索词（例如给目标会话设唯一备注），
      直到第一条稳定命中为止。DB 回读只能事后报警，挡不住发错会话。
-1. TCC"辅助功能"+"屏幕录制"授权（合规闸必需，缺屏幕录制 = 恒 deferred，reason='tcc_denied'）+ 配置 `sourceToolDir`/`sourceDbRoot`（回读验证必需）+ `sendTargetChat`/`readbackChatId`（缺失 fail-closed 不发送）；
+1. TCC **「辅助功能」** 授权（键盘模拟唯一必需；屏幕录制不需要）+ 配置 `sourceToolDir`/`sourceDbRoot`（回读验证必需）+ `sendTargetChat`/`readbackChatId`（缺失 fail-closed 不发送）；
 2. 配置保持 `senderEnabled: true`、`sendDryRun: true`（默认），重启插件；
 3. **第一段（干跑）**：触发消费（或调 `groupLurker.sender.sendTestSample()`）——dry_run 执行到
    「Return 进入对话」为止即停（**不粘贴消息不回车发送**）。人工确认微信停在的正是目标会话、
@@ -552,8 +556,7 @@ Accessibility Inspector 确认元素层级）。**实证结论回填此处：___
 - **状态机**：`pending → sent | dry_run | skipped_quota | skipped_channel | failed`；
 - **审计**：`audit/sender.jsonl` 只记元数据（id/kind/结果/attempts/method），绝不记正文；
 - **剪贴板**：发送前保存、发送后恢复；恢复失败只 warn；发送失败路径同样尝试恢复；
-- **切换回旧实现**：`sendMethod: 'wechat-ui'`（此时 `wechatUiPath`/`composerTop` 生效，TCC 需
-  屏幕录制，验证标志回到 `sent_ui_verified`）；
+- **旧实现已移除**：`wechat-ui` 发送/OCR 闸（2026-10-20）已整体删除——发送原语只剩键盘流程一条路，无需任何回退配置；
 - **测试模式隔离**：`scheduleTestMode` 产生的报告同样进 outbox、同样可发——测试期务必保持
   `sendDryRun: true`，验证完及时关掉 scheduleTestMode。
 
