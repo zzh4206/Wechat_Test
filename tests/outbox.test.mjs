@@ -62,6 +62,47 @@ test('tailOutbox：文件不存在返回 []；损坏行跳过不抛出', () => {
   rmSync(dir, { recursive: true, force: true })
 })
 
+test('W-4：并发追加 + 状态补丁交织 → 最终状态正确、无行丢失（追加补丁行替代整文件读改写）', () => {
+  const { dir, outbox } = makeEnv()
+  const entries = []
+  for (let i = 1; i <= 10; i++) entries.push(outbox.appendOutbox({ kind: 'daily', title: `t${i}`, body: 'b', evidence_ref: 'x' }))
+  // 交织：每一条状态补丁之间穿插新条目追加（模拟 regen 报告入箱与 sender 推进并发）
+  const appends = []
+  entries.forEach((e, i) => {
+    if (i % 3 === 1) appends.push(outbox.appendOutbox({ kind: 'remind', title: `mid${i}`, body: 'b', evidence_ref: 'x' }))
+    assert.equal(outbox.updateSendState(e.id, { status: 'sent', attempts: 1 }), true, `补丁 ${i} 成功`)
+  })
+  const all = outbox.listOutbox()
+  assert.equal(all.length, entries.length + appends.length, '无行丢失（补丁行归并不吞追加）')
+  for (const e of entries) {
+    const folded = all.find((x) => x.id === e.id)
+    assert.equal(folded.status, 'sent', `${e.title} 最终 sent`)
+    assert.equal(folded.attempts, 1)
+    assert.equal(folded.kind, 'daily', '原行字段保留')
+  }
+  for (const a of appends) assert.equal(all.find((x) => x.id === a.id).status, 'pending', '穿插追加不受补丁影响')
+  // 未知 id 补丁 → false；幂等推进链 pending→sent_pending_verify→sent 后写覆盖先写
+  assert.equal(outbox.updateSendState('no-such-id', { status: 'sent' }), false)
+  const last = entries[9]
+  outbox.updateSendState(last.id, { status: 'sent_pending_verify', transmittedAt: 5 })
+  outbox.updateSendState(last.id, { status: 'sent', serverId: 'svr-1', sentAt: 6 })
+  const final = outbox.listOutbox().find((x) => x.id === last.id)
+  assert.equal(final.status, 'sent')
+  assert.equal(final.serverId, 'svr-1')
+  assert.equal(final.transmittedAt, 5, '前序补丁字段保留（fold 合并非替换）')
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('W-11：appendOutbox 接受调用方预生成 id（evidence_ref 可指向条目自身）', () => {
+  const { dir, outbox } = makeEnv()
+  const id = 'fix-0001-digest'
+  const entry = outbox.appendOutbox({ kind: 'digest', title: '速览', body: 'b', evidence_ref: `outbox/${id}`, id })
+  assert.equal(entry.id, id)
+  assert.equal(entry.evidence_ref, `outbox/${id}`)
+  assert.equal(outbox.listOutbox().find((x) => x.id === id).evidence_ref, `outbox/${id}`)
+  rmSync(dir, { recursive: true, force: true })
+})
+
 test('零发送断言：outbox.ts / report.ts 无任何发送原语（no-send 红线沿用）', () => {
   const srcDir = join(import.meta.dirname, '..', 'src')
   const files = ['outbox.ts', 'report.ts']

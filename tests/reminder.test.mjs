@@ -185,6 +185,9 @@ test('每日 7:50 速览：合并当日到期/逾期/待确认一次性推送（
     assert.equal(boxes.length, 1, 'outbox 只有一条合并正文')
     assert.ok(boxes[0].body.includes('今天到期的任务'))
     assert.ok(boxes[0].body.includes('（待确认）待确认任务'))
+    // W-11：evidence_ref 指向 outbox 条目自身 id（不再指向从未写入的 reminder/digest/<day>.txt）
+    assert.equal(boxes[0].evidence_ref, `outbox/${boxes[0].id}`, 'evidence_ref=outbox/<id> 且可解析回本条')
+    assert.ok(!boxes[0].evidence_ref.startsWith('reminder/'), '不指向从未落盘的 reminder 文件')
     // 同日再 tick 不重复
     await h.tick()
     assert.equal(env.notified.filter((n) => n.kind === 'digest').length, 1)

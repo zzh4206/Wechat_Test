@@ -66,7 +66,21 @@ function makeEnv(overrides = {}) {
 
 function readOutbox(dir) {
   if (!existsSync(join(dir, OUTBOX_REL))) return []
-  return readFileSync(join(dir, OUTBOX_REL), 'utf8').trim().split('\n').map((l) => JSON.parse(l))
+  // W-4：补丁行按 id fold 归并（与 Outbox.tailOutbox 读侧语义一致）
+  const entries = []
+  const byId = new Map()
+  for (const l of readFileSync(join(dir, OUTBOX_REL), 'utf8').split('\n')) {
+    if (l.trim() === '') continue
+    const v = JSON.parse(l)
+    if (v && v.patch === true && typeof v.id === 'string') {
+      const prev = byId.get(v.id)
+      if (prev) { const { patch, id, ...rest } = v; Object.assign(prev, rest) }
+      continue
+    }
+    entries.push(v)
+    if (v && typeof v.id === 'string') byId.set(v.id, v)
+  }
+  return entries
 }
 function readAudit(dir) {
   const p = join(dir, SENDER_AUDIT_REL)

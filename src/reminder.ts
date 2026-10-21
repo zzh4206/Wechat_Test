@@ -27,6 +27,7 @@ import type { Store } from './store.js'
 import type { GroupStoreService, TaskRow } from './group-store.js'
 import type { Outbox } from './outbox.js'
 import type { SystemNotifier } from './notify.js'
+import { randomUUID } from 'node:crypto'
 import { localDayKey } from './person-digest.js'
 
 /** 无明确 deadline 的默认软提醒时限（毫秒；功能文档 §6.1：默认 3 天） */
@@ -198,7 +199,9 @@ export class ReminderService {
     const title = count > 0 ? `今日待办速览（${count} 项）` : '今日待办速览（无）'
     const body = count > 0 ? lines.join('\n') : '今天没有到期任务，也没有待确认项。'
     await this.options.notifier.notify('digest', title, '今日待办速览已生成，详情见存档')
-    this.options.outbox.appendOutbox({ kind: 'digest', title, body, evidence_ref: `reminder/digest/${day}.txt` })
+    // W-11：evidence_ref 指向本条 outbox 条目自身（详情就在 body；不再指向从未写入的 reminder/digest/<day>.txt）
+    const digestId = randomUUID()
+    this.options.outbox.appendOutbox({ kind: 'digest', title, body, evidence_ref: `outbox/${digestId}`, id: digestId })
     this.options.logger.info(`reminder: digest ${day} pushed (${count} items)`)
   }
 
