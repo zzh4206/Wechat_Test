@@ -5,7 +5,7 @@
  *    每轮只处理该来源最早的一个元素（多元素逐轮处理，避免一轮长阻塞）：
  * 1. satisfied 检查：该 (chatId, dateKey) 已有非 empty 报告（正确账号在触发时刻前已登录）→
  *    done 出队，审计 regen_satisfied，不重生成；
- * 2. 重新 generateReport（backfill 窗口锚定 dateKey，end=处理时刻，覆盖已同步消息）：
+ * 2. 重新 generateReport（backfill 窗口锚定 dateKey，end=该周期原定生成时刻，见 dailyCutoff/periodCutoff）：
  *    - 有内容 → 报告已落盘 + outbox 条目（进发送链路，takeFocus 照常）→ done 出队，
  *      审计 regen_regenerated + notify；
  *    - 空 → regenAttempts++：≤2 次 → 放回队首（审计 regen_deferred_sync_pending）；
@@ -29,8 +29,11 @@ import type { RegenEntry, RegenQueue } from './regen-queue.js'
 
 export const REGEN_EMPTY_MAX_ATTEMPTS = 2 // 空产出重试上限（共 1+2=3 次生成尝试）
 /** 回填生成的 asOf：日报截到该日原定生成时刻；周/月报沿用 now（窗口终点口径另议） */
-function regenAsOf(deps: Pick<RegenProcessorDeps, 'now' | 'dailyReportTime'>, kind: RegenEntry['kind'], dateKey: string): number {
-  return kind === 'daily' ? dailyCutoff(dateKey, deps.dailyReportTime, deps.now()) : deps.now()
+function regenAsOf(deps: Pick<RegenProcessorDeps, 'now' | 'dailyReportTime' | 'weeklyReportTime' | 'monthlyReportTime'>, kind: RegenEntry['kind'], dateKey: string): number {
+  const now = deps.now()
+  if (kind === 'daily') return periodCutoff(dateKey, deps.dailyReportTime, now)
+  if (kind === 'weekly') return periodCutoff(dateKey, deps.weeklyReportTime, now)
+  return periodCutoff(dateKey, deps.monthlyReportTime, now)
 }
 
 /** 跨群汇总的 chatId（与 store / knowledge.db 的 report.chat_id 同值） */
@@ -47,8 +50,10 @@ export interface RegenProcessorDeps {
   /** 审计出口（零正文：只记元数据） */
   audit: (entry: Record<string, unknown>) => void
   now: () => number
-  /** 日报触达时点 HH:MM（Config.dailyReportTime）：历史日的日报/汇总窗口截到该日这一刻（见 dailyCutoff） */
+  /** 周期触达时点（Config.daily/weekly/monthlyReportTime）：历史周期的窗口截到该周期原定生成时刻（见 periodCutoff） */
   dailyReportTime?: string
+  weeklyReportTime?: string
+  monthlyReportTime?: string
 }
 
 export interface RegenProcessOutcome {
@@ -109,7 +114,7 @@ export async function processRegenHead(deps: RegenProcessorDeps): Promise<RegenP
 }
 
 /** 手动重跑的依赖：不需要 outbox / groupStore（不发送、不做 satisfied 检查） */
-export type ManualRegenDeps = Pick<RegenProcessorDeps, 'queue' | 'logger' | 'notify' | 'audit' | 'now' | 'dailyReportTime'> & {
+export type ManualRegenDeps = Pick<RegenProcessorDeps, 'queue' | 'logger' | 'notify' | 'audit' | 'now' | 'dailyReportTime' | 'weeklyReportTime' | 'monthlyReportTime'> & {
   report: RegenProcessorDeps['report'] & {
     /** 跨群汇总重跑（缺省 = aggregate 条目按失败出队） */
     generateSummary?: (asOf?: number) => Promise<{ path: string | null; groupsIncluded: number }>
@@ -123,15 +128,18 @@ export type ManualRegenDeps = Pick<RegenProcessorDeps, 'queue' | 'logger' | 'not
  * 日报重跑/补发与汇总重跑共用：之后几天的消息不进该日窗口（审批/标记的后续变化走修订流，不靠扩窗）。
  * 时点缺失/非法时退到该日 23:59:59.999（仍落在该日：reportWindow 据 asOf 推 dateKey）。
  */
-export function dailyCutoff(dateKey: string, dailyReportTime: string | undefined, now: number): number {
+export function periodCutoff(dateKey: string, reportTime: string | undefined, now: number): number {
   const d = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateKey)
   if (!d) return now
-  const t = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(dailyReportTime ?? '')
+  const t = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(reportTime ?? '')
   const at = t
     ? new Date(Number(d[1]), Number(d[2]) - 1, Number(d[3]), Number(t[1]), Number(t[2])).getTime()
     : new Date(Number(d[1]), Number(d[2]) - 1, Number(d[3]) + 1).getTime() - 1
   return Math.min(now, at)
 }
+
+/** 日报口径别名（既有导出与测试沿用） */
+export const dailyCutoff = periodCutoff
 
 /** 处理最早的一条手动重跑（每次一条）。只重新生成报告，不创建 outbox 条目 */
 export async function processManualRegen(deps: ManualRegenDeps): Promise<RegenProcessOutcome> {
