@@ -551,6 +551,8 @@ export function apply(ctx: Context, config: PluginConfig): void {
               audit: (entry) => regenAudit(String(entry.result), String(entry.chat_id), String(entry.date_key), entry),
               now: () => Date.now(),
               dailyReportTime: config.dailyReportTime,
+              weeklyReportTime: config.weeklyReportTime,
+              monthlyReportTime: config.monthlyReportTime,
             })
             if (outcome.action === 'regenerated') logger.info(`scheduler[daily]: 补发日报已生成并入发送队列`)
             else if (outcome.action !== 'empty') logger.warn(`scheduler[daily]: 补发队列处理结局=${outcome.action}`)
@@ -1142,6 +1144,8 @@ export function apply(ctx: Context, config: PluginConfig): void {
           },
           now: () => Date.now(),
           dailyReportTime: config.dailyReportTime,
+          weeklyReportTime: config.weeklyReportTime,
+          monthlyReportTime: config.monthlyReportTime,
           accountOk: accountGate
             ? async () => {
                 const active = await accountGate.activeAccount()
