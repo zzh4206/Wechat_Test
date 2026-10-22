@@ -199,3 +199,44 @@ export class ApprovalActions {
     return this.receipt(ok, 'approval', '补生成已排程', ok ? `${kind} ${dateKey}（${chatId}）已入补生成队列` : `${kind} ${dateKey} 已在队列中（去重）`)
   }
 }
+
+// —— 报告操作的独立实现（前端收件箱在任务/承诺识别未开启时也能力可用）——
+
+/** 报告操作接口：与 ApprovalActions.reportFinalize/reportRegen 同语义，但不依赖任务/承诺服务 */
+export interface ReportOps {
+  regen: (chatId: string, dateKey: string, kind?: ReportKind) => Promise<boolean>
+  finalize: (chatId: string, periodStart: string, kind?: ReportKind, source?: 'chat' | 'web') => Promise<FinalizeResult>
+}
+
+export interface ReportOpsDeps {
+  enqueueReportRegen?: ApprovalActionsDeps['enqueueReportRegen']
+  reports?: ApprovalActionsDeps['reports']
+  notify: ApprovalNotify
+  logger: StoreLogger
+  now?: () => number
+}
+
+/** 组装报告操作（收件箱与对话框通道共用同一份实现，避免两处漂移） */
+export function createReportOps(deps: ReportOpsDeps): ReportOps {
+  const now = deps.now ?? (() => Date.now())
+  return {
+    async finalize(chatId, periodStart, kind = 'daily', source = 'chat') {
+      if (!deps.reports) return 'unavailable'
+      const r = deps.reports.finalizeReport(chatId, kind, periodStart)
+      if (r === 'ok') {
+        deps.reports.recordRevision(chatId, kind, periodStart, now(), '报告定稿（draft → final）', source)
+        await deps.notify('approval', '报告已定稿', `${kind} ${periodStart}（${chatId}）已定稿`)
+      }
+      return r
+    },
+    async regen(chatId, dateKey, kind = 'daily') {
+      if (!deps.enqueueReportRegen) {
+        deps.logger.warn('approval-actions: reportRegen 未接 regen 队列——请求被忽略')
+        return false
+      }
+      const ok = deps.enqueueReportRegen(chatId, dateKey, kind, 'manual')
+      if (ok) await deps.notify('approval', '补生成已排程', `${kind} ${dateKey}（${chatId}）已入补生成队列`)
+      return ok
+    },
+  }
+}
