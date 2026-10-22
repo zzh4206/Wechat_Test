@@ -13,7 +13,7 @@
  */
 import type { Store } from './store.js'
 import type { StoreLogger } from './store.js'
-import type { ApprovalActions, ReportKind } from './approval-actions.js'
+import type { ApprovalActions, ReportKind, ReportOps } from './approval-actions.js'
 import { AGGREGATE_CHAT_ID } from './regen-processor.js'
 
 export const ACTIONS_REL = 'web/actions.jsonl'
@@ -46,7 +46,10 @@ export interface ActionLine {
 
 export interface ActionInboxDeps {
   store: Store
-  actions: ApprovalActions
+  /** 审批动作（task/promise/event/person）。null = 任务/承诺识别未开启：非报告动作回执 unsupported，报告操作照常 */
+  actions: ApprovalActions | null
+  /** 报告操作（定稿/重新生成）；与 ApprovalActions 解耦——识别未开启时前端也能用报告操作 */
+  reportOps?: ReportOps
   /** 标记动作（阶段四 MarkActions；未注入 = task.mark/promise.mark 拒绝 unsupported） */
   marks?: { markTarget: (chatId: string, kind: 'task' | 'promise', targetId: number, status: 'completed' | 'incomplete' | 'deleted', source: 'chat' | 'web') => Promise<boolean> }
   /** 白名单群（R2：chatId ∈ groups，白名单外拒绝） */
@@ -158,11 +161,43 @@ export const RESULT_TOMBSTONE_MAX = 100
  * 带 source 的门面方法一律显式传 'web'——缺省值是 'chat'，漏传会把前端审批记成「来源：对话框」。
  */
 export async function dispatchAction(
-  deps: Pick<ActionInboxDeps, 'actions' | 'marks' | 'resolveTarget' | 'reportOutbox'>,
+  deps: Pick<ActionInboxDeps, 'actions' | 'marks' | 'resolveTarget' | 'reportOutbox' | 'reportOps'>,
   a: ActionLine,
 ): Promise<{ code: ActionOutcome['code']; reason?: string }> {
-  const A = deps.actions
   const id = a.targetId
+  // 报告操作与审批动作解耦：识别未开启（actions=null）时，报告操作仍可用
+  if (a.type.startsWith('report.')) {
+    const reportOps = deps.reportOps
+    switch (a.type) {
+      case 'report.regen': {
+        if (!reportOps) return { code: 'unsupported', reason: 'report_ops_unavailable' }
+        const dateKey = a.params?.dateKey
+        const kind = (a.params?.kind ?? 'daily') as ReportKind
+        if (typeof dateKey !== 'string' || dateKey === '') return { code: 'bad_request', reason: 'dateKey_required' }
+        return (await reportOps.regen(a.chatId, dateKey, kind)) ? { code: 'ok' } : { code: 'duplicate', reason: 'already_queued' }
+      }
+      case 'report.finalize': {
+        if (!reportOps) return { code: 'unsupported', reason: 'report_ops_unavailable' }
+        const r = await reportOps.finalize(a.chatId, String(a.params?.dateKey), a.params?.kind as ReportKind, 'web')
+        if (r === 'ok') return { code: 'ok' }
+        if (r === 'already_final') return { code: 'status_conflict', reason: 'already_final' }
+        if (r === 'not_found') return { code: 'not_found' }
+        if (r === 'unavailable') return { code: 'unsupported', reason: 'knowledge_db_off' }
+        return { code: 'error' }
+      }
+      case 'report.toOutbox': {
+        if (!deps.reportOutbox) return { code: 'unsupported', reason: 'outbox_disabled' }
+        const r = deps.reportOutbox(a.chatId, a.params?.kind as ReportKind, String(a.params?.dateKey))
+        if (r === 'ok') return { code: 'ok' }
+        if (r === 'duplicate') return { code: 'duplicate', reason: 'recently_queued' }
+        return { code: 'not_found' }
+      }
+      default:
+        return { code: 'type_not_allowed' }
+    }
+  }
+  const A = deps.actions
+  if (!A) return { code: 'unsupported', reason: 'actions_disabled' }
   switch (a.type) {
     case 'task.confirm': return (await A.taskConfirm(a.chatId, id, 'web')) ? { code: 'ok' } : staleOf(deps, a)
     case 'task.cancel': return (await A.taskCancel(a.chatId, id, 'web')) ? { code: 'ok' } : staleOf(deps, a)
@@ -196,29 +231,6 @@ export async function dispatchAction(
       const pid = a.params?.pid
       if (typeof pid !== 'string' || pid === '') return { code: 'bad_request', reason: 'pid_required' }
       return (await A.personUnfollow(a.chatId, pid)) ? { code: 'ok' } : staleOf(deps, a)
-    }
-    case 'report.regen': {
-      const dateKey = a.params?.dateKey
-      const kind = (a.params?.kind ?? 'daily') as ReportKind
-      if (typeof dateKey !== 'string' || dateKey === '') return { code: 'bad_request', reason: 'dateKey_required' }
-      // false = 同一 (chatId, dateKey, kind) 已在重跑队列（去重）；不是目标不存在，不能走 staleOf
-      return (await A.reportRegen(a.chatId, dateKey, kind)) ? { code: 'ok' } : { code: 'duplicate', reason: 'already_queued' }
-    }
-    case 'report.finalize': {
-      // 参数已在 process() 经 validateRegenParams 校验（kind 枚举 + dateKey 为周期起点）
-      const r = await A.reportFinalize(a.chatId, String(a.params?.dateKey), a.params?.kind as ReportKind, 'web')
-      if (r === 'ok') return { code: 'ok' }
-      if (r === 'already_final') return { code: 'status_conflict', reason: 'already_final' }
-      if (r === 'not_found') return { code: 'not_found' }
-      if (r === 'unavailable') return { code: 'unsupported', reason: 'knowledge_db_off' }
-      return { code: 'error' }
-    }
-    case 'report.toOutbox': {
-      if (!deps.reportOutbox) return { code: 'unsupported', reason: 'outbox_disabled' }
-      const r = deps.reportOutbox(a.chatId, a.params?.kind as ReportKind, String(a.params?.dateKey))
-      if (r === 'ok') return { code: 'ok' }
-      if (r === 'duplicate') return { code: 'duplicate', reason: 'recently_queued' }
-      return { code: 'not_found' }
     }
     case 'task.mark':
     case 'promise.mark': {

@@ -15,6 +15,7 @@ const { Store } = await import('../lib/store.js')
 const { TaskRecognitionService } = await import('../lib/task-recognition.js')
 const { PromiseRecognitionService } = await import('../lib/promise-track.js')
 const { createApprovalWiring } = await import('../lib/approval-wiring.js')
+const { createReportOps } = await import('../lib/approval-actions.js')
 const { ActionInbox } = await import('../lib/action-inbox.js')
 const { writeWebManifest } = await import('../lib/web-manifest.js')
 const { reportRelPath } = await import('../lib/report.js')
@@ -46,8 +47,17 @@ async function makeEnv({ allowActions = true, actionsEnabled = true, pluginToken
     // 与 index.ts 同口径：前端/对话框重跑一律 reason='manual'
     enqueueReportRegen: (c, d, k) => regenQueue.enqueue(c, d, Date.now(), k, 'manual') !== 'deduped',
   })
+  const reportOps = createReportOps({
+    enqueueReportRegen: (c, d, k) => regenQueue.enqueue(c, d, Date.now(), k, 'manual') !== 'deduped',
+    reports: {
+      finalizeReport: (c, k, ps) => store.finalizeReport(c, k, ps),
+      recordRevision: (c, k, ps, ts, summary, src) => store.mirrorReport(c, k, ps, ts, 'status', { summary, source: src }),
+    },
+    notify: () => {},
+    logger,
+  })
   const inbox = new ActionInbox({
-    store, actions: approvalActions, groups: [CHAT], logger, resolveTarget: resolveInboxTarget, operator: pluginOperator,
+    store, actions: approvalActions, reportOps, groups: [CHAT], logger, resolveTarget: resolveInboxTarget, operator: pluginOperator,
     // 与 index.ts 同口径：仅 webOutboxEnabled 时注入
     reportOutbox: outboxEnabled ? createReportOutbox({ store, outbox: new Outbox({ store }) }) : undefined,
     marks: { markTarget: (c, k, id, s, src) => reportRevision.markTarget(c, k, id, s, src) },

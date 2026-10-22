@@ -54,6 +54,7 @@ import { RegenQueue, REGEN_QUEUE_REL } from './regen-queue.js'
 import { processRegenHead, startManualRegen } from './regen-processor.js'
 import { ActionInbox } from './action-inbox.js'
 import { createApprovalWiring } from './approval-wiring.js'
+import { createReportOps } from './approval-actions.js'
 import { writeWebManifest } from './web-manifest.js'
 import { createReportOutbox } from './report-outbox.js'
 import { homedir } from 'node:os'
@@ -734,16 +735,30 @@ export function apply(ctx: Context, config: PluginConfig): void {
       ...(taskRecognition ? [] : ['taskRecognition']),
       ...(promiseRecognition ? [] : ['promiseRecognition']),
     ]
-    logger.error(`web-actions: webActionsEnabled=true 但收件箱依赖缺失（${missing.join('、')}）——收件箱不消费 web/actions.jsonl，前端将永远等不到 action-results 回执`)
+    logger.warn(`web-actions: 审批动作依赖缺失（${missing.join('、')}）——task/promise/event 动作回执 unsupported；报告操作（定稿/重新生成/排入发件箱）照常可用`)
   }
   // W-1：操作者标识 = 共享 token 的 sha256 前 8 位（绝不落原 token；空 token 记 unknown）
   const webActionsOperator = config.webActionsToken
     ? createHash('sha256').update(config.webActionsToken, 'utf8').digest('hex').slice(0, 8)
     : undefined
-  const actionInbox = config.webActionsEnabled && approvalActions
+  // 报告操作与审批解耦：识别未开启时前端仍可定稿/重生成/排入发件箱（零 LLM）
+  const reportOps = createReportOps({
+    enqueueReportRegen: (chatId2, dateKey2, kind2) => regenQueue.enqueue(chatId2, dateKey2, Date.now(), kind2, 'manual') !== 'deduped',
+    reports: mirrorPath
+      ? {
+          finalizeReport: (chatId2, kind2, periodStart2) => store.finalizeReport(chatId2, kind2, periodStart2),
+          recordRevision: (chatId2, kind2, periodStart2, ts2, summary2, source2) => store.mirrorReport(chatId2, kind2, periodStart2, ts2, 'status', { summary: summary2, source: source2 }),
+        }
+      : undefined,
+    notify: async (kind2, title, body) => { await notifier.notify(kind2, title, body) },
+    logger: logger as unknown as StoreLogger,
+    now: () => Date.now(),
+  })
+  const actionInbox = config.webActionsEnabled
     ? new ActionInbox({
         store,
         actions: approvalActions,
+        reportOps,
         marks: { markTarget: (chatId2, kind2, targetId2, status2, source2) => reportRevision.markTarget(chatId2, kind2, targetId2, status2, source2) },
         groups: config.groups,
         resolveTarget: resolveInboxTarget,

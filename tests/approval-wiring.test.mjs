@@ -12,6 +12,7 @@ const { Store } = await import('../lib/store.js')
 const { TaskRecognitionService } = await import('../lib/task-recognition.js')
 const { PromiseRecognitionService } = await import('../lib/promise-track.js')
 const { createApprovalWiring } = await import('../lib/approval-wiring.js')
+const { createReportOps } = await import('../lib/approval-actions.js')
 const { reportRelPath } = await import('../lib/report.js')
 const { openDb } = await import('../lib/db/db.js')
 const { KnowledgeDao } = await import('../lib/db/dao.js')
@@ -117,7 +118,14 @@ test('report.finalize：draft → final + 修订行（source=web）；重复定�
   try {
     env.store.writeReport('daily', CHAT, ORIGIN_KEY, `# 日报 ${ORIGIN_KEY}\n\n初稿\n`)
     assert.equal(env.dao.getReport('daily', ORIGIN_KEY, CHAT).status, 'draft')
-    const inbox = new ActionInbox({ store: env.store, actions: env.approvalActions, groups: [CHAT], logger: { warn() {}, error() {} } })
+    const reportOps = createReportOps({
+      reports: {
+        finalizeReport: (c, k, ps) => env.store.finalizeReport(c, k, ps),
+        recordRevision: (c, k, ps, ts, summary, src) => env.store.mirrorReport(c, k, ps, ts, 'status', { summary, source: src }),
+      },
+      notify: () => {}, logger: { warn() {}, error() {} },
+    })
+    const inbox = new ActionInbox({ store: env.store, actions: env.approvalActions, reportOps, groups: [CHAT], logger: { warn() {}, error() {} } })
     const lines = [
       { actionId: 'f1', type: 'report.finalize', params: { kind: 'daily', dateKey: ORIGIN_KEY } },
       { actionId: 'f2', type: 'report.finalize', params: { kind: 'daily', dateKey: ORIGIN_KEY } },
@@ -154,7 +162,8 @@ test('report.finalize：未启用知识库镜像 → unsupported（status 只存
   const promise = new PromiseRecognitionService({ groupStore, llm, logger, enabled: true })
   const { approvalActions } = createApprovalWiring({ store, groupStore, task, promise, notify: () => {}, logger })
   try {
-    const inbox = new ActionInbox({ store, actions: approvalActions, groups: [CHAT], logger })
+    const reportOps = createReportOps({ notify: () => {}, logger })
+    const inbox = new ActionInbox({ store, actions: approvalActions, reportOps, groups: [CHAT], logger })
     store.ensureDir('web')
     store.writeText(ACTIONS_REL, JSON.stringify({ actionId: 'n1', ts: 1, chatId: CHAT, type: 'report.finalize', params: { kind: 'daily', dateKey: ORIGIN_KEY } }) + '\n')
     await inbox.poll()
@@ -178,7 +187,11 @@ test('report.regen：入队 ok；同一报告已在队列 → duplicate（不是
     enqueueReportRegen: (c, d, k) => queue.enqueue(c, d, 1, k, 'manual') !== 'deduped',
   })
   try {
-    const inbox = new ActionInbox({ store: env.store, actions: approvalActions, groups: [CHAT], logger })
+    const reportOps = createReportOps({
+      enqueueReportRegen: (c, d, k) => queue.enqueue(c, d, 1, k, 'manual') !== 'deduped',
+      notify: () => {}, logger,
+    })
+    const inbox = new ActionInbox({ store: env.store, actions: approvalActions, reportOps, groups: [CHAT], logger })
     env.store.ensureDir('web')
     const l = (id) => JSON.stringify({ actionId: id, ts: 1, chatId: CHAT, type: 'report.regen', params: { kind: 'daily', dateKey: ORIGIN_KEY } })
     env.store.writeText(ACTIONS_REL, [l('r1'), l('r2')].join('\n') + '\n')
@@ -186,6 +199,34 @@ test('report.regen：入队 ok；同一报告已在队列 → duplicate（不是
     const codes = env.store.readText(ACTION_RESULTS_REL).trim().split('\n').map(JSON.parse).map(r => r.code)
     assert.deepEqual(codes, ['ok', 'duplicate'])
     assert.deepEqual(queue.list().map(e => e.reason), ['manual'])
+  } finally {
+    env.cleanup()
+  }
+})
+
+test('解耦：识别未开启（actions=null）时报告操作照样可用，task 动作回执 unsupported', async () => {
+  const env = makeEnv()
+  const { ActionInbox, ACTIONS_REL, ACTION_RESULTS_REL } = await import('../lib/action-inbox.js')
+  try {
+    env.store.writeReport('daily', CHAT, ORIGIN_KEY, `# 日报 ${ORIGIN_KEY}\n\n初稿\n`)
+    const reportOps = createReportOps({
+      reports: {
+        finalizeReport: (c, k, ps) => env.store.finalizeReport(c, k, ps),
+        recordRevision: (c, k, ps, ts, summary, src) => env.store.mirrorReport(c, k, ps, ts, 'status', { summary, source: src }),
+      },
+      notify: () => {}, logger: { warn() {}, error() {} },
+    })
+    const inbox = new ActionInbox({ store: env.store, actions: null, reportOps, groups: [CHAT], logger: { warn() {}, error() {} } })
+    env.store.ensureDir('web')
+    const lines = [
+      { actionId: 'd1', type: 'report.finalize', params: { kind: 'daily', dateKey: ORIGIN_KEY } },
+      { actionId: 'd2', type: 'task.confirm', targetId: 1 },
+    ]
+    env.store.writeText(ACTIONS_REL, lines.map((l) => JSON.stringify({ ts: 1, chatId: CHAT, ...l })).join('\n') + '\n')
+    await inbox.poll()
+    const codes = env.store.readText(ACTION_RESULTS_REL).trim().split('\n').map(JSON.parse).map((r) => [r.actionId, r.code])
+    assert.deepEqual(codes, [['d1', 'ok'], ['d2', 'unsupported']], '报告操作不依赖识别；task 动作如实拒绝')
+    assert.equal(env.dao.getReport('daily', ORIGIN_KEY, CHAT).status, 'final')
   } finally {
     env.cleanup()
   }
