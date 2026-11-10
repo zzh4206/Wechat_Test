@@ -13,7 +13,7 @@
 
 ```
 1数据/
-└── <账号 wxid>/                        ← 账号隔离（如 wxid_bqlher…= 小号）
+└── <账号 wxid>/                        ← 账号隔离（如 wxid_xxx…= 小号）
     ├── knowledge.db                    ← 该账号的知识库（schema 同 v0.4）
     ├── exports/                        ← Markdown 导出
     └── <群聊 chatId>/                  ← 群聊隔离
