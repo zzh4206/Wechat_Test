@@ -27,6 +27,10 @@
 - schema v6（工单 D-3/D-4/D-5/D-7，2026-10-20）：`entry` 增列 `chat_id`（迁移回填 `'aggregate'`）+ 索引 `idx_entry_chat`，`v_marking_latest` 分组改 `(chat_id, target_ref)`（不同群同名任务各留最新态）；`KnowledgeDao.insertEntry` / 镜像 `opportunity→entry` 带群 `chatId`；自动迁移升 user_version 5→6 链式幂等（v4 先升 5 再 6、v3 先升 4 再 5 再 6，0=全新建 v6，>6 拒开），与 Python 侧逻辑一致
 - group-store：store.db 连接补 `busy_timeout=5000`（D-7），写竞争时忙等而非即刻 SQLITE_BUSY
 
+### Changed
+
+- CI 的 `pull_request` 触发不再限定 base 分支：所有 PR 都跑 `build-test` 与 `sensitive-scan`，并新增 `workflow_dispatch` 供手动重跑。起因是 #17/#18 的目标分支为 `llm/revert-last-two`，PR 上整条 CI 未触发，两条失败的测试合入半个多月后才被发现
+
 ### Fixed
 
 - 基准两条判据的口径错误（`--fail 0` 下也必红，红了半个多月无人认领）：

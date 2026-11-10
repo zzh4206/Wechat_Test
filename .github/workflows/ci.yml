@@ -3,8 +3,12 @@ name: CI
 on:
   push:
     branches: [main]
+  # 不限定 base 分支：所有 PR 都跑 build-test + sensitive-scan。
+  # 起因：#17/#18 的目标分支是 llm/revert-last-two，PR 上没有任何检查，
+  # 两条失败的测试合进去半个多月没被发现；#19/#20 合进 main 后才对比出来。
   pull_request:
-    branches: [main]
+  # 允许手动重跑（排查 flaky / 补跑某个分支）
+  workflow_dispatch:
   # 启用 merge queue 时必须声明，否则队列上的检查永远不会被触发
   merge_group:
 
