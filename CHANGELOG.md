@@ -8,6 +8,7 @@
 
 ### Added
 
+- 基准 `--storm` 模式：同一 fixture/seed 跑两遍（零失败基线 → 注入失败），按方法论 §2 L2 判 I3「注入失败后调用数 ≤ 基线 1.5x」，输出 `baseline.{calls,distillCalls,costCny,failRate}`。单次重放下 I3 如实给 `pass: null`（N/A）并提示怎么判，不再假装有结论。`retryAmplification` 更名为 `callFanout`（= `distill.calls / ceil(msgs/batch)`，观测量而非判据），新增 `distill.intervalRounds` / `distill.expectedRounds` 说明扇出的两个来源
 - 合成基准（`scripts/synth-profile.mjs` / `synth-gen.mjs` / `lib/fault-llm.mjs` / `bench.mjs` / `bench-quality.mjs`，文档 `docs/SYNTHETIC-BENCH.md`）：不依赖真实群聊验证 LLM 成本与鲁棒性策略——画像只输出统计量（无文本/ID/ts）；固定种子合成会话 + 植入真值；故障注入可编排 timeout/429/5xx/auth/坏 JSON/延迟；重放复刻生产语义并输出 I1–I5 不变量判定，变体感知 guard/legacy
 - 前端工作台：跨群汇总报告（`chatId='aggregate'`，只有日报）也可「定稿」「重新生成」「排入发件箱」。插件收件箱与 web 侧对 `aggregate` 只放行 `report.*` 且只认日报（其它周期回执 `bad_request`/`aggregate_daily_only`，非报告动作仍 `chat_not_allowed`；周/月汇总尚未生成，详情页不显示操作）；手动重跑遇到 `aggregate` 条目改调 `generateSummary(该日原定生成时刻)`，按各群该日现有日报重新汇总、不调 LLM，写入失败如实出队；排入发件箱的标题为「跨群汇总 <日期>（前端补推）」。同时修正回填窗口终点（`docs/ANALYSIS-2026-10-21-report-cutoff-window.md`）：汇总重跑、群日报的错号补发与手动重跑，窗口终点由「现在」改为该日 `dailyReportTime`（`dailyCutoff`），之后几天的消息不再计入统计或喂给 LLM；周/月报回填不变
 - 成本治理 C1（失败退避 + 熔断 + 错误可见，依据 `docs/COST-ANALYSIS-2026-10-21.md` §3 根因链）：每群新增持久化状态 `groups/<chatId>/distill-state.json`（`failStreak` / `nextAttemptAt` / `lastSuccessAt` / 增量水位 / 熔断告警标记），`tryDistill` 入口先查 `nextAttemptAt`，退避窗口内直接返回、**不触发 LLM**；连续失败按 `min(30min, 1min×2^(k-1))` 退避，连续 5 次失败熔断 1 小时并经 notifier 告警一次（`distill-circuit-open`，dry_run 语义由 SystemNotifier 保持，未注入则静默）；`tick()` 判据改用 `nextAttemptAt` / `lastSuccessAt`（`lastDistill` 内存 Map 退役）。观测侧 `errKindOf` 由 `timeout|other` 细分为 `timeout / rate_limit / auth / server / bad_request / other`（timeout 优先匹配，对半切分判据不变），`llm_call` JSONL 增可选 `errMsg`（`redactSecretLike` 脱敏 + 截断 160 字符，仅失败行）
@@ -28,6 +29,10 @@
 
 ### Fixed
 
+- 基准两条判据的口径错误（`--fail 0` 下也必红，红了半个多月无人认领）：
+  - **I1** 上界原为 `ceil(msgs/batch) × 失败余量`，隐含「阈值触发主导」的假设。生产默认是每 25 条触发 + 每 15 分钟 tick，而 fixture 消息间隔 5 分钟——tick 先到，每轮只喂 3 条新消息，实测 51 轮 vs 上界 6。改为 `(阈值轮 + 定时轮) × 失败余量`（定时轮 = 有消息的 `intervalMin` 桶数），本 fixture 上界 57，实测 51 通过
+  - **I3** 原为「提炼调用 / 理论最少批数 ≤ 3.0」，量到的是定时触发的小批扇出而不是重试（`--fail 0` 时 8.5x 恒 FAIL）。改为 A/B 口径 1.5x 且只在 `--storm` 下判定：30% 失败 51 → 68 = 1.33x PASS；90% 失败 4.0x FAIL 并同时打穿日成本预算，与 10-20 的真实形态一致
+- 合成基准 fixture 的注释与实际默认值不符（写的是「每 5 条触发 + 30 分钟 tick、阈值主导」，代码是每 25 条 + 15 分钟），改为如实记录 interval 主导的触发形态与「新鲜度换调用数」的权衡
 - 标记的修订归属改为**标记发生当天**的日报（级联当天所在周/月）：标记是工作流的演化，应体现在当天的报告里；审批仍归条目出身日报。此前两者同口径都写出身日报，是把审批与标记当成同一种效果的遗留问题
 - 提炼器重试风暴（10-20 单群 ¥34.87 的元凶）：旧实现失败路径既不更新 `lastDistill`、也不清 `counters`，`tick()` 又对从未成功的群每 30s 必触发，两路叠加成"每条新消息跑一轮全量提炼"——单群一天 1948 次调用、93% 失败。现改为失败只记账并退避（失败**不消费**消息计数，是否真调 LLM 只由 `nextAttemptAt` 决定），状态跨重启持久化；同时 `tick()` 不再依赖内存 Map
 - 收件箱 `report.regen` 去重回执：同一报告已在重跑队列时原被映射为 `not_found`（「目标不存在」），改为 `duplicate`

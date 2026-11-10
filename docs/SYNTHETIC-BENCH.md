@@ -95,8 +95,9 @@ node scripts/bench-quality.mjs --report /path/to/2026-10-20.md \
    legacy 形态被如实还原。alwaysOk 下 calls 恒等于 `ceil(msgs/batch)`。
 2. **串行 await**：每次 `tryDistill` 都 await，不复现生产里并发调用导致的「_distilling
    丢触发」。因此重放的触发数是保守上界，不会比生产更容易失败。
-3. **不做环形淘汰干扰**：默认 `--buffer-size 10000`（生产默认 60），避免缓冲淘汰把
-   待处理窗口截断；要复现线上淘汰可显式调小。
+3. **缓冲淘汰可控**：`--buffer-size` 默认 60（与生产同值）。默认形态下淘汰不会截断
+   待处理窗口（水位已越过被淘汰的消息）；要完全排除淘汰对度量的干扰，显式调大
+   （如 `--buffer-size 10000`），要复现线上淘汰则调小。
 
 触发复刻真实语义：`onNewMessage` 的「每 N 条」计数（失败不清零）+ 每 30 分钟 tick
 （`now - 上次成功 ≥ interval` 才触发）。报告按「每天窗口 = 前日 20:20 → 当日 23:59:59.999」
@@ -106,15 +107,21 @@ node scripts/bench-quality.mjs --report /path/to/2026-10-20.md \
 
 | 编号 | 定义 | 实现要点 |
 |---|---|---|
-| **I1** | 提炼调用数 ≤ `ceil(msgs/batch) × (1 + 2×失败率×4)` | 失败率取**提炼阶段**实测值；batch = `min(distillEveryMessages, batchThreshold)`；上界随失败率放宽 |
+| **I1** | 提炼调用数 ≤ `(阈值轮 + 定时轮) × (1 + 2×失败率×4)` | **阈值轮** = `ceil(msgs/batch)`；**定时轮** = 有消息的 `intervalMin` 桶数（每个活跃窗口至多触发一轮）。失败率取提炼阶段实测值；batch = `min(distillEveryMessages, batchThreshold)`；上界随失败率放宽 |
 | **I2** | 单日总成本 ≤ ¥0.5 | 逐日 `distill + report` 费用取最大值；口径为 585 规模 300 条/日画像的预算线 |
-| **I3** | 失败注入 30% 时重试放大系数 ≤ 3.0 | `提炼 calls / 理论最少调用数`；理论最少 = `ceil(msgs/batch)`；只统计提炼阶段 |
+| **I3** | 注入失败后提炼调用数 ≤ 零失败基线 × **1.5** | **只在 `--storm` 下判定**：同 fixture 同 seed 跑两遍（零失败 → 注入失败），取两次 `distill.calls` 之比。口径见（方法论 §2 L2「无风暴证明」）。单次重放无基线可比，`pass` 为 `null`（N/A），不再用「总调用 / 理论批数」冒充重试 |
 | **I4** | 报告必需产出（ok 或 degraded，不抛） | 每天 `generateReport` 不抛、状态 ∈ {ok, degraded}（窗口无消息时允许 empty）、`path` 非空；逐日明细进 detail |
 | **I5** | evidence / quotes 序号映射合法 | 解析报告 md 的 `[evidence: …]` 与原文引用 `[msgId]`，全部必须落在当天报告窗口的 msg_id 集合内 |
 
-输出同时包含：`days` / `calls` / `costCny` / `failRate` / `retryAmplification` /
+输出同时包含：`days` / `calls` / `costCny` / `failRate` / `callFanout` /
 `invariants.{I1..I5}.{pass,detail}`，以及 `meta` / `variant` / `distill` / `report` /
-`perDay` / `failByKind` / `observed`（`llm-calls.jsonl` 观测层交叉校验）。
+`perDay` / `failByKind` / `observed`（`llm-calls.jsonl` 观测层交叉校验）；`--storm` 时
+额外有 `baseline.{calls,distillCalls,costCny,failRate}`。
+
+- `callFanout` = `distill.calls / ceil(msgs/batch)`，**观测量，不是判据**：它同时含
+  「定时触发的小批」和「失败重试」，单看它分不清两者（这正是旧 I3 的错）。
+- `distill.intervalRounds` / `distill.expectedRounds`：I1 上界的两个加项，便于解释扇出。
+- `pass === null` 表示「本轮无法判定」（目前只有单次重放的 I3），不计入 `allPass`。
 
 ## 8. 变体探测（guard vs legacy）
 
@@ -127,7 +134,7 @@ node scripts/bench-quality.mjs --report /path/to/2026-10-20.md \
 - 强制值与探测值不一致时，`variant.warnings` 明确写出「实际行为与 legacy 相同」或
   「代码已带保护，无法在本进程关闭」；
 - 同一 fixture 在两个分支上各跑一次，对比 `distill.calls` / `costCny` /
-  `retryAmplification` / `stateFileWritten` 即可证明保护是否生效。
+  `callFanout` / `stateFileWritten` 即可证明保护是否生效。
 
 > 当前分支已 revert 掉 C1+C2（退避/熔断/增量水位），因此探测结果为 `legacy`、
 > `stateFileWritten=false`。保护分支合回后，同一命令应自动变为 `guard` 并写出状态文件。
@@ -150,18 +157,26 @@ node scripts/bench-quality.mjs --report /path/to/2026-10-20.md \
 
 ## 10. 示例与边界
 
-内置合成器、`--seed 42` 的实测（数值随 seed/规模变动，仅示意）：
+内置合成器 `--synth --seed 42` 的实测（3 天 × 50 条；数值随 seed/规模变动，仅示意）：
 
-| 场景 | calls | costCny | failRate | retryAmplification | I1/I2/I3 |
+| 场景 | 提炼 calls | costCny | failRate | callFanout | I1 / I2 / I3 |
 |---|---|---|---|---|---|
-| alwaysOk | 33 | 0.3687 | 0 | 1.00 | PASS |
-| 注入 30% | 55 | 0.5517 | 0.382 | 1.67 | PASS |
-| 注入 90% | 262 | 1.8990 | 0.893 | 8.53 | FAIL |
+| alwaysOk | 51 | 0.5479 | 0 | 8.50 | PASS / PASS / N/A |
+| `--storm`（注入 30%） | 68（基线 51） | 0.7091 | 0.343 | 11.33 | PASS / PASS / PASS（1.33x） |
+| `--storm --fail 0.9` | 204（基线 51） | 1.7566 | 0.910 | 34.0 | PASS / FAIL / FAIL（4.00x） |
 
-诚实结论：**30% 失败下 legacy 没有出现 >3 倍调用风暴**（每 5 条一个窗口，两次重试
-后整次失败的概率约 5–10%）；把失败率提到 90% 才复现生产级的重试风暴。基准只负责
-如实输出这个事实，不为了「证明策略有效」而调参；要证明 C1/C2 的价值，应在 guard
-分支上跑同一 fixture 对比，而不是在本分支上期待它变好。
+三条结论：
+
+1. **8.5 倍扇出不是重试，也不是重复提炼**。本 fixture 消息间隔 5 分钟、每 25 条才够
+   一次阈值触发（125 分钟），于是 15 分钟 tick 先到——每轮只喂 3 条新消息（水位生效，
+   buffer 3→6→9 递增），51 轮对应 51 个活跃窗口（`distill.intervalRounds = 51`）。
+   这是「新鲜度换调用数」的权衡：上界 = 阈值轮 + 定时轮，而日成本仅 ¥0.18（I2 预算线
+   ¥0.5 的一半以下）。群越活跃，两种触发越接近，扇出越向 1 收敛。
+2. **30% 失败下没有重试风暴**：51 → 68 = 1.33x，在规范 1.5x 内（I3 PASS）。
+3. **90% 失败才复现生产级风暴**：4.0x，并同时打穿日成本预算（I2 FAIL）——这与 10-20
+   的真实形态一致（那天失败率 93%）。
+
+判据只如实输出这两件事，不为了「证明策略有效」调参。
 
 它**不能**证明：语义质量与真实群聊等价、真实 API 的所有失败模式、生产并发下的丢触发。
 这些仍需本地小样本人工抽查与真实验证（方法论 §4）。
