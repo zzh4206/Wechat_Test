@@ -3,7 +3,7 @@
 // 覆盖：
 // ① fault-llm 序列/概率/计数/费用估算精确；
 // ② timeout 与 server 等错误分类正确传递（errKindOf 与 FaultLlmError.kind 双口径）；
-// ③ bench 在 alwaysOk 下 I1/I4/I5 PASS，提炼 calls 与理论批数一致；
+// ③ bench 在 alwaysOk 下探测为 guard、单日成本 ≤ 预算线 0.5、I4/I5 PASS（#18 降本的回归锁）；
 // ④ bench 在 30% 失败下输出合法 JSON（不断言 I3 结论——变体感知结果如实输出）；
 // ⑤ --variant legacy|guard 被接受并体现在输出（代码不支持 guard 时给出 warning）；
 // ⑥ bench-quality 召回算法：构造 manifest+md → 召回 1.0、编造引用被判出；
@@ -199,8 +199,9 @@ test('② timeout 与 server/rate_limit/auth/bad_request 分类正确传递', as
     assert.equal(caught.kind, kind)
     errors.push(caught)
   }
-  // errKindOf 只区分 timeout / other：timeout 触发对半切分，其余走「重试一次」
-  assert.deepEqual(errors.map((e) => errKindOf(e)), ['timeout', 'other', 'other', 'other', 'other'])
+  // errKindOf 六分类（#18 C1「错误可见」）：fault-llm 注入的每类错误都应被识别成同名类别；
+  // timeout 仍单独触发对半切分，其余类别只用于退避与失败行可见
+  assert.deepEqual(errors.map((e) => errKindOf(e)), expected)
   assert.equal(errors[0].status, undefined, 'timeout 不是 HTTP 状态错误')
   assert.equal(errors[1].status, 500)
   assert.equal(errors[2].status, 429)
@@ -213,7 +214,7 @@ test('② timeout 与 server/rate_limit/auth/bad_request 分类正确传递', as
 
 // —————————————————— ③ bench alwaysOk ——————————————————
 
-test('③ bench 在 legacy 语义下暴露重复提炼（放大 > 3x），且 I4/I5 仍 PASS', (t) => {
+test('③ bench 在当前代码（guard）下单日成本 ≤ 预算线 0.5，且 I4/I5 PASS', (t) => {
   const fx = makeFixture(t)
   const res = runNode(BENCH, [
     '--stream', fx.stream,
@@ -229,16 +230,16 @@ test('③ bench 在 legacy 语义下暴露重复提炼（放大 > 3x），且 I4
   // 生产默认：每 25 条触发 + buffer 60 条环 → 理论最少 150/25 = 6 批
   assert.equal(out.distill.theoreticalMinCalls, 6)
   assert.ok(out.distill.calls >= out.distill.theoreticalMinCalls, '调用数不少于理论批数')
-  // 保真断言：legacy（无水位/无退避）下每次触发都重提炼整个 buffer，放大必然 > 3x
-  assert.ok(out.retryAmplification > 3, `legacy 重试放大应 > 3x，实际 ${out.retryAmplification}`)
+  // 退避 + 增量水位已合入：探测必须是 guard（旧 legacy 行为在同一进程里无法复现，--variant 只改标签）
+  assert.equal(out.variant.detected, 'guard', JSON.stringify(out.variant.evidence))
   assert.ok(out.report.calls >= 3, '每天至少一份日报')
   assert.equal(out.invariants.I4.pass, true, out.invariants.I4.detail)
   assert.equal(out.invariants.I5.pass, true, out.invariants.I5.detail)
   assert.deepEqual(out.report.statuses, ['ok', 'ok', 'ok'])
   assert.ok(out.costCny > 0, '费用必须为正（估算 token × 价格）')
-  // legacy 单日成本必然高于预算线（这正是基准要暴露的问题）；guard 变体才应满足 ≤0.5
+  // 降本回归锁：本 fixture 旧代码单日 ¥2.2–4.9（661 次提炼），guard 后约 ¥0.18（51 次）；预算线 0.5
   assert.ok(out.perDay.every((d) => d.costCny > 0))
-  assert.ok(out.perDay.some((d) => d.costCny > 0.5), `legacy 应超预算线，实际最高 ${Math.max(...out.perDay.map((d) => d.costCny))}`)
+  assert.ok(out.perDay.every((d) => d.costCny <= 0.5), `单日成本应 ≤ 0.5，实际最高 ${Math.max(...out.perDay.map((d) => d.costCny))}`)
   assert.equal(out.variant.effective, out.variant.detected)
 })
 
