@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
 const { RegenQueue, REGEN_QUEUE_REL, REGEN_QUEUE_MAX } = await import('../lib/regen-queue.js')
-const { processRegenHead } = await import('../lib/regen-processor.js')
+const { processRegenHead, periodCutoff } = await import('../lib/regen-processor.js')
 const { Store } = await import('../lib/store.js')
 const { Outbox, OUTBOX_REL } = await import('../lib/outbox.js')
 
@@ -272,23 +272,35 @@ test('手动重跑历史日汇总：传给 generateSummary 的 asOf 是该日原
   rmSync(env.dir, { recursive: true, force: true })
 })
 
-test('群日报回填（错号补发 + 手动重跑）：asOf 截到该日原定生成时刻；周报沿用 now', async () => {
-  const env = makeEnv(['ok', 'ok', 'ok'])
+test('回填 asOf 截到各周期原定生成时刻：日报=dailyReportTime、周报=weeklyReportTime、月报=monthlyReportTime（不再用 now）', async () => {
+  const env = makeEnv(['ok', 'ok', 'ok', 'ok'])
   const asOfs = []
   const inner = env.deps.report.generateReport
   env.deps.report.generateReport = async (c, k, asOf, d) => { asOfs.push([k, d, asOf]); return inner(c, k, asOf, d) }
   const now = new Date(2026, 9, 21, 9).getTime()
-  const deps = { ...env.deps, now: () => now, dailyReportTime: '20:30' }
+  const deps = { ...env.deps, now: () => now, dailyReportTime: '20:30', weeklyReportTime: '20:40', monthlyReportTime: '08:00' }
   env.queue.enqueue(CHAT, '2026-10-14', 1, 'daily', 'wrong_account')
   env.queue.enqueue(CHAT, '2026-10-15', 2, 'daily', 'manual')
   env.queue.enqueue(CHAT, '2026-10-12', 3, 'weekly', 'manual')
+  env.queue.enqueue(CHAT, '2026-10-01', 4, 'monthly', 'manual')
   await processRegenHead(deps)
+  await processManualRegen(deps)
   await processManualRegen(deps)
   await processManualRegen(deps)
   assert.deepEqual(asOfs, [
     ['daily', '2026-10-14', new Date(2026, 9, 14, 20, 30).getTime()],
     ['daily', '2026-10-15', new Date(2026, 9, 15, 20, 30).getTime()],
-    ['weekly', '2026-10-12', now],
+    ['weekly', '2026-10-12', new Date(2026, 9, 12, 20, 40).getTime()],
+    ['monthly', '2026-10-01', new Date(2026, 9, 1, 8, 0).getTime()],
   ])
   rmSync(env.dir, { recursive: true, force: true })
+})
+
+test('periodCutoff 三周期同口径：时点非法退到该日最后一毫秒；未来时点取 now', () => {
+  const dayEnd = new Date(2026, 9, 12, 23, 59, 59, 999).getTime()
+  assert.equal(periodCutoff('2026-10-12', undefined, dayEnd + 1), dayEnd, '无时点 = 该日最后一毫秒')
+  assert.equal(periodCutoff('2026-10-12', '25:99', dayEnd + 1), dayEnd, '非法时点同样退到日末')
+  const nowBefore = new Date(2026, 9, 12, 9).getTime()
+  assert.equal(periodCutoff('2026-10-12', '20:40', nowBefore), nowBefore, '未到点取 now（当天提前重跑不越界）')
+  assert.equal(periodCutoff('bad-date', '20:40', dayEnd), dayEnd, 'dateKey 非法退 now')
 })
