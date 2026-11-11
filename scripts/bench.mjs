@@ -49,7 +49,13 @@ import { parseReportMd } from './bench-quality.mjs'
 const DAY_MS = 86_400_000
 const BENCH_CHAT = '12345678@chatroom'
 const COST_BUDGET_CNY = 0.5
-const RETRY_AMPLIFICATION_MAX = 3.0
+// 重试风暴的规范口径是 A/B：注入 30% 失败后调用总数 ≤ 零失败基线的 1.5 倍
+// （docs/SYNTHETIC-BENCH-METHODOLOGY.md §2 L2）。
+// 旧常量 RETRY_AMPLIFICATION_MAX=3.0 拿「理论最少批数」当分母去量总调用数——
+// 那样量到的是定时触发的扇出（--fail 0 时实测 8.5x 也红），不是重试。
+// 单次重放没有基线可比，故该判定只在 --storm（两次重放）下给出。
+const RETRY_STORM_RATIO_MAX = 1.5
+const STORM_FAIL_RATE = 0.3
 
 class BenchError extends Error {
   constructor(message) {
@@ -95,7 +101,7 @@ function quietLogger() {
 
 const HELP = `用法:
   node scripts/bench.mjs --stream <stream.jsonl> --manifest <manifest.json> \\
-       --seed 42 [--fail 0.3] [--days N] [--variant guard|legacy] [--json] [--strict]
+       --seed 42 [--fail 0.3] [--storm] [--days N] [--variant guard|legacy] [--json] [--strict]
   node scripts/bench.mjs --synth --seed 42 [--days 3] [--json]
 
 参数:
@@ -106,12 +112,14 @@ const HELP = `用法:
   --bad-json <0..1>       成功调用里返回非法 JSON 的概率（默认 0）
   --days <n>              只重放前 n 个自然日（默认全部；--synth 时默认 3）
   --variant <v>           强制变体标签 guard|legacy（默认自动探测）
-  --every <n>             每 n 条消息触发提炼（默认 5）
-  --interval-min <n>      定时间隔分钟（默认 30）
+  --every <n>             每 n 条消息触发提炼（默认 25）
+  --interval-min <n>      定时间隔分钟（默认 15）
   --batch-threshold <n>   报告分批阈值（默认 120，50 条/日 → 单批）
-  --buffer-size <n>       重放缓冲容量（默认 10000，避免淘汰干扰度量）
+  --buffer-size <n>       重放缓冲容量（默认 60，与生产同值）
   --chat <id>             合成 chatId（默认 12345678@chatroom）
   --synth                 使用内置最小合成器（3 天 × 50 条 + 植入真值）
+  --storm                 跑两遍（零失败基线 + 注入失败）并判定 I3 重试风暴 ≤ 1.5x
+                          未给 --fail 时用 30%；单次重放下 I3 恒为 N/A
   --json                  只输出机器可读 JSON
   --strict                任一不变量 FAIL 时退出码 1（默认 0）
   --help                  显示本帮助
@@ -137,6 +145,7 @@ function parseArgs(argv) {
     synth: false,
     json: false,
     strict: false,
+    storm: false,
     help: false,
   }
   const numberFlag = (name, value, { min = -Infinity, max = Infinity, integer = false } = {}) => {
@@ -201,6 +210,9 @@ function parseArgs(argv) {
         break
       case '--strict':
         opts.strict = true
+        break
+      case '--storm':
+        opts.storm = true
         break
       case '--help':
       case '-h':
@@ -299,6 +311,17 @@ function selectDays(messages, days) {
   }
 }
 
+/**
+ * 活跃的「定时间隔窗口」数——interval 触发的轮数上界。
+ * 每次 tick 至多触发一轮提炼（成功/失败都会刷新下一次尝试时间），
+ * 故空窗口不产生调用，有消息的窗口至多一轮。
+ */
+function countActiveWindows(messages, intervalMs) {
+  const seen = new Set()
+  for (const m of messages) seen.add(Math.floor(m.ts / intervalMs))
+  return seen.size
+}
+
 // —————————————————— 内置最小合成器（--synth） ——————————————————
 
 const SYNTH_TOPICS = [
@@ -326,8 +349,11 @@ const SYNTH_TEXTS = [
 /**
  * 内置最小合成器：固定基准日 2026-10-20 起，每天 50 条（08:00 起 5 分钟一条，
  * 即 08:00–12:05 的活跃段），文案只含合成占位词；植入 6 个话题 / 3 个任务 / 3 条引用。
- * 5 分钟间隔让「每 5 条触发」形成 25 分钟节拍，短于 30 分钟 tick——于是 tick 只在
- * 失败后的空闲段补触发（阈值主导形态），与 I1 上界公式的前提一致。
+ * 触发形态：本 fixture 的消息间隔 5 分钟、每 25 条才够一次阈值触发（125 分钟），
+ * 短于默认 15 分钟 tick——于是 **interval 主导**：每轮只喂 3 条新消息，
+ * 提炼轮数 ≈ 活跃窗口数（150/3 = 50 轮），约为「理论最少批数」6 的 8.5 倍。
+ * 这是「新鲜度换调用数」的设计权衡（日成本仍远低于预算线），I1 的上界按
+ * 「阈值轮 + 定时轮」求和得来，不再假设阈值主导。
  * 用途仅是本仓库离线演示与测试，不替代 G1 的 synth-gen 产物。
  */
 export function buildSynthFixture({ days = 3, seed = 42 } = {}) {
@@ -519,6 +545,8 @@ export async function runBench(params) {
     batchThreshold: 120,
     bufferSize: 60,
     chat: BENCH_CHAT,
+    // 零失败那一轮的提炼调用数；只有 --storm（两次重放）会传，用来判 I3
+    baselineCalls: null,
     ...params,
   }
   const { messages: allMessages, manifest, source } = params
@@ -777,27 +805,41 @@ export async function runBench(params) {
     mergeFailByKind(failByKind, distillStats.failByKind)
     mergeFailByKind(failByKind, reportStats.failByKind)
     const theoreticalMinCalls = Math.ceil(selected.messages.length / batchLimit)
-    const retryAmplification = theoreticalMinCalls === 0 ? null : round(distillStats.calls / theoreticalMinCalls, 3)
+    const intervalRounds = countActiveWindows(selected.messages, intervalMs)
+    const expectedRounds = theoreticalMinCalls + intervalRounds
+    // 扇出 = 实际提炼调用 / 理论最少批数。它同时含「定时触发的小批」与「失败重试」，
+    // 是观测量而非失败判据（本 fixture 实测 8.5x，全部来自 interval 轮）。见 docs/SYNTHETIC-BENCH.md。
+    const callFanout = theoreticalMinCalls === 0 ? null : round(distillStats.calls / theoreticalMinCalls, 3)
     const maxDayCost = perDay.reduce((max, d) => Math.max(max, d.costCny), 0)
     const maxDayKey = perDay.find((d) => d.costCny === maxDayCost)?.date ?? '-'
 
     // I1（失败率按提炼阶段口径——报告调用不改变提炼批数的上界）
+    // 上界 = (阈值轮 + 定时轮) × (1 + 失败余量)：每一轮至多发 1 次「批量 = 批上限」的调用，
+    // 失败重试与超时对半切分再乘一个与失败率成比例的余量。
     const distillFailRate = distillStats.calls === 0 ? 0 : distillStats.failCalls / distillStats.calls
-    const i1Bound = theoreticalMinCalls * (1 + 2 * distillFailRate * 4)
+    const i1Bound = expectedRounds * (1 + 2 * distillFailRate * 4)
     const I1 = {
       pass: distillStats.calls <= i1Bound + 1e-9,
-      detail: `提炼调用 ${distillStats.calls} ≤ 上界 ${round(i1Bound, 2)}（理论最少 ${theoreticalMinCalls}，提炼失败率 ${(distillFailRate * 100).toFixed(1)}%，批上限 ${batchLimit}）`,
+      detail: `提炼调用 ${distillStats.calls} ≤ 上界 ${round(i1Bound, 2)}（阈值轮 ${theoreticalMinCalls} + 定时轮 ${intervalRounds} = ${expectedRounds}，提炼失败率 ${(distillFailRate * 100).toFixed(1)}%，批上限 ${batchLimit}）`,
     }
     // I2
     const I2 = {
       pass: maxDayCost <= COST_BUDGET_CNY + 1e-9,
       detail: `单日最高成本 ¥${maxDayCost.toFixed(4)} ≤ ¥${COST_BUDGET_CNY}（${maxDayKey}）`,
     }
-    // I3
-    const I3 = {
-      pass: retryAmplification !== null && retryAmplification <= RETRY_AMPLIFICATION_MAX + 1e-9,
-      detail: `重试放大 ${retryAmplification === null ? 'n/a' : `${retryAmplification.toFixed(2)}x`} ≤ ${RETRY_AMPLIFICATION_MAX.toFixed(1)}x（提炼 ${distillStats.calls} / 理论最少 ${theoreticalMinCalls}，注入失败率 ${(opts.fail * 100).toFixed(0)}%）`,
-    }
+    // I3（重试风暴 = A/B：注入失败的调用数 vs 零失败基线，规范口径 1.5x）
+    const baselineCalls = typeof opts.baselineCalls === 'number' ? opts.baselineCalls : null
+    const I3 = baselineCalls === null
+      ? {
+          pass: null,
+          detail: `未判定：单次重放没有基线可比（本次提炼 ${distillStats.calls} 次；加 --storm 做零失败↔注入失败 A/B）`,
+        }
+      : {
+          pass: distillStats.calls <= baselineCalls * RETRY_STORM_RATIO_MAX + 1e-9,
+          detail:
+            `注入失败 ${(opts.fail * 100).toFixed(0)}% 后提炼 ${distillStats.calls} ≤ 基线 ${baselineCalls} × ${RETRY_STORM_RATIO_MAX} = ` +
+            `${round(baselineCalls * RETRY_STORM_RATIO_MAX, 2)}（放大 ${baselineCalls > 0 ? `${round(distillStats.calls / baselineCalls, 3)}x` : 'n/a'}）`,
+        }
     // I4
     const I4 = {
       pass: i4Problems.length === 0,
@@ -844,7 +886,8 @@ export async function runBench(params) {
     }
 
     const stateFileWritten = existsSync(join(tempDir, 'groups', chatId, 'distill-state.json'))
-    const allPass = Object.values(invariants).every((inv) => inv.pass)
+    // pass === null 表示「本轮无法判定」（如单次重放的 I3），不算失败
+    const allPass = Object.values(invariants).every((inv) => inv.pass !== false)
 
     return {
       days: selected.dayKeys.length,
@@ -852,7 +895,8 @@ export async function runBench(params) {
       calls,
       costCny,
       failRate: round(failRate, 4),
-      retryAmplification,
+      callFanout,
+      baselineCalls: opts.baselineCalls,
       invariants,
       allPass,
       meta: {
@@ -889,6 +933,8 @@ export async function runBench(params) {
         attemptsOk,
         attemptsFailed,
         theoreticalMinCalls,
+        intervalRounds,
+        expectedRounds,
         batchAttempts,
         batches: batchAttempts,
         failByKind: distillStats.failByKind,
@@ -934,6 +980,8 @@ export async function runBench(params) {
 // —————————————————— 输出 ——————————————————
 
 function verdict(pass) {
+  // null = 本轮无法判定（如单次重放下的 I3），既不是 PASS 也不是失败
+  if (pass === null) return 'N/A '
   return pass ? 'PASS' : 'FAIL'
 }
 
@@ -995,7 +1043,8 @@ function printHuman(result) {
   console.log(
     `汇总: 调用 ${result.calls} 次（失败 ${result.distill.failCalls + result.report.failCalls}，失败率 ${(result.failRate * 100).toFixed(1)}%）` +
       ` · 总费用 ¥${result.costCny.toFixed(4)} · 单日最高 ¥${result.maxDayCostCny.toFixed(4)}` +
-      ` · 重试放大 ${result.retryAmplification === null ? 'n/a' : `${result.retryAmplification.toFixed(2)}x`}`,
+      ` · 调用扇出 ${result.callFanout === null ? 'n/a' : `${result.callFanout.toFixed(2)}x`}` +
+      `（阈值轮 ${result.distill.theoreticalMinCalls} + 定时轮 ${result.distill.intervalRounds}）`,
   )
   console.log(
     `故障分布: ${Object.entries(result.failByKind).map(([k, v]) => `${k} ${v}`).join(' · ')}` +
@@ -1052,10 +1101,32 @@ async function main(argv) {
         source: { stream: opts.stream, manifest: opts.manifest, synth: false },
       }
     }
-    const result = await runBench({ ...opts, ...fixture })
+    // --storm：先跑零失败基线，再跑注入失败，用两者之比判 I3（规范口径 1.5x）。
+    // 单次重放拿不到基线，故 I3 恒为 N/A——不再用「总调用 / 理论批数」冒充重试。
+    let result
+    if (opts.storm === true) {
+      const stormFail = opts.fail > 0 ? opts.fail : STORM_FAIL_RATE
+      const base = await runBench({ ...opts, ...fixture, fail: 0, baselineCalls: null })
+      result = await runBench({ ...opts, ...fixture, fail: stormFail, baselineCalls: base.distill.calls })
+      result.baseline = {
+        calls: base.calls,
+        distillCalls: base.distill.calls,
+        costCny: base.costCny,
+        failRate: base.failRate,
+      }
+      if (!opts.json) {
+        console.log(
+          `基线（零失败 / 同 fixture 同 seed）：提炼 ${base.distill.calls} 次 · 总调用 ${base.calls} · ¥${base.costCny.toFixed(4)}` +
+            ` · 扇出 ${base.callFanout === null ? 'n/a' : `${base.callFanout.toFixed(2)}x`}`,
+        )
+        console.log('')
+      }
+    } else {
+      result = await runBench({ ...opts, ...fixture })
+    }
     if (opts.json) console.log(JSON.stringify(result, null, 2))
     else printHuman(result)
-    const allPass = Object.values(result.invariants).every((inv) => inv.pass)
+    const allPass = Object.values(result.invariants).every((inv) => inv.pass !== false)
     return opts.strict && !allPass ? 1 : 0
   } catch (error) {
     if (error instanceof BenchError) {

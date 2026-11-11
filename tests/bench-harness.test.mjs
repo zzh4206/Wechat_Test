@@ -3,8 +3,8 @@
 // 覆盖：
 // ① fault-llm 序列/概率/计数/费用估算精确；
 // ② timeout 与 server 等错误分类正确传递（errKindOf 与 FaultLlmError.kind 双口径）；
-// ③ bench 在 alwaysOk 下探测为 guard、单日成本 ≤ 预算线 0.5、I4/I5 PASS（#18 降本的回归锁）；
-// ④ bench 在 30% 失败下输出合法 JSON（不断言 I3 结论——变体感知结果如实输出）；
+// ③ bench 在 alwaysOk 下探测为 guard、单日成本 ≤ 预算线 0.5、I1/I4/I5 PASS（#18 降本的回归锁）；
+// ④ --storm 两遍重放：I3 按规范口径判「注入失败 ≤ 零失败基线 1.5x」；单次重放下 I3 为 N/A；
 // ⑤ --variant legacy|guard 被接受并体现在输出（代码不支持 guard 时给出 warning）；
 // ⑥ bench-quality 召回算法：构造 manifest+md → 召回 1.0、编造引用被判出；
 // ⑦ 临时目录清理（bench 只写 TMPDIR，不碰 HOME）。
@@ -214,7 +214,7 @@ test('② timeout 与 server/rate_limit/auth/bad_request 分类正确传递', as
 
 // —————————————————— ③ bench alwaysOk ——————————————————
 
-test('③ bench 在当前代码（guard）下单日成本 ≤ 预算线 0.5，且 I4/I5 PASS', (t) => {
+test('③ bench 在当前代码（guard）下单日成本 ≤ 预算线 0.5，且 I1/I4/I5 PASS', (t) => {
   const fx = makeFixture(t)
   const res = runNode(BENCH, [
     '--stream', fx.stream,
@@ -230,6 +230,12 @@ test('③ bench 在当前代码（guard）下单日成本 ≤ 预算线 0.5，�
   // 生产默认：每 25 条触发 + buffer 60 条环 → 理论最少 150/25 = 6 批
   assert.equal(out.distill.theoreticalMinCalls, 6)
   assert.ok(out.distill.calls >= out.distill.theoreticalMinCalls, '调用数不少于理论批数')
+  // 触发形态：消息间隔 5 分钟 < 15 分钟 tick，故 interval 主导，每轮只喂 3 条新消息。
+  // 调用数 ≈ 活跃窗口数，而不是理论批数——I1 的上界按「阈值轮 + 定时轮」求和，2026-11-10 起 PASS。
+  assert.equal(out.distill.calls, 51)
+  assert.equal(out.distill.intervalRounds, 51)
+  assert.equal(out.callFanout, 8.5)
+  assert.equal(out.invariants.I1.pass, true, out.invariants.I1.detail)
   // 退避 + 增量水位已合入：探测必须是 guard（旧 legacy 行为在同一进程里无法复现，--variant 只改标签）
   assert.equal(out.variant.detected, 'guard', JSON.stringify(out.variant.evidence))
   assert.ok(out.report.calls >= 3, '每天至少一份日报')
@@ -245,30 +251,53 @@ test('③ bench 在当前代码（guard）下单日成本 ≤ 预算线 0.5，�
 
 // —————————————————— ④ 30% 失败 ——————————————————
 
-test('④ bench 30% 失败：输出合法 JSON（I3 结论如实输出，不断言）', (t) => {
+test('④ 注入失败：单次重放 I3 为 N/A；--storm 两遍重放判重试风暴 ≤ 1.5x', (t) => {
   const fx = makeFixture(t)
-  const res = runNode(BENCH, [
+  // 第 1 段：单次重放。没有零失败基线可比，I3 必须如实报 N/A，而不是拿
+  // 「总调用 / 理论批数」冒充重试（2026-11-10 之前就是这么写的，--fail 0 时也红）。
+  const single = runNode(BENCH, [
     '--stream', fx.stream,
     '--manifest', fx.manifest,
     '--seed', '42',
     '--fail', '0.3',
     '--json',
   ])
+  assert.equal(single.status, 0, single.stderr)
+  const one = JSON.parse(single.stdout)
+  for (const id of ['I1', 'I2', 'I4', 'I5']) {
+    assert.equal(typeof one.invariants[id].pass, 'boolean', `${id}.pass`)
+    assert.equal(typeof one.invariants[id].detail, 'string', `${id}.detail`)
+  }
+  assert.equal(one.invariants.I3.pass, null, '单次重放不得给出重试风暴结论')
+  assert.match(one.invariants.I3.detail, /--storm/, 'N/A 时必须指出怎么判')
+  assert.equal(typeof one.invariants.I3.detail, 'string')
+  assert.ok(one.calls > 0)
+  assert.ok(one.failRate > 0, `注入 30% 后实测失败率应 >0（实际 ${one.failRate}）`)
+  assert.ok(one.distill.failCalls > 0)
+  assert.ok(Object.values(one.failByKind).reduce((s, v) => s + v, 0) > 0)
+  assert.equal(one.report.statuses.length, 3)
+  assert.equal(typeof one.allPass, 'boolean')
+
+  // 第 2 段：--storm。规范口径 = 注入失败后调用数 ≤ 零失败基线 1.5 倍
+  // （docs/SYNTHETIC-BENCH-METHODOLOGY.md §2 L2）。本 fixture：51 → 68 = 1.33x。
+  const res = runNode(BENCH, [
+    '--stream', fx.stream,
+    '--manifest', fx.manifest,
+    '--seed', '42',
+    '--storm',
+    '--json',
+  ])
   assert.equal(res.status, 0, res.stderr)
   const out = JSON.parse(res.stdout)
-  for (const id of ['I1', 'I2', 'I3', 'I4', 'I5']) {
-    assert.equal(typeof out.invariants[id].pass, 'boolean', `${id}.pass`)
-    assert.equal(typeof out.invariants[id].detail, 'string', `${id}.detail`)
-  }
-  assert.ok(out.calls > 0)
-  assert.ok(out.failRate > 0, `注入 30% 后实测失败率应 >0（实际 ${out.failRate}）`)
-  assert.ok(out.distill.failCalls > 0)
-  assert.ok(Object.values(out.failByKind).reduce((s, v) => s + v, 0) > 0)
-  assert.equal(out.report.statuses.length, 3)
-  assert.equal(typeof out.allPass, 'boolean')
+  assert.equal(out.baseline.distillCalls, 51, '基线（零失败）提炼调用数')
+  assert.equal(out.distill.calls, 68)
+  const ratio = out.distill.calls / out.baseline.distillCalls
+  assert.ok(ratio <= 1.5, `失败注入后放大 ${ratio.toFixed(2)}x > 1.5x：重试风暴回来了`)
+  assert.equal(out.invariants.I3.pass, true, out.invariants.I3.detail)
+  assert.equal(out.allPass, true, JSON.stringify(out.invariants))
   t.diagnostic(
-    `30% 注入：calls=${out.calls} 提炼失败率=${out.distill.failCalls}/${out.distill.calls} ` +
-      `重试放大=${out.retryAmplification}x I3=${out.invariants.I3.pass}（${out.invariants.I3.detail}）`,
+    `--storm：基线 ${out.baseline.distillCalls} → 注入 30% 后 ${out.distill.calls}（${ratio.toFixed(2)}x）` +
+      ` · 扇出 ${out.callFanout}x · ${out.invariants.I3.detail}`,
   )
 })
 
