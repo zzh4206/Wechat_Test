@@ -39,6 +39,9 @@
 | [DESIGN-approval-marking.md](DESIGN-approval-marking.md) | 审批与标记的报告修正流（修订流展示 / 完成情况段 / 级联更新） |
 | [REF-prefixes.md](REF-prefixes.md) | 编号前缀注册表（新增前缀先查表登记） |
 | [REF-mac-wechat-report.md](REF-mac-wechat-report.md) | 参考资料：macOS 端微信群聊消息读取与自动应答 |
+| [SYNTHETIC-BENCH-METHODOLOGY.md](SYNTHETIC-BENCH-METHODOLOGY.md) | 合成基准方法论：I1–I5 不变量的定义、阈值与判定条件（基准代码按此实现） |
+| [COST-ANALYSIS-2026-10-21.md](COST-ANALYSIS-2026-10-21.md) | LLM 成本根因分析：重试风暴、输入冗余的量化与治理取舍（C1–C4 依据） |
+| [CHANGELOG-DETAILS.md](CHANGELOG-DETAILS.md) | 更新日志的详细记录：`CHANGELOG.md` 压缩条目的原文全文与记录口径说明 |
 
 ## 解释（背景与决策）
 

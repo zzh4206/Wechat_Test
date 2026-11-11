@@ -44,6 +44,7 @@
 - 文件消息归档兜底：`FileIndexService.ingestFromListing` 以 `files` 清单补全 files 表
   - 背景：微信 4.x 文件消息的 `local_type` 低 32 位与链接同为 49 且 XML 不导出，消息流侧只能归为 link，files 表恒为 0
   - 新增 `fileIndexListIntervalMin`（默认 30，0=关）/ `fileIndexListTimeoutMs` / `fileIndexListLimit`，失败只 warn 不阻塞
+  - 证据链见 `docs/REPORT-文件消息归档缺口诊断.md`
 - 仓库防线与治理文件：`check-sensitive.sh` 与 CI `sensitive-scan`、`SECURITY.md`、`CONTRIBUTING.md`、`AGENTS.md`、文档索引
 - 补记 sender 发送链路：受监管读取 → 键盘原语 → 发送 worker，四道闸、配额与回读验证
   - 键盘流程：`⌘⇧W` 切会话、`⌘F` 搜索定位，合成粘贴后轮询草稿清空
