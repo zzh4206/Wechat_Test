@@ -122,5 +122,6 @@
 - `no-send` 静态哨兵测试：钉死读取路径不持有消息发送通道
 - 解密密钥经 stdin 传入，不进入命令行参数
 
-[Unreleased]: https://github.com/zzh4206/Wechat_Test/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/zzh4206/Wechat_Test/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/zzh4206/Wechat_Test/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/zzh4206/Wechat_Test/releases/tag/v0.2.0
