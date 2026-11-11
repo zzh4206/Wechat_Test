@@ -85,5 +85,6 @@ Refs: docs/HANDOFF-sender-autotarget.md
 
 - 改代码时同步更新受影响的文档（`README.md` 的配置表、`docs/RUNBOOK.md` 的操作步骤、本仓库 `docs/` 下的设计文档）
 - `CHANGELOG.md` 在 `[Unreleased]` 下累加，小节名只用 Keep a Changelog 的六个：`Added` / `Changed` / `Deprecated` / `Removed` / `Fixed` / `Security`；**空小节删掉**
+- 提交前跑 `node scripts/check-changelog.mjs`（CI 同款）：校验 `[Unreleased]` 存在、小节名与顺序、空小节、版本降序与链接定义；`[Unreleased]` 与最新版本段另外校验主句 ≤ 120 字符、不出现「合并方式 / 直推」这类过程性表述
 - 一次性过程文档（报告、调研）文件名带日期或主题前缀，长期文档用不带日期的全大写名（`PRD`、`TECH-DESIGN`、`RUNBOOK`）
 - 文档索引见 [docs/README.md](docs/README.md)

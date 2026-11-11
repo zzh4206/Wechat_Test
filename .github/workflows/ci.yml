@@ -48,6 +48,11 @@ jobs:
       - name: 测试
         run: npm test
 
+      # 规则写在 CONTRIBUTING.md，但过去没人执行：[Unreleased] 因此长出
+      # Added×3 / Changed×3 / Fixed×2 共 9 个同名小节。这里只判结构，不判措辞。
+      - name: CHANGELOG 结构校验
+        run: node scripts/check-changelog.mjs
+
   sensitive-scan:
     name: sensitive-scan
     runs-on: ubuntu-latest
