@@ -30,6 +30,7 @@
 ### Changed
 
 - CI 的 `pull_request` 触发不再限定 base 分支：所有 PR 都跑 `build-test` 与 `sensitive-scan`，并新增 `workflow_dispatch` 供手动重跑。起因是 #17/#18 的目标分支为 `llm/revert-last-two`，PR 上整条 CI 未触发，两条失败的测试合入半个多月后才被发现
+- 报告修订落位规则（用户裁决，文档）：标记写「操作当天」日报（工作流演化），审批写「出身日」日报（现状不变）；修订行时间戳=操作时刻。见 `docs/ANALYSIS-2026-10-21-report-cutoff-window.md` §六
 
 ### Fixed
 
