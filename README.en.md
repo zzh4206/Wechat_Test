@@ -32,7 +32,7 @@ One [DSH](https://github.com/deepseek-ai) Cordis plugin plus a zero-data knowled
 | `0数据格式/` | **Pure knowledge-base template**: three-layer schema (`doc` / `report`+`entry` / `chat_digest`) + 3 Python tools. **Nothing is ever entered into it** |
 | `web/` | Local web workbench (separate process, listens on 127.0.0.1 only): read-only browsing of reports by calendar, docs, media, chat digests and watched-person digests, plus an approval inbox (confirm / cancel / complete / set deadline) and report finalize / regenerate / queue-to-outbox (all executed by the plugin's action inbox; queue-to-outbox is off by default and then follows the existing send path). See [RUNBOOK §14](docs/RUNBOOK.md) |
 | `scripts/` | `check-sensitive.sh` (sensitive-data scan), `llm-cost.mjs` (spend roll-up), `import-state-to-sqlite.mjs` (one-shot importer) |
-| `tests/` | 60 test files / 567 cases, fully offline mocks, never touches a real database |
+| `tests/` | 62 test files / 584 cases, fully offline mocks, never touches a real database |
 
 ## Architecture: from chats to knowledge
 
@@ -143,11 +143,12 @@ The knowledge base (`~/WeChat/1数据/knowledge.db`) core objects: five fact tab
 Every report ends with a cost summary line:
 
 ```text
-> 统计：批 1（失败 0）· 最大批耗时 0.0 s · 缓存命中 0 · LLM 调用 1 次 / 5.6 s · 模型 glm-5.3 · 输入 ~618 / 输出 ~178 tok · ≈¥0.0099
+> 统计：批 1（失败 0）· 最大批耗时 0.0 s · 缓存命中 0 · LLM 调用 1 次 / 5.6 s · 模型 glm-5.3 · 输入 ~618 / 输出 ~178 tok · ≈¥0.0099（固定前缀命中缓存可再省 ≈3.7%；≈¥ 为未命中上界）
 ```
 
 - When real usage is unavailable, tokens are estimated with Zhipu's official ratio (**Chinese characters : tokens ≈ 1 : 1.6**), prefixed `~` and flagged `tokensEst: true`; cost is always prefixed `≈`
 - Price changes need no code change: edit `llmPricing` (see [Zhipu's pricing page](https://docs.bigmodel.cn/cn/guide/start/pricing))
+- The stable instruction prefix can hit the provider's context cache: the instruction section (persona + schema + wire-format note, byte-identical and placed first) is billed at `cacheInput` when cached (defaults: GLM-5.3 ¥2, GLM-5.3-flash ¥0.23 per million tokens), and the report footer notes "固定前缀命中缓存可再省 ≈X%"; `costCny` and ≈¥ remain the **no-cache upper bound** (accounting is unchanged). Savings are estimated by the pure function `estimateCostWithCache()`; when `cacheInput` is absent it falls back to `input` (never overstates)
 - Roll-up: `node scripts/llm-cost.mjs` (`--month` / `--day` / `--chat` / `--state`); details in [docs/RUNBOOK.md](docs/RUNBOOK.md) §7.11
 
 ## Security model: five red lines
@@ -197,7 +198,7 @@ Rules (full red lines in [`0数据格式/PRIVACY.md`](0数据格式/PRIVACY.md))
 ```bash
 npm install
 npm run build   # tsc → lib/
-npm test        # node --test, 60 files / 567 cases, fully offline mocks
+npm test        # node --test, 62 files / 584 cases, fully offline mocks
 ./scripts/check-sensitive.sh   # must pass before committing; CI enforces it
 ```
 
